@@ -2,7 +2,7 @@
 
 import unittest
 
-from scripts.openclaw_quality_gate import evaluate_quality
+from scripts.openclaw_quality_gate import compute_runtime_timeout, evaluate_quality, evaluate_round
 
 
 class OpenClawQualityGateTest(unittest.TestCase):
@@ -17,6 +17,26 @@ class OpenClawQualityGateTest(unittest.TestCase):
         delta_pack = {"added": [1], "modified": [1]}
         out = evaluate_quality(model_scores, delta_pack)
         self.assertFalse(out["expansion_used"])
+
+    def test_runtime_timeout_with_cap(self):
+        timeout, flags = compute_runtime_timeout(estimated_minutes=40)
+        self.assertEqual(timeout, 45)
+        self.assertIn("long_task_capped", flags)
+
+    def test_round_pass_when_metrics_good(self):
+        out = evaluate_round(
+            round_index=1,
+            previous_unresolved=[],
+            metrics={
+                "terminology_rate": 0.96,
+                "structure_complete_rate": 0.97,
+                "target_language_purity": 0.98,
+                "numbering_consistency": 0.97,
+                "hard_fail_items": [],
+            },
+            gemini_enabled=True,
+        )
+        self.assertTrue(out["pass"])
 
 
 if __name__ == "__main__":

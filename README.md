@@ -1,9 +1,9 @@
 # Translation Task Automation
 
-This repository now provides two architectures:
+This repository now provides:
 
-- V1: n8n direct multi-model calls (legacy, kept for rollback)
-- V2: n8n orchestration + OpenClaw intelligence (recommended)
+- V1: n8n direct multi-model calls (legacy, rollback only)
+- V2 (overwritten by V3.2 behavior): n8n orchestration + OpenClaw intelligence
 
 ## Paths
 
@@ -21,7 +21,7 @@ Review folder:
 
 - `Translated -EN/_REVIEW/{job_id}`
 
-## V2 Workflow files
+## Active workflow files (V2 filenames, V3.2 behavior)
 
 - `workflows/WF-00-Orchestrator-V2.json`
 - `workflows/WF-20-OpenClaw-Orchestrator-V2.json`
@@ -32,7 +32,7 @@ V2 reuses existing:
 
 - `workflows/WF-10-Ingest-Classify.json`
 
-## V2 scripts (OpenClaw-side intelligence)
+## Active scripts (OpenClaw-side intelligence)
 
 - `scripts/openclaw_translation_orchestrator.py`
 - `scripts/openclaw_quality_gate.py`
@@ -114,22 +114,37 @@ n8n start
 
 4. Fill workflow IDs in `.env`, then restart n8n.
 
-## Runtime behavior (V2)
+## Runtime behavior (V3.2, on V2 filenames)
 
 1. n8n detects task event (email or scheduled poll).
-2. n8n classifies required docs (Arabic V1/V2 + English V1).
-3. n8n calls OpenClaw `/hooks/agent` with `job_id + file paths + review_dir`.
-4. OpenClaw returns async ACK (`runId`), then executes `openclaw_translation_orchestrator.py`.
-5. n8n polls `_REVIEW/{job_id}/openclaw_result.json` and continues only when `ok=true`.
-6. OpenClaw writes:
-   - `English V2 Draft.docx`
-   - `Task Brief.md`
-   - `Delta Summary.json`
-   - `Model Scores.json`
-   - `openclaw_result.json`
-7. n8n opens manual review gate.
-8. You edit draft manually, save `*_manual*.docx`, then approve.
-9. n8n copies manual file to `Translated -EN`.
+2. n8n normalizes all discovered DOCX into `candidate_files` (not fixed to one scenario).
+3. n8n calls OpenClaw `/hooks/agent` with `job_id + candidate_files + review_dir`.
+4. OpenClaw classifies task type and estimates duration:
+   - `REVISION_UPDATE`
+   - `NEW_TRANSLATION`
+   - `BILINGUAL_REVIEW`
+   - `EN_ONLY_EDIT`
+   - `MULTI_FILE_BATCH`
+5. Timeout policy:
+   - `runtime_timeout = min(estimated_minutes * 1.3, 45)`
+   - `long_task_capped` flag when capped.
+6. OpenClaw runs self-check loop (max 3 rounds):
+   - Codex write
+   - Gemini review
+   - iterative resolve
+   - stop on `double_pass=true` or round 3.
+7. Artifacts are written to `_REVIEW/{job_id}`:
+   - `Draft A (Preserve).docx`
+   - `Draft B (Reflow).docx`
+   - `Review Brief.docx`
+   - `.system/Task Brief.md`
+   - `.system/Delta Summary.json`
+   - `.system/Model Scores.json`
+   - `.system/quality_report.json`
+   - `.system/openclaw_result.json`
+8. n8n opens manual review gate only for `status=review_pending`.
+9. You edit manually and save `*_manual*.docx` or `*_edited*.docx`.
+10. Approve callback copies manual file to `Translated -EN`.
 
 ## Security requirements (mandatory before production)
 
@@ -160,9 +175,9 @@ PYTHONPATH=/Users/Code/workflow/translation python3 -m unittest discover -s test
 - `python3` + `python-docx`
 - `jq` (used by setup script)
 
-## Dedup strategy (V2)
+## Dedup strategy
 
-- V2 dedupe key: `event_hash + file_fingerprint`
+- Dedupe key: `event_hash + file_fingerprint`
 - Result: same event + same file version is skipped; same event + new file content is processed.
 
 ## Rollback

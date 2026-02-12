@@ -4,7 +4,7 @@ set -euo pipefail
 # Usage:
 #   OPENCLAW_HOOK_TOKEN="..." ./scripts/setup_openclaw_v2.sh
 # Optional:
-#   OPENCLAW_PRIMARY_MODEL="openai-codex/gpt-5.3-codex" ./scripts/setup_openclaw_v2.sh
+#   OPENCLAW_PRIMARY_MODEL="openai-codex/gpt-5.3-codex" OPENCLAW_GEMINI_MODEL="google/gemini-2.5-pro" ./scripts/setup_openclaw_v2.sh
 
 HOOK_TOKEN="${OPENCLAW_HOOK_TOKEN:-}"
 if [[ -z "$HOOK_TOKEN" ]]; then
@@ -13,6 +13,7 @@ if [[ -z "$HOOK_TOKEN" ]]; then
 fi
 
 PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.3-codex}"
+GEMINI_MODEL="${OPENCLAW_GEMINI_MODEL:-google/gemini-2.5-pro}"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-/Users/Code/workflow/translation}"
 
 ensure_agent() {
@@ -60,8 +61,7 @@ openclaw models set "$PRIMARY_MODEL"
 
 # Reset and set primary fallback chain.
 openclaw models fallbacks clear || true
-openclaw models fallbacks add "google/gemini-2.5-pro" || true
-openclaw models fallbacks add "anthropic/claude-sonnet-4-5" || true
+openclaw models fallbacks add "$GEMINI_MODEL" || true
 
 echo "Done. Restart OpenClaw gateway to apply changes:"
 echo "  openclaw gateway --force"

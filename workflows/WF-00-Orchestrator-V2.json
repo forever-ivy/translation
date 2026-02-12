@@ -414,14 +414,14 @@
       "main": [
         [
           {
-            "node": "IF Required Files Ready",
+            "node": "Mark Processed Event",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Mark Processed Event",
+            "node": "IF Required Files Ready",
             "type": "main",
             "index": 0
           }

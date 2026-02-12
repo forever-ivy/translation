@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "quality_report.schema.json",
+  "title": "QualityReport",
+  "type": "object",
+  "required": [
+    "rounds",
+    "convergence_reached",
+    "stop_reason"
+  ],
+  "properties": {
+    "rounds": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "round",
+          "findings",
+          "resolved",
+          "unresolved",
+          "pass"
+        ],
+        "properties": {
+          "round": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "resolved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "unresolved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "codex_pass": {
+            "type": "boolean"
+          },
+          "gemini_pass": {
+            "type": "boolean"
+          },
+          "pass": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "convergence_reached": {
+      "type": "boolean"
+    },
+    "stop_reason": {
+      "type": "string",
+      "enum": [
+        "double_pass",
+        "max_rounds",
+        "timeout",
+        "hard_fail"
+      ]
+    }
+  },
+  "additionalProperties": true
+}
+

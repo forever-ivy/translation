@@ -1,78 +1,71 @@
-# Implementation Notes (V2)
-
-## Summary
-
-V2 shifts model orchestration from n8n to OpenClaw.
-
-- n8n handles: triggers, routing, review gate, delivery, notifications.
-- OpenClaw handles: translation intelligence, quality gate, artifact generation.
+# Implementation Notes (V3.2 Behavior on V2 Files)
 
 ## What changed
 
-1. Added V2 workflows:
-   - `WF-00-Orchestrator-V2`
-   - `WF-20-OpenClaw-Orchestrator-V2`
-   - `WF-30-Manual-Review-Deliver-V2`
-   - `WF-99-Error-Audit-V2`
-2. Reused `WF-10-Ingest-Classify`.
-3. Added OpenClaw scripts:
-   - `openclaw_translation_orchestrator.py`
-   - `openclaw_quality_gate.py`
-   - `openclaw_artifact_writer.py`
-4. Removed model API keys from n8n env contract.
-5. Added OpenClaw setup helper: `scripts/setup_openclaw_v2.sh`.
-6. Setup helper now bootstraps required agents:
-   - `translator-main`
-   - `translator-diff`
-   - `translator-draft`
-   - `translator-qa`
+This repository keeps the same V2 workflow filenames, but behavior is upgraded to V3.2:
 
-## Interface contract
+1. Full-scenario task handling:
+   - `REVISION_UPDATE`
+   - `NEW_TRANSLATION`
+   - `BILINGUAL_REVIEW`
+   - `EN_ONLY_EDIT`
+   - `MULTI_FILE_BATCH`
+2. Self-check loop:
+   - max rounds = 3
+   - stop rule = both Codex and Gemini pass (`double_pass=true`)
+3. Dynamic duration:
+   - estimate at runtime
+   - timeout budget = `min(estimated * 1.3, 45)`
+   - capped tasks flagged as `long_task_capped`
+4. Manual delivery remains mandatory:
+   - no `*_manual*.docx` or `*_edited*.docx` => approve blocked
 
-### n8n -> OpenClaw
+## Public contracts
 
-`POST {OPENCLAW_BASE_URL}/hooks/agent`
+### HookTaskRequest
 
-Headers:
+- `meta` now accepts:
+  - `candidate_files[]` (primary input)
+  - legacy `files` map (backward compatibility)
+  - `task_type` (optional hint)
 
-- `Authorization: Bearer {OPENCLAW_HOOK_TOKEN}`
+### HookTaskResponse (result JSON)
 
-Payload includes:
+New fields:
 
-- `message` with command to execute orchestrator script
-- `agentId`
-- `sessionKey`
-- `deliver=false`
-- `meta` (`job_id`, 3 input paths, `review_dir`)
+- `plan` (`task_type`, `confidence`, `estimated_minutes`, `complexity_score`, `time_budget_minutes`)
+- `iteration_count`
+- `double_pass`
+- `estimated_minutes`
+- `runtime_timeout_minutes`
+- `actual_duration_minutes`
+- `status_flags[]`
+- `quality_report` (`rounds[]`, `convergence_reached`, `stop_reason`)
 
-### OpenClaw -> n8n (filesystem contract)
+### Artifacts written to review folder
 
-OpenClaw writes result file:
+- `Draft A (Preserve).docx`
+- `Draft B (Reflow).docx`
+- `Review Brief.docx`
+- `.system/Task Brief.md`
+- `.system/Delta Summary.json`
+- `.system/Model Scores.json`
+- `.system/quality_report.json`
+- `.system/openclaw_result.json`
 
-- `{review_dir}/openclaw_result.json`
+## Workflow impact
 
-n8n polls this file and validates `ok=true` before opening review gate.
+Updated files:
 
-### Hook ACK behavior
+- `/Users/Code/workflow/translation/workflows/WF-10-Ingest-Classify.json`
+- `/Users/Code/workflow/translation/workflows/WF-20-OpenClaw-Orchestrator-V2.json`
+- `/Users/Code/workflow/translation/workflows/WF-30-Manual-Review-Deliver-V2.json`
+- `/Users/Code/workflow/translation/workflows/WF-99-Error-Audit-V2.json`
 
-- `/hooks/agent` returns async ACK (`202` + `runId`) in this OpenClaw version.
-- n8n does not wait for final payload from HTTP response body.
-- n8n waits for `openclaw_result.json` and treats that file as `HookTaskResponse`.
+## Operational notes
 
-## Compatibility notes
+1. V2 workflow IDs and import names are unchanged.
+2. If you already imported workflows, re-import and overwrite to get new node scripts.
+3. OpenClaw + n8n should remain on the same machine with loopback hook URL.
+4. If Gemini is unavailable, workflow flags `degraded_single_model` and continues with Codex.
 
-- In OpenClaw 2026.2.9, `hooks.allowedAgentIds` may not be supported by config schema.
-- Enforce allowed agent behavior via payload (`agentId=translator-main`) and script-side checks.
-
-## Release plan
-
-- Keep legacy V1 workflows for rollback.
-- Activate V2 workflows only after credentials + hook config + 3 successful task runs.
-- Dedup in V2 uses `event_hash + file_fingerprint`.
-
-## Required manual actions
-
-1. Rotate leaked API keys and gateway/hook tokens.
-2. Configure OpenClaw hooks and fallback chain.
-3. Import V2 workflows and set `WF*_V2_WORKFLOW_ID` env variables.
-4. Verify end-to-end with a test job.

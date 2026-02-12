@@ -22,7 +22,7 @@
         340
       ],
       "parameters": {
-        "jsCode": "\nconst err = $json.error || {};\nconst workflow = $json.workflow || {};\nconst execution = $json.execution || {};\nconst input = $json.input || {};\nreturn [{\n  job_id: $json.job_id || input.job_id || execution.id || 'unknown',\n  workflow_name: workflow.name || $json.workflow_name || 'unknown',\n  execution_id: execution.id || $json.execution_id || 'unknown',\n  failed_node: err.node?.name || $json.failed_node || input.failed_node || 'unknown',\n  error_code: err.code || $json.error_code || input.error_code || '',\n  retry_count: Number($json.retry_count || input.retry_count || 0),\n  openclaw_run_id: input.openclaw_run_id || $json.openclaw_run_id || '',\n  error_message: err.message || input.error_message || $json.error_message || 'unknown error',\n  error_stack: err.stack || $json.error_stack || '',\n  at: new Date().toISOString(),\n}];\n"
+        "jsCode": "\nconst err = $json.error || {};\nconst workflow = $json.workflow || {};\nconst execution = $json.execution || {};\nconst input = $json.input || {};\nreturn [{\n  job_id: $json.job_id || input.job_id || execution.id || 'unknown',\n  workflow_name: workflow.name || $json.workflow_name || 'unknown',\n  execution_id: execution.id || $json.execution_id || 'unknown',\n  failed_node: err.node?.name || $json.failed_node || input.failed_node || 'unknown',\n  error_code: err.code || $json.error_code || input.error_code || '',\n  retry_count: Number($json.retry_count || input.retry_count || 0),\n  openclaw_run_id: input.openclaw_run_id || $json.openclaw_run_id || '',\n  status: input.status || $json.status || 'failed',\n  status_flags: input.status_flags || $json.status_flags || [],\n  iteration_count: Number(input.iteration_count || $json.iteration_count || 0),\n  runtime_timeout_minutes: Number(input.runtime_timeout_minutes || $json.runtime_timeout_minutes || 0),\n  error_message: err.message || input.error_message || $json.error_message || 'unknown error',\n  error_stack: err.stack || $json.error_stack || '',\n  at: new Date().toISOString(),\n}];\n"
       }
     },
     {
@@ -38,7 +38,7 @@
         "fromEmail": "={{$env.EMAIL_FROM}}",
         "toEmail": "={{$env.EMAIL_TO}}",
         "subject": "=[n8n Error] {{$json.workflow_name}} / {{$json.job_id}}",
-        "text": "={{`Execution: ${$json.execution_id}\\nMessage: ${$json.error_message}\\nTime: ${$json.at}`}}"
+        "text": "={{`Execution: ${$json.execution_id}\\nStatus: ${$json.status}\\nFlags: ${($json.status_flags || []).join(', ')}\\nIterations: ${$json.iteration_count}\\nMessage: ${$json.error_message}\\nTime: ${$json.at}`}}"
       },
       "continueOnFail": true
     },

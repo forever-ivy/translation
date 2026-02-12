@@ -22,7 +22,7 @@
         360
       ],
       "parameters": {
-        "jsCode": "\nconst root = $json.root || $json.root_path || $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nconst jobId = $json.job_id || `job_${Date.now()}`;\nconst reviewDir = `${root}/Translated -EN/_REVIEW/${jobId}`;\nconst meta = {\n  job_id: jobId,\n  root_path: root,\n  arabic_v1_path: $json.files?.arabic_v1?.path,\n  arabic_v2_path: $json.files?.arabic_v2?.path,\n  english_v1_path: $json.files?.english_v1?.path,\n  review_dir: reviewDir,\n};\nconst metaB64 = Buffer.from(JSON.stringify(meta), 'utf8').toString('base64');\nconst pythonBin = $env.PYTHON_BIN || 'python3';\nconst cmd = `${pythonBin} /Users/Code/workflow/translation/scripts/openclaw_translation_orchestrator.py --meta-json-base64 '${metaB64}'`;\nconst message = [\n  'You are translator-main. Run the following command exactly once and do not alter arguments:',\n  cmd,\n  'After command finishes, respond with one short line: ORCHESTRATOR_DONE',\n].join('\\n');\nconst payload = {\n  message,\n  name: 'translation-revision-job',\n  agentId: $env.OPENCLAW_AGENT_ID || 'translator-main',\n  sessionKey: `job:${jobId}`,\n  wakeMode: 'now',\n  deliver: false,\n  meta,\n  model: $env.OPENCLAW_PRIMARY_MODEL || 'openai-codex/gpt-5.3-codex',\n  timeoutSeconds: Number($env.OPENCLAW_HOOK_TIMEOUT_SECONDS || 900),\n};\nreturn [{ ...$json, job_id: jobId, meta, hook_payload: payload }];\n"
+        "jsCode": "\nconst root = $json.root || $json.root_path || $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nconst jobId = $json.job_id || `job_${Date.now()}`;\nconst reviewDir = `${root}/Translated -EN/_REVIEW/${jobId}`;\n\nconst meta = {\n  job_id: jobId,\n  root_path: root,\n  review_dir: reviewDir,\n  files: $json.files || {},\n  candidate_files: $json.candidate_files || [],\n  stats: $json.stats || {},\n  max_rounds: Number($env.OPENCLAW_MAX_SELF_CHECK_ROUNDS || 3),\n  codex_available: true,\n  gemini_available: (($env.OPENCLAW_DISABLE_GEMINI || '0') !== '1'),\n};\n\nconst metaB64 = Buffer.from(JSON.stringify(meta), 'utf8').toString('base64');\nconst pythonBin = $env.PYTHON_BIN || 'python3';\nconst cmd = `${pythonBin} /Users/Code/workflow/translation/scripts/openclaw_translation_orchestrator.py --meta-json-base64 '${metaB64}'`;\nconst message = [\n  'You are translator-main. Execute this translation pipeline command exactly once:',\n  cmd,\n  'Do not alter arguments. Reply with: ORCHESTRATOR_DONE',\n].join('\\n');\n\nconst payload = {\n  message,\n  name: 'translation-general-job',\n  agentId: $env.OPENCLAW_AGENT_ID || 'translator-main',\n  sessionKey: `job:${jobId}`,\n  wakeMode: 'now',\n  deliver: false,\n  meta,\n  model: $env.OPENCLAW_PRIMARY_MODEL || 'openai-codex/gpt-5.3-codex',\n  timeoutSeconds: Number($env.OPENCLAW_HOOK_TIMEOUT_SECONDS || 2700),\n};\n\nreturn [{ ...$json, job_id: jobId, review_dir: reviewDir, meta, hook_payload: payload }];\n"
       }
     },
     {
@@ -128,7 +128,7 @@
         300
       ],
       "parameters": {
-        "command": "=mkdir -p \"{{$json.meta.review_dir}}\"; for i in $(seq 1 {{$env.OPENCLAW_RESULT_POLL_TRIES || 120}}); do if [ -f \"{{$json.meta.review_dir}}/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/openclaw_result.json\"; exit 0; fi; sleep {{$env.OPENCLAW_RESULT_POLL_INTERVAL_SECONDS || 2}}; done; META_JSON='{{ JSON.stringify($json.meta) }}'; {{$env.PYTHON_BIN || 'python3'}} /Users/Code/workflow/translation/scripts/openclaw_translation_orchestrator.py --meta-json \"$META_JSON\" >/tmp/openclaw_fallback_{{$json.job_id}}.log 2>&1 || true; if [ -f \"{{$json.meta.review_dir}}/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/openclaw_result.json\"; else echo '{\"ok\":false,\"status\":\"needs_revision\",\"errors\":[\"openclaw_result_timeout\",\"openclaw_fallback_failed\"]}'; fi"
+        "command": "=mkdir -p \"{{$json.meta.review_dir}}/.system\"; for i in $(seq 1 {{$env.OPENCLAW_RESULT_POLL_TRIES || 120}}); do if [ -f \"{{$json.meta.review_dir}}/.system/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/.system/openclaw_result.json\"; exit 0; fi; sleep {{$env.OPENCLAW_RESULT_POLL_INTERVAL_SECONDS || 2}}; done; META_JSON='{{ JSON.stringify($json.meta) }}'; {{$env.PYTHON_BIN || 'python3'}} /Users/Code/workflow/translation/scripts/openclaw_translation_orchestrator.py --meta-json \"$META_JSON\" >/tmp/openclaw_fallback_{{$json.job_id}}.log 2>&1 || true; if [ -f \"{{$json.meta.review_dir}}/.system/openclaw_result.json\" ]; then cat \"{{$json.meta.review_dir}}/.system/openclaw_result.json\"; else echo '{\"ok\":false,\"status\":\"needs_revision\",\"errors\":[\"openclaw_result_timeout\",\"openclaw_fallback_failed\"]}'; fi"
       }
     },
     {
@@ -174,7 +174,7 @@
         240
       ],
       "parameters": {
-        "jsCode": "\nconst r = $json.hook_result || {};\nreturn [{\n  job_id: r.job_id || $json.job_id,\n  review_dir: r.review_dir || $json.meta?.review_dir,\n  status: r.status || 'review_pending',\n  artifacts: r.artifacts || {},\n  quality: r.quality || {},\n  errors: r.errors || [],\n  openclaw_run_id: $json.openclaw_run_id || '',\n  callback_base: `${$env.N8N_PUBLIC_BASE_URL || ''}/webhook/review`,\n}];\n"
+        "jsCode": "\nconst r = $json.hook_result || {};\nconst estimated = Number(r.estimated_minutes || 0);\nconst runtimeTimeoutN8n = Math.min(Math.round(Math.max(1, estimated) * Number($env.OPENCLAW_TIMEOUT_BUFFER_RATIO || 1.3)), Number($env.OPENCLAW_HARD_TIMEOUT_MINUTES || 45));\nconst flags = Array.isArray(r.status_flags) ? [...r.status_flags] : [];\nif ((estimated * Number($env.OPENCLAW_TIMEOUT_BUFFER_RATIO || 1.3)) > Number($env.OPENCLAW_HARD_TIMEOUT_MINUTES || 45) && !flags.includes('long_task_capped')) {\n  flags.push('long_task_capped');\n}\n\nreturn [{\n  job_id: r.job_id || $json.job_id,\n  review_dir: r.review_dir || $json.meta?.review_dir,\n  status: r.status || 'needs_attention',\n  artifacts: r.artifacts || {},\n  quality: r.quality || {},\n  quality_report: r.quality_report || {},\n  plan: r.plan || {},\n  iteration_count: Number(r.iteration_count || 0),\n  double_pass: Boolean(r.double_pass),\n  estimated_minutes: estimated,\n  runtime_timeout_minutes: Number(r.runtime_timeout_minutes || runtimeTimeoutN8n),\n  runtime_timeout_minutes_n8n: runtimeTimeoutN8n,\n  actual_duration_minutes: Number(r.actual_duration_minutes || 0),\n  status_flags: flags,\n  errors: r.errors || [],\n  openclaw_run_id: $json.openclaw_run_id || '',\n  callback_base: `${$env.N8N_PUBLIC_BASE_URL || ''}/webhook/review`,\n}];\n"
       }
     },
     {
@@ -187,7 +187,7 @@
         520
       ],
       "parameters": {
-        "jsCode": "\nreturn [{\n  ...$json,\n  status: 'needs_revision',\n  error_message: 'OpenClaw hook request was not accepted',\n  openclaw_run_id: $json.openclaw_run_id || '',\n}];\n"
+        "jsCode": "\nreturn [{\n  ...$json,\n  status: 'needs_attention',\n  error_message: 'OpenClaw hook request was not accepted',\n  status_flags: ['hook_not_accepted'],\n  openclaw_run_id: $json.openclaw_run_id || '',\n}];\n"
       }
     },
     {
@@ -200,7 +200,7 @@
         420
       ],
       "parameters": {
-        "jsCode": "\nreturn [{\n  ...$json,\n  status: 'needs_revision',\n  error_message: ($json.hook_result?.errors || []).join('; ') || 'OpenClaw hook processing failed',\n  openclaw_run_id: $json.openclaw_run_id || '',\n}];\n"
+        "jsCode": "\nreturn [{\n  ...$json,\n  status: $json.hook_result?.status || 'needs_attention',\n  error_message: ($json.hook_result?.errors || []).join('; ') || 'OpenClaw hook processing failed',\n  status_flags: $json.hook_result?.status_flags || [],\n  openclaw_run_id: $json.openclaw_run_id || '',\n}];\n"
       }
     },
     {

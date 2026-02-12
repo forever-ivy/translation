@@ -97,7 +97,7 @@
         240
       ],
       "parameters": {
-        "jsCode": "\nreturn [{\n  source: $json.source,\n  triggered_at: $json.triggered_at,\n  raw_refs: $json.raw_refs || [],\n  payload: $json.payload || {},\n  root_path: $json.root_path,\n  event_hash: $json.event_hash,\n  job_id: $json.job_id,\n  valid: $json.valid,\n  missing: $json.missing || [],\n  file_fingerprint: $json.file_fingerprint || '',\n  files: $json.files,\n  root: $json.root,\n}];\n"
+        "jsCode": "\nreturn [{\n  source: $json.source,\n  triggered_at: $json.triggered_at,\n  raw_refs: $json.raw_refs || [],\n  payload: $json.payload || {},\n  root_path: $json.root_path,\n  event_hash: $json.event_hash,\n  job_id: $json.job_id,\n  valid: $json.valid,\n  missing: $json.missing || [],\n  legacy_missing: $json.legacy_missing || [],\n  file_fingerprint: $json.file_fingerprint || '',\n  files: $json.files,\n  candidate_files: $json.candidate_files || [],\n  stats: $json.stats || {},\n  root: $json.root,\n}];\n"
       }
     }
   ],

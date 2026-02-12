@@ -45,9 +45,6 @@
       "required": [
         "job_id",
         "root_path",
-        "arabic_v1_path",
-        "arabic_v2_path",
-        "english_v1_path",
         "review_dir"
       ],
       "properties": {
@@ -57,17 +54,69 @@
         "root_path": {
           "type": "string"
         },
-        "arabic_v1_path": {
-          "type": "string"
-        },
-        "arabic_v2_path": {
-          "type": "string"
-        },
-        "english_v1_path": {
-          "type": "string"
-        },
         "review_dir": {
           "type": "string"
+        },
+        "task_type": {
+          "type": "string",
+          "enum": [
+            "REVISION_UPDATE",
+            "NEW_TRANSLATION",
+            "BILINGUAL_REVIEW",
+            "EN_ONLY_EDIT",
+            "MULTI_FILE_BATCH"
+          ]
+        },
+        "candidate_files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "language": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "files": {
+          "type": "object",
+          "properties": {
+            "arabic_v1": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "arabic_v2": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "english_v1": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": true
         }
       },
       "additionalProperties": true

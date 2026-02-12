@@ -1,49 +1,25 @@
 #!/usr/bin/env python3
-"""Create a DOCX draft from text while preserving template styles."""
+"""Create a DOCX draft while preserving the template layout exactly."""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import json
-import re
+import shutil
 import sys
 from pathlib import Path
-
-from docx import Document
-
-
-def clear_document_body(doc: Document) -> None:
-    body = doc._element.body
-    for child in list(body):
-        if child.tag.endswith("sectPr"):
-            continue
-        body.remove(child)
-
 
 def split_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def build_doc(template_path: Path, output_path: Path, text: str) -> None:
-    doc = Document(str(template_path))
-    clear_document_body(doc)
-
-    lines = split_lines(text)
-    if not lines:
-        lines = ["English V2 Draft"]
-
-    for idx, line in enumerate(lines):
-        if idx == 0 and len(line) < 120:
-            doc.add_heading(line, level=1)
-        else:
-            if line.startswith("- "):
-                doc.add_paragraph(line[2:], style="List Paragraph")
-            else:
-                doc.add_paragraph(line)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(output_path))
+    if template_path.resolve() == output_path.resolve():
+        return
+    # Keep the full DOCX structure (styles, tables, section layout) unchanged.
+    shutil.copy2(template_path, output_path)
 
 
 def main() -> int:

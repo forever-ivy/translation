@@ -19,13 +19,43 @@
     "status": {
       "type": "string"
     },
+    "plan": {
+      "type": "object",
+      "properties": {
+        "task_type": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "number"
+        },
+        "estimated_minutes": {
+          "type": "number"
+        },
+        "complexity_score": {
+          "type": "number"
+        },
+        "time_budget_minutes": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
     "review_dir": {
       "type": "string"
     },
     "artifacts": {
       "type": "object",
       "properties": {
-        "draft_docx": {
+        "draft_a_docx": {
+          "type": "string"
+        },
+        "draft_b_docx": {
+          "type": "string"
+        },
+        "review_brief_docx": {
+          "type": "string"
+        },
+        "legacy_draft_docx": {
           "type": "string"
         },
         "task_brief_md": {
@@ -35,6 +65,9 @@
           "type": "string"
         },
         "model_scores_json": {
+          "type": "string"
+        },
+        "quality_report_json": {
           "type": "string"
         }
       },
@@ -54,6 +87,53 @@
         }
       },
       "additionalProperties": true
+    },
+    "quality_report": {
+      "type": "object",
+      "properties": {
+        "rounds": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "convergence_reached": {
+          "type": "boolean"
+        },
+        "stop_reason": {
+          "type": "string",
+          "enum": [
+            "double_pass",
+            "max_rounds",
+            "timeout",
+            "hard_fail"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "iteration_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+    "double_pass": {
+      "type": "boolean"
+    },
+    "estimated_minutes": {
+      "type": "number"
+    },
+    "runtime_timeout_minutes": {
+      "type": "number"
+    },
+    "actual_duration_minutes": {
+      "type": "number"
+    },
+    "status_flags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "errors": {
       "type": "array",
@@ -75,6 +155,12 @@
         "job_id",
         "status",
         "review_dir",
+        "iteration_count",
+        "double_pass",
+        "estimated_minutes",
+        "runtime_timeout_minutes",
+        "actual_duration_minutes",
+        "status_flags",
         "errors"
       ]
     }
