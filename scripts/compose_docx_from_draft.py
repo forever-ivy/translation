@@ -10,6 +10,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from docx import Document
+
 def split_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -18,8 +20,54 @@ def build_doc(template_path: Path, output_path: Path, text: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if template_path.resolve() == output_path.resolve():
         return
-    # Keep the full DOCX structure (styles, tables, section layout) unchanged.
     shutil.copy2(template_path, output_path)
+    if not split_lines(text):
+        return
+
+    doc = Document(str(output_path))
+    replacements = split_lines(text)
+    idx = 0
+
+    def next_line() -> str | None:
+        nonlocal idx
+        if idx >= len(replacements):
+            return None
+        value = replacements[idx]
+        idx += 1
+        return value
+
+    for p in doc.paragraphs:
+        if idx >= len(replacements):
+            break
+        if not p.text.strip():
+            continue
+        candidate = next_line()
+        if candidate is None:
+            break
+        p.text = candidate
+
+    if idx < len(replacements):
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if idx >= len(replacements):
+                        break
+                    if not cell.text.strip():
+                        continue
+                    candidate = next_line()
+                    if candidate is None:
+                        break
+                    cell.text = candidate
+                if idx >= len(replacements):
+                    break
+            if idx >= len(replacements):
+                break
+
+    while idx < len(replacements):
+        doc.add_paragraph(replacements[idx])
+        idx += 1
+
+    doc.save(str(output_path))
 
 
 def main() -> int:

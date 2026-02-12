@@ -126,15 +126,15 @@ def main() -> int:
         errors=list(result.get("errors", [])),
     )
 
-    if result.get("status") == "review_pending":
+    if result.get("status") == "review_ready":
         _notify(
             conn,
             job_id=args.job_id,
-            milestone="review_pending",
+            milestone="review_ready",
             target=args.target,
             message=(
-                f"[{args.job_id}] review_pending. Edit manual file in {result.get('review_dir')} "
-                f"then send: approve {args.job_id}"
+                f"[{args.job_id}] review_ready. Verify files in {result.get('review_dir')} "
+                "then send: ok | no {reason} | rerun"
             ),
             dry_run=args.dry_run_notify,
         )

@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskIntentV5",
+  "type": "object",
+  "required": [
+    "task_type",
+    "source_language",
+    "target_language",
+    "required_inputs",
+    "missing_inputs",
+    "confidence",
+    "reasoning_summary"
+  ],
+  "properties": {
+    "task_type": {
+      "type": "string",
+      "enum": [
+        "REVISION_UPDATE",
+        "NEW_TRANSLATION",
+        "BILINGUAL_REVIEW",
+        "EN_ONLY_EDIT",
+        "MULTI_FILE_BATCH",
+        "TERMINOLOGY_ENFORCEMENT",
+        "LOW_CONTEXT_TASK",
+        "FORMAT_CRITICAL_TASK"
+      ]
+    },
+    "source_language": { "type": "string" },
+    "target_language": { "type": "string" },
+    "required_inputs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "missing_inputs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reasoning_summary": { "type": "string" }
+  }
+}

@@ -46,7 +46,7 @@ def infer_version(path: Path) -> str:
 def infer_role(path: Path) -> str:
     lowered_full = str(path).lower()
     lowered_name = path.name.lower()
-    if "/_review/" in lowered_full or "/.system/" in lowered_full:
+    if "/_review/" in lowered_full or "/_verify/" in lowered_full or "/.system/" in lowered_full:
         return "generated"
     if "glossery" in lowered_full or "glossary" in lowered_full:
         return "glossary"
@@ -80,7 +80,7 @@ def discover_docx(root: Path) -> list[Path]:
         if "~$" in p.name:
             continue
         lowered = str(p).lower()
-        if "/_review/" in lowered or "/.system/" in lowered:
+        if "/_review/" in lowered or "/_verify/" in lowered or "/.system/" in lowered:
             continue
         candidates.append(p)
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)

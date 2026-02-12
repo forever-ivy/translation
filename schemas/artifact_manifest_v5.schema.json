@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ArtifactManifestV5",
+  "type": "object",
+  "required": [
+    "final_docx",
+    "final_reflow_docx",
+    "draft_a_docx",
+    "draft_b_docx",
+    "review_brief_docx",
+    "change_log_md"
+  ],
+  "properties": {
+    "final_docx": { "type": "string" },
+    "final_reflow_docx": { "type": "string" },
+    "draft_a_docx": { "type": "string" },
+    "draft_b_docx": { "type": "string" },
+    "review_brief_docx": { "type": "string" },
+    "change_log_md": { "type": "string" },
+    "execution_plan_json": { "type": "string" },
+    "quality_report_json": { "type": "string" }
+  }
+}

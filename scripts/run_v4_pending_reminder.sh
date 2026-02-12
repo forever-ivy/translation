@@ -15,7 +15,7 @@ KB_ROOT="${V4_KB_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowled
 NOTIFY_TARGET="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"
 
 "${V4_PYTHON_BIN:-/Users/Code/workflow/translation/.venv/bin/python}" \
-  "${ROOT_DIR}/scripts/openclaw_v4_dispatcher.py" \
+  -m scripts.openclaw_v4_dispatcher \
   --work-root "$WORK_ROOT" \
   --kb-root "$KB_ROOT" \
   --notify-target "$NOTIFY_TARGET" \

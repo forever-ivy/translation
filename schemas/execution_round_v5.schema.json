@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExecutionRoundV5",
+  "type": "object",
+  "required": [
+    "round",
+    "codex_output_ref",
+    "gemini_findings_ref",
+    "resolved",
+    "unresolved",
+    "codex_pass",
+    "gemini_pass"
+  ],
+  "properties": {
+    "round": { "type": "integer", "minimum": 1, "maximum": 3 },
+    "codex_output_ref": { "type": "string" },
+    "gemini_findings_ref": { "type": "string" },
+    "resolved": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "unresolved": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "codex_pass": { "type": "boolean" },
+    "gemini_pass": { "type": "boolean" },
+    "pass": { "type": "boolean" },
+    "metrics": { "type": "object" }
+  }
+}

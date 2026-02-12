@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V4.1 dispatcher for OpenClaw full orchestration."""
+"""V5.2 dispatcher for OpenClaw full orchestration."""
 
 from __future__ import annotations
 
@@ -125,6 +125,7 @@ def cmd_approval(args: argparse.Namespace) -> int:
         work_root=Path(args.work_root),
         kb_root=Path(args.kb_root),
         target=args.notify_target,
+        sender=args.sender,
         dry_run_notify=args.dry_run_notify,
     )
     print(json.dumps(result, ensure_ascii=False))
@@ -132,7 +133,7 @@ def cmd_approval(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OpenClaw V4.1 dispatcher")
+    parser = argparse.ArgumentParser(description="OpenClaw V5.2 dispatcher")
     parser.add_argument("--work-root", default=str(DEFAULT_WORK_ROOT))
     parser.add_argument("--kb-root", default=str(DEFAULT_KB_ROOT))
     parser.add_argument("--notify-target", default=DEFAULT_NOTIFY_TARGET)
@@ -164,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ap = sub.add_parser("approval")
     p_ap.add_argument("--command", required=True)
+    p_ap.add_argument("--sender", default="")
 
     return parser
 

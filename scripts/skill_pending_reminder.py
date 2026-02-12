@@ -43,7 +43,7 @@ def main() -> int:
 
     paths = ensure_runtime_paths(Path(args.work_root))
     conn = db_connect(paths)
-    pending = list_jobs_by_status(conn, ["review_pending", "needs_attention", "running_timeout"])
+    pending = list_jobs_by_status(conn, ["review_ready", "needs_attention", "running_timeout", "needs_revision"])
 
     sent_items: list[dict[str, Any]] = []
     overdue_items: list[str] = []
@@ -59,11 +59,11 @@ def main() -> int:
         except Exception:
             age_hours = 0.0
 
-        next_cmd = f"status {job_id}"
-        if job["status"] == "review_pending":
-            next_cmd = f"approve {job_id}"
-        elif job["status"] in {"needs_attention", "running_timeout"}:
-            next_cmd = f"rerun {job_id}"
+        next_cmd = "status"
+        if job["status"] == "review_ready":
+            next_cmd = "ok"
+        elif job["status"] in {"needs_attention", "running_timeout", "needs_revision"}:
+            next_cmd = "rerun"
 
         summary = (
             f"[{job_id}] pending status={job['status']} age={age_hours:.1f}h. "

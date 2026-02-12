@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end V4.1 pipeline helpers."""
+"""End-to-end V5.2 pipeline helpers."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from scripts.v4_runtime import (
     json_dumps,
     list_job_files,
     record_event,
+    set_sender_active_job,
     send_whatsapp_message,
     update_job_plan,
     update_job_result,
@@ -56,6 +57,7 @@ def create_job(
     inbox_dir: Path,
     job_id: str,
     work_root: Path,
+    active_sender: str | None = None,
 ) -> dict[str, Any]:
     paths = ensure_runtime_paths(work_root)
     conn = db_connect(paths)
@@ -72,6 +74,9 @@ def create_job(
         inbox_dir=inbox_dir,
         review_dir=review_dir,
     )
+    set_sender_active_job(conn, sender=sender, job_id=job_id)
+    if active_sender and active_sender.strip():
+        set_sender_active_job(conn, sender=active_sender.strip(), job_id=job_id)
     record_event(conn, job_id=job_id, milestone="received", payload={"source": source, "sender": sender, "subject": subject})
     conn.close()
     return {
@@ -125,15 +130,8 @@ def run_job_pipeline(
     if not job:
         raise ValueError(f"Job not found: {job_id}")
 
-    notify_milestone(
-        paths=paths,
-        conn=conn,
-        job_id=job_id,
-        milestone="received",
-        message=f"[{job_id}] received via {job.get('source', 'unknown')}. Starting pipeline.",
-        target=notify_target,
-        dry_run=dry_run_notify,
-    )
+    update_job_status(conn, job_id=job_id, status="running", errors=[])
+    set_sender_active_job(conn, sender=job.get("sender", ""), job_id=job_id)
 
     notify_milestone(
         paths=paths,
@@ -177,6 +175,12 @@ def run_job_pipeline(
 
     query = " ".join([job.get("subject", ""), job.get("message_text", "")]).strip()
     kb_hits = retrieve_kb(conn=conn, query=query, task_type="", top_k=8) if query else []
+    record_event(
+        conn,
+        job_id=job_id,
+        milestone="kb_retrieve",
+        payload={"query": query, "hit_count": len(kb_hits), "hits": kb_hits[:8]},
+    )
 
     meta = {
         "job_id": job_id,
@@ -194,12 +198,13 @@ def run_job_pipeline(
     }
 
     plan = run_translation(meta, plan_only=True)
+    intent = plan.get("intent") or {}
     if plan.get("plan"):
         p = plan["plan"]
         update_job_plan(
             conn,
             job_id=job_id,
-            status="planned",
+            status=plan.get("status", "planned"),
             task_type=p.get("task_type", ""),
             confidence=float(p.get("confidence", 0.0)),
             estimated_minutes=int(p.get("estimated_minutes", 0)),
@@ -212,14 +217,35 @@ def run_job_pipeline(
         paths=paths,
         conn=conn,
         job_id=job_id,
-        milestone="planned",
+        milestone="intent_classified",
         message=(
-            f"[{job_id}] planned: {plan.get('plan', {}).get('task_type', 'unknown')} "
-            f"est={plan.get('estimated_minutes', 0)}m timeout={plan.get('runtime_timeout_minutes', 0)}m"
+            f"[{job_id}] intent_classified: {plan.get('plan', {}).get('task_type', 'unknown')} "
+            f"est={plan.get('estimated_minutes', 0)}m timeout={plan.get('runtime_timeout_minutes', 0)}m "
+            f"missing={len(intent.get('missing_inputs', []))}"
         ),
         target=notify_target,
         dry_run=dry_run_notify,
     )
+    if plan.get("status") == "missing_inputs":
+        missing = intent.get("missing_inputs") or []
+        update_job_status(conn, job_id=job_id, status="missing_inputs", errors=[f"missing:{x}" for x in missing])
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="missing_inputs",
+            message=f"[{job_id}] missing inputs: {', '.join(missing) if missing else 'unknown'}. Upload files then send 'run'.",
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+        conn.close()
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "status": "missing_inputs",
+            "intent": intent,
+            "errors": [f"missing:{x}" for x in missing],
+        }
 
     notify_milestone(
         paths=paths,
@@ -243,26 +269,54 @@ def run_job_pipeline(
         errors=list(result.get("errors", [])),
     )
 
-    if result.get("status") == "review_pending":
+    if result.get("status") == "review_ready":
+        rounds = (((result.get("quality_report") or {}).get("rounds")) or [])
+        for rd in rounds:
+            rd_no = rd.get("round")
+            if not rd_no:
+                continue
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone=f"round_{rd_no}_done",
+                message=f"[{job_id}] round_{rd_no}_done codex_pass={rd.get('codex_pass')} gemini_pass={rd.get('gemini_pass')}",
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
         notify_milestone(
             paths=paths,
             conn=conn,
             job_id=job_id,
-            milestone="review_pending",
+            milestone="review_ready",
             message=(
-                f"[{job_id}] review_pending. Drafts ready in {result.get('review_dir')}. "
-                f"After manual edit, send: approve {job_id}"
+                f"[{job_id}] review_ready. Verify files in {result.get('review_dir')}. "
+                "After your manual checks, send: ok | no {reason} | rerun"
             ),
             target=notify_target,
             dry_run=dry_run_notify,
         )
-    elif result.get("status") == "needs_attention":
+    elif result.get("status") in {"needs_attention", "failed"}:
+        rounds = (((result.get("quality_report") or {}).get("rounds")) or [])
+        for rd in rounds:
+            rd_no = rd.get("round")
+            if not rd_no:
+                continue
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone=f"round_{rd_no}_done",
+                message=f"[{job_id}] round_{rd_no}_done codex_pass={rd.get('codex_pass')} gemini_pass={rd.get('gemini_pass')}",
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
         notify_milestone(
             paths=paths,
             conn=conn,
             job_id=job_id,
             milestone="needs_attention",
-            message=f"[{job_id}] needs_attention. Send: status {job_id} or rerun {job_id}.",
+            message=f"[{job_id}] needs_attention. Send: status | rerun | no {{reason}}",
             target=notify_target,
             dry_run=dry_run_notify,
         )

@@ -1,72 +1,64 @@
-# Translation Automation V4.1 (OpenClaw-First)
+# Translation Automation V5.2 (OpenClaw Skill-First)
 
-## What changed
+## Scope
 
-V4.1 makes **OpenClaw the primary orchestrator**:
+V5.2 implements:
 
-- Trigger sources:
-  - Email (IMAP poll by OpenClaw cron)
-  - WhatsApp inbound (message/file)
-- Knowledge base:
-  - Read-only source: `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository`
-  - Incremental indexing: `mtime + hash`
-  - Supported: `docx`, `pdf`, `md`, `txt`, `xlsx`, `csv`
-- Work outputs:
+- OpenClaw-first orchestration
+- pure LLM intent classification (`TaskIntentV5`)
+- real Codex + Gemini 3-round review loop
+- mandatory `kb_sync_incremental` + `kb_retrieve` before every `run`
+- outputs only in `_VERIFY/{job_id}`
+- no auto-delivery to final folder
+- contextual WhatsApp commands:
+  - `run`
+  - `status`
+  - `ok`
+  - `no {reason}`
+  - `rerun`
+
+Legacy commands `approve/reject` are kept as compatibility aliases and are internally redirected to `ok/no`.
+
+## Fixed paths
+
+- Knowledge source (read-only):
+  - `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository`
+- Working root:
   - `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task`
-- Notifications:
-  - Milestone WhatsApp messages
-  - Pending reminders twice daily
-- Approval:
-  - WhatsApp commands: `status|approve|reject|rerun`
+- Verify output:
+  - `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task/Translated -EN/_VERIFY/{job_id}`
 
-`n8n` legacy workflows have been removed from this repository.
+## Runtime layout
 
-## Directory roles
-
-- Knowledge source root: `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository`
-  - `Previously Translated`
-  - `Glossery`
-  - `Arabic Source`
-  - `Translated -EN`
-- Work root: `/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task`
+- Inbox:
   - `_INBOX/email/{job_id}`
   - `_INBOX/whatsapp/{job_id}`
-  - `Translated -EN/_REVIEW/{job_id}`
+- Verify bundle:
+  - `Translated -EN/_VERIFY/{job_id}`
+- State DB:
   - `.system/jobs/state.sqlite`
-  - `.system/kb/*`
+- Logs:
   - `.system/logs/*`
+- KB index cache:
+  - `.system/kb/*`
 
-## New V4.1 scripts
+## Produced artifacts (per job)
 
-- Dispatcher:
-  - `scripts/openclaw_v4_dispatcher.py`
-- Skills:
-  - `scripts/skill_email_ingest.py`
-  - `scripts/skill_whatsapp_ingest.py`
-  - `scripts/skill_kb_incremental_sync.py`
-  - `scripts/skill_kb_retrieve.py`
-  - `scripts/skill_task_router.py`
-  - `scripts/skill_translation_execute.py`
-  - `scripts/skill_approval.py`
-  - `scripts/skill_notify.py`
-  - `scripts/skill_pending_reminder.py`
-- Runtime libs:
-  - `scripts/v4_runtime.py`
-  - `scripts/v4_kb.py`
-  - `scripts/v4_pipeline.py`
-- Setup:
-  - `scripts/setup_openclaw_v4.sh`
-  - `scripts/run_v4_email_poll.sh`
-  - `scripts/run_v4_pending_reminder.sh`
+Under `_VERIFY/{job_id}`:
 
-## Install dependencies
+- `Final.docx`
+- `Final-Reflow.docx`
+- `Draft A (Preserve).docx`
+- `Draft B (Reflow).docx`
+- `Review Brief.docx`
+- `Change Log.md`
+- `.system/execution_plan.json`
+- `.system/quality_report.json`
+- `.system/openclaw_result.json`
+- `.system/Delta Summary.json`
+- `.system/Model Scores.json`
 
-```bash
-cd /Users/Code/workflow/translation
-/Users/Code/workflow/translation/.venv/bin/pip install -r requirements.txt
-```
-
-## Local env file for V4
+## Environment
 
 Create `/Users/Code/workflow/translation/.env.v4.local`:
 
@@ -79,97 +71,78 @@ OPENCLAW_NOTIFY_TARGET="+8615071054627"
 OPENCLAW_NOTIFY_CHANNEL="whatsapp"
 OPENCLAW_NOTIFY_ACCOUNT="default"
 
-V4_IMAP_HOST="imap.your-provider.com"
+V4_IMAP_HOST="imap.163.com"
 V4_IMAP_PORT=993
-V4_IMAP_USER="you@example.com"
-V4_IMAP_PASSWORD="your_password_or_app_password"
+V4_IMAP_USER="your_163_account@163.com"
+V4_IMAP_PASSWORD="your_163_imap_authorization_code"
 V4_IMAP_MAILBOX="INBOX"
 V4_IMAP_FROM_FILTER="modeh@eventranz.com"
 V4_IMAP_MAX_MESSAGES=5
 ```
 
-### Mailbox setup notes (163 mail)
-
-- `V4_IMAP_HOST` use `imap.163.com`
-- `V4_IMAP_PORT` use `993`
-- `V4_IMAP_PASSWORD` must be 163 IMAP authorization code (not login password)
-- Keep `V4_IMAP_FROM_FILTER="modeh@eventranz.com"` to only process boss emails
-
-Quick test:
+## Install
 
 ```bash
 cd /Users/Code/workflow/translation
-./scripts/run_v4_email_poll.sh
+/Users/Code/workflow/translation/.venv/bin/pip install -r requirements.txt
+chmod +x scripts/setup_openclaw_v4.sh scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh
 ```
 
-If the mailbox is configured correctly, output JSON contains `"ok": true`.
-
-## OpenClaw setup (V4)
+## Setup OpenClaw
 
 ```bash
 cd /Users/Code/workflow/translation
-chmod +x scripts/setup_openclaw_v4.sh scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh
 ./scripts/setup_openclaw_v4.sh
 openclaw gateway --force
 openclaw health --json
 ```
 
-## Manual run commands
+## Run
 
-### 1) Poll email and auto-run jobs
+Email poll:
 
 ```bash
 cd /Users/Code/workflow/translation
 ./scripts/run_v4_email_poll.sh
 ```
 
-### 2) Run pending reminders
+Pending reminder:
 
 ```bash
 cd /Users/Code/workflow/translation
 ./scripts/run_v4_pending_reminder.sh
 ```
 
-### 3) Handle approval command directly
+Direct command test:
 
 ```bash
 cd /Users/Code/workflow/translation
-/Users/Code/workflow/translation/.venv/bin/python scripts/openclaw_v4_dispatcher.py \
-  approval --command "approve job_xxx"
+/Users/Code/workflow/translation/.venv/bin/python -m scripts.openclaw_v4_dispatcher \
+  --work-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task" \
+  --kb-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository" \
+  --notify-target "+8615071054627" \
+  approval --sender "+8615071054627" --command "status"
 ```
 
-## WhatsApp command interface
+## Message flow
 
-- `status {job_id}`
-- `approve {job_id}`
-- `reject {job_id} {reason}`
-- `rerun {job_id}`
-
-## Key runtime outputs per job
-
-`/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task/Translated -EN/_REVIEW/{job_id}`
-
-- `Draft A (Preserve).docx`
-- `Draft B (Reflow).docx`
-- `Review Brief.docx`
-- `.system/Task Brief.md`
-- `.system/Delta Summary.json`
-- `.system/Model Scores.json`
-- `.system/quality_report.json`
-- `.system/openclaw_result.json`
-- `.system/execution_plan.json`
+1. Upload files (email or WhatsApp) -> job enters `collecting`
+2. Send `run`
+3. System emits milestones:
+   - `collecting_update`
+   - `run_accepted`
+   - `kb_sync_started`
+   - `kb_sync_done`
+   - `intent_classified`
+   - `round_1_done` (and round 2/3 if needed)
+   - `review_ready` or `needs_attention`
+4. You manually verify files in `_VERIFY/{job_id}`
+5. Send `ok` to mark `verified` (status only, no file move)
+6. You manually move final file to destination folder
 
 ## Tests
 
 ```bash
 cd /Users/Code/workflow/translation
-PYTHONPATH=/Users/Code/workflow/translation /Users/Code/workflow/translation/.venv/bin/python -m unittest discover -s tests -v
+/Users/Code/workflow/translation/.venv/bin/python -m unittest discover -s tests -q
 ```
-
-## Schemas (V4)
-
-- `schemas/job_envelope_v4.schema.json`
-- `schemas/knowledge_sync_record.schema.json`
-- `schemas/execution_plan_v4.schema.json`
-- `schemas/execution_result_v4.schema.json`
-- `schemas/notification_event_v4.schema.json`

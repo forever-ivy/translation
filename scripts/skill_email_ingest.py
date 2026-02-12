@@ -22,8 +22,10 @@ from scripts.v4_runtime import (
     db_connect,
     ensure_runtime_paths,
     make_job_id,
+    set_sender_active_job,
     mark_mailbox_uid_seen,
     mailbox_uid_seen,
+    update_job_status,
 )
 
 
@@ -97,7 +99,22 @@ def main() -> int:
     jobs: list[dict[str, Any]] = []
     with imaplib.IMAP4_SSL(args.imap_host, args.imap_port) as imap:
         imap.login(args.imap_user, args.imap_password)
-        imap.select(args.mailbox)
+        sel_status, sel_data = imap.select(args.mailbox)
+        if sel_status != "OK":
+            conn.close()
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "imap_select_failed",
+                        "mailbox": args.mailbox,
+                        "detail": [d.decode("utf-8", errors="ignore") if isinstance(d, bytes) else str(d) for d in (sel_data or [])],
+                        "hint": "Mailbox select failed. For 163 mail, enable IMAP and use client authorization code.",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         status, data = imap.uid("search", None, "UNSEEN")
         if status != "OK":
             conn.close()
@@ -150,7 +167,11 @@ def main() -> int:
                 inbox_dir=inbox_dir,
                 job_id=job_id,
                 work_root=Path(args.work_root),
+                active_sender=args.notify_target,
             )
+            if not args.auto_run:
+                update_job_status(conn, job_id=job_id, status="collecting", errors=[])
+                set_sender_active_job(conn, sender=args.notify_target, job_id=job_id)
 
             attachments = _iter_attachments(msg)
             for idx, (name, payload) in enumerate(attachments, start=1):
@@ -167,6 +188,14 @@ def main() -> int:
                     notify_target=args.notify_target,
                 )
                 envelope["run_result"] = result
+            else:
+                send_msg = (
+                    f"[{job_id}] collecting_update from email. "
+                    f"Received {len(attachments)} attachment(s). Send 'run' to start."
+                )
+                from scripts.v4_runtime import send_whatsapp_message  # local import to avoid cycles
+
+                send_whatsapp_message(target=args.notify_target, message=send_msg, dry_run=False)
 
             jobs.append(envelope)
             mark_mailbox_uid_seen(conn, args.mailbox, uid)

@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SenderActiveJobMapV5",
+  "type": "object",
+  "required": ["sender", "active_job_id", "updated_at"],
+  "properties": {
+    "sender": { "type": "string" },
+    "active_job_id": { "type": "string" },
+    "updated_at": { "type": "string" }
+  }
+}

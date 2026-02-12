@@ -286,6 +286,9 @@ def retrieve_kb(
         "BILINGUAL_REVIEW": {"glossary": 1.2, "translated_en": 1.15},
         "EN_ONLY_EDIT": {"translated_en": 1.2, "previously_translated": 1.1},
         "MULTI_FILE_BATCH": {"glossary": 1.15, "previously_translated": 1.1},
+        "TERMINOLOGY_ENFORCEMENT": {"glossary": 1.4, "translated_en": 1.15},
+        "FORMAT_CRITICAL_TASK": {"glossary": 1.2, "previously_translated": 1.15},
+        "LOW_CONTEXT_TASK": {"glossary": 1.1},
     }.get(task, {})
 
     rows = conn.execute("SELECT path, source_group, chunk_index, text FROM kb_chunks").fetchall()

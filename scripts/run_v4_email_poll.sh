@@ -22,9 +22,13 @@ fi
 WORK_ROOT="${V4_WORK_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task}"
 KB_ROOT="${V4_KB_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository}"
 NOTIFY_TARGET="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"
+AUTO_RUN_ARGS=()
+if [[ "${V5_EMAIL_AUTO_RUN:-0}" == "1" ]]; then
+  AUTO_RUN_ARGS+=(--auto-run)
+fi
 
 "${V4_PYTHON_BIN:-/Users/Code/workflow/translation/.venv/bin/python}" \
-  "${ROOT_DIR}/scripts/openclaw_v4_dispatcher.py" \
+  -m scripts.openclaw_v4_dispatcher \
   --work-root "$WORK_ROOT" \
   --kb-root "$KB_ROOT" \
   --notify-target "$NOTIFY_TARGET" \
@@ -36,4 +40,4 @@ NOTIFY_TARGET="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"
   --mailbox "${V4_IMAP_MAILBOX:-INBOX}" \
   --from-filter "${V4_IMAP_FROM_FILTER:-modeh@eventranz.com}" \
   --max-messages "${V4_IMAP_MAX_MESSAGES:-5}" \
-  --auto-run
+  "${AUTO_RUN_ARGS[@]}"

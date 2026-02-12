@@ -70,7 +70,7 @@ def ensure_runtime_paths(work_root: Path | str = DEFAULT_WORK_ROOT) -> RuntimePa
     logs_root = system_root / "logs"
     inbox_email = root / "_INBOX" / "email"
     inbox_whatsapp = root / "_INBOX" / "whatsapp"
-    review_root = root / "Translated -EN" / "_REVIEW"
+    review_root = root / "Translated -EN" / "_VERIFY"
     translated_root = root / "Translated -EN"
 
     for p in [jobs_root, kb_system_root, logs_root, inbox_email, inbox_whatsapp, review_root, translated_root]:
@@ -174,6 +174,13 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id);
+
+        CREATE TABLE IF NOT EXISTS sender_active_jobs (
+            sender TEXT PRIMARY KEY,
+            active_job_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(active_job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+        );
         """
     )
     conn.commit()
@@ -385,6 +392,84 @@ def list_jobs_by_status(conn: sqlite3.Connection, statuses: list[str]) -> list[d
                 job[key] = default
         out.append(job)
     return out
+
+
+def set_sender_active_job(conn: sqlite3.Connection, *, sender: str, job_id: str) -> None:
+    sender_norm = (sender or "").strip()
+    if not sender_norm:
+        return
+    conn.execute(
+        """
+        INSERT INTO sender_active_jobs(sender, active_job_id, updated_at)
+        VALUES(?,?,?)
+        ON CONFLICT(sender) DO UPDATE SET
+            active_job_id=excluded.active_job_id,
+            updated_at=excluded.updated_at
+        """,
+        (sender_norm, job_id, utc_now_iso()),
+    )
+    conn.commit()
+
+
+def clear_sender_active_job(conn: sqlite3.Connection, *, sender: str, only_if_job_id: str | None = None) -> None:
+    sender_norm = (sender or "").strip()
+    if not sender_norm:
+        return
+    if only_if_job_id:
+        conn.execute(
+            "DELETE FROM sender_active_jobs WHERE sender=? AND active_job_id=?",
+            (sender_norm, only_if_job_id),
+        )
+    else:
+        conn.execute("DELETE FROM sender_active_jobs WHERE sender=?", (sender_norm,))
+    conn.commit()
+
+
+def get_sender_active_job(conn: sqlite3.Connection, *, sender: str) -> str | None:
+    sender_norm = (sender or "").strip()
+    if not sender_norm:
+        return None
+    row = conn.execute(
+        "SELECT active_job_id FROM sender_active_jobs WHERE sender=?",
+        (sender_norm,),
+    ).fetchone()
+    if not row:
+        return None
+    return str(row["active_job_id"])
+
+
+def list_actionable_jobs_for_sender(conn: sqlite3.Connection, *, sender: str, limit: int = 20) -> list[dict[str, Any]]:
+    sender_norm = (sender or "").strip()
+    if not sender_norm:
+        return []
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM jobs
+        WHERE sender=?
+          AND status NOT IN ('verified', 'failed')
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        (sender_norm, max(1, int(limit))),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def latest_actionable_job(conn: sqlite3.Connection, *, sender: str | None = None) -> dict[str, Any] | None:
+    if sender:
+        rows = list_actionable_jobs_for_sender(conn, sender=sender, limit=1)
+        return rows[0] if rows else None
+    row = conn.execute(
+        """
+        SELECT *
+        FROM jobs
+        WHERE status NOT IN ('verified', 'failed')
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def mailbox_uid_seen(conn: sqlite3.Connection, mailbox: str, uid: str) -> bool:
