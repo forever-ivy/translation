@@ -69,7 +69,7 @@
         200
       ],
       "parameters": {
-        "jsCode": "\nconst now = new Date().toISOString();\nconst jobId = `job_${Date.now()}`;\nreturn [{\n  source: 'email',\n  triggered_at: now,\n  job_id: jobId,\n  root_path: $json.root_path || $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task',\n  raw_refs: [$json.subject || '', $json.from || ''],\n  payload: $json,\n}];\n"
+        "jsCode": "\nconst now = new Date().toISOString();\nconst jobId = `job_${Date.now()}`;\nreturn [{\n  source: 'email',\n  triggered_at: now,\n  job_id: jobId,\n  root_path: $json.root_path || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task',\n  raw_refs: [$json.subject || '', $json.from || ''],\n  payload: $json,\n}];\n"
       },
       "disabled": true
     },
@@ -103,7 +103,7 @@
         600
       ],
       "parameters": {
-        "jsCode": "\nconst now = new Date().toISOString();\nconst jobId = `job_${Date.now()}`;\nreturn [{\n  source: 'onedrive',\n  triggered_at: now,\n  job_id: jobId,\n  root_path: $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task',\n  raw_refs: ['scheduled_poll'],\n  payload: {},\n}];\n"
+        "jsCode": "\nconst now = new Date().toISOString();\nconst jobId = `job_${Date.now()}`;\nreturn [{\n  source: 'onedrive',\n  triggered_at: now,\n  job_id: jobId,\n  root_path: '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task',\n  raw_refs: ['scheduled_poll'],\n  payload: {},\n}];\n"
       }
     },
     {

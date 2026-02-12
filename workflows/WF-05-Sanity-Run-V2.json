@@ -22,7 +22,7 @@
         300
       ],
       "parameters": {
-        "jsCode": "const root = $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nreturn [{ root_path: root, job_id: `job_${Date.now()}` }];"
+        "jsCode": "const root = '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nreturn [{ root_path: root, job_id: `job_${Date.now()}` }];"
       }
     },
     {

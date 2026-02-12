@@ -22,7 +22,7 @@
         320
       ],
       "parameters": {
-        "jsCode": "\nconst root = $json.root_path || $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nconst jobId = $json.job_id || `job_${Date.now()}`;\nreturn [{ ...$json, root_path: root, job_id: jobId }];\n"
+        "jsCode": "\nconst root = $json.root_path || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nconst jobId = $json.job_id || `job_${Date.now()}`;\nreturn [{ ...$json, root_path: root, job_id: jobId }];\n"
       }
     },
     {

@@ -22,7 +22,7 @@
         300
       ],
       "parameters": {
-        "jsCode": "\nconst g = $getWorkflowStaticData('global');\ng.reviews = g.reviews || {};\nconst secret = $env.REVIEW_CALLBACK_SECRET || 'replace_me';\nconst suggestedName = $json.final_filename || `${$json.job_id || 'translation'} EN [${$now.toFormat('yyyy-LL-dd')}].docx`;\ng.reviews[$json.job_id] = {\n  ...$json,\n  status: 'review_pending',\n  secret,\n  final_filename: suggestedName,\n  updated_at: new Date().toISOString()\n};\nconst base = $env.N8N_PUBLIC_BASE_URL || '';\nconst approveUrl = `${base}/webhook/review/${$json.job_id}/approve_manual/${secret}`;\nconst rejectUrl = `${base}/webhook/review/${$json.job_id}/reject/${secret}`;\nconst statusUrl = `${base}/webhook/review/status/${$json.job_id}`;\nreturn [{ ...$json, final_filename: suggestedName, approve_url: approveUrl, reject_url: rejectUrl, status_url: statusUrl }];\n"
+        "jsCode": "\nconst g = $getWorkflowStaticData('global');\ng.reviews = g.reviews || {};\nconst secret = 'replace_with_strong_secret';\nconst suggestedName = $json.final_filename || `${$json.job_id || 'translation'} EN [${$now.toFormat('yyyy-LL-dd')}].docx`;\ng.reviews[$json.job_id] = {\n  ...$json,\n  status: 'review_pending',\n  secret,\n  final_filename: suggestedName,\n  updated_at: new Date().toISOString()\n};\nconst base = 'http://localhost:5678';\nconst approveUrl = `${base}/webhook/review/${$json.job_id}/approve_manual/${secret}`;\nconst rejectUrl = `${base}/webhook/review/${$json.job_id}/reject/${secret}`;\nconst statusUrl = `${base}/webhook/review/status/${$json.job_id}`;\nreturn [{ ...$json, final_filename: suggestedName, approve_url: approveUrl, reject_url: rejectUrl, status_url: statusUrl }];\n"
       }
     },
     {
@@ -242,7 +242,7 @@
         600
       ],
       "parameters": {
-        "jsCode": "\nconst g = $getWorkflowStaticData('global');\ng.reviews = g.reviews || {};\nconst root = $env.TRANSLATION_ROOT || '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nconst finalName = g.reviews[$json.job_id]?.final_filename || `${$json.job_id} EN [${$now.toFormat('yyyy-LL-dd')}].docx`;\nif (g.reviews[$json.job_id]) {\n  g.reviews[$json.job_id].status = 'approved';\n  g.reviews[$json.job_id].updated_at = new Date().toISOString();\n  g.reviews[$json.job_id].final_file_path = `${root}/Translated -EN/${finalName}`;\n}\nreturn [{ job_id: $json.job_id, status: 'approved', final_file_path: g.reviews[$json.job_id]?.final_file_path || '' }];\n"
+        "jsCode": "\nconst g = $getWorkflowStaticData('global');\ng.reviews = g.reviews || {};\nconst root = '/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task';\nconst finalName = g.reviews[$json.job_id]?.final_filename || `${$json.job_id} EN [${$now.toFormat('yyyy-LL-dd')}].docx`;\nif (g.reviews[$json.job_id]) {\n  g.reviews[$json.job_id].status = 'approved';\n  g.reviews[$json.job_id].updated_at = new Date().toISOString();\n  g.reviews[$json.job_id].final_file_path = `${root}/Translated -EN/${finalName}`;\n}\nreturn [{ job_id: $json.job_id, status: 'approved', final_file_path: g.reviews[$json.job_id]?.final_file_path || '' }];\n"
       }
     },
     {
