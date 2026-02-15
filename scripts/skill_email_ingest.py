@@ -14,7 +14,8 @@ from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
 
-from scripts.v4_pipeline import attach_file_to_job, create_job, run_job_pipeline
+from scripts.skill_approval import handle_command
+from scripts.v4_pipeline import attach_file_to_job, create_job
 from scripts.v4_runtime import (
     DEFAULT_KB_ROOT,
     DEFAULT_NOTIFY_TARGET,
@@ -181,13 +182,15 @@ def main() -> int:
                 attach_file_to_job(work_root=Path(args.work_root), job_id=job_id, path=target)
 
             if args.auto_run:
-                result = run_job_pipeline(
-                    job_id=job_id,
+                run_result = handle_command(
+                    command_text=f"run {job_id}",
                     work_root=Path(args.work_root),
                     kb_root=Path(args.kb_root),
-                    notify_target=args.notify_target,
+                    target=args.notify_target,
+                    sender=args.notify_target,
+                    dry_run_notify=False,
                 )
-                envelope["run_result"] = result
+                envelope["run_result"] = run_result
             else:
                 send_msg = (
                     f"[{job_id}] collecting_update from email. "

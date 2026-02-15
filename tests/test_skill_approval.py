@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import signal
 
 from scripts.skill_approval import handle_command
 from scripts.v4_pipeline import create_job
@@ -11,6 +12,7 @@ from scripts.v4_runtime import (
     add_job_final_upload,
     db_connect,
     ensure_runtime_paths,
+    get_active_queue_item,
     get_job,
     set_job_kb_company,
     update_job_status,
@@ -65,6 +67,200 @@ class SkillApprovalTest(unittest.TestCase):
                 )
             self.assertFalse(result["ok"])
             self.assertEqual(result["error"], "job_not_found")
+
+    @patch("scripts.skill_approval.send_message")
+    def test_run_enqueues_job_once(self, mocked_send):
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            (kb_root / "30_Reference" / "Eventranz").mkdir(parents=True, exist_ok=True)
+            sender = "+8613"
+
+            job_id = "job_test_run_queue"
+            inbox = work_root / "_INBOX" / "telegram" / job_id
+            inbox.mkdir(parents=True, exist_ok=True)
+            create_job(
+                source="telegram",
+                sender=sender,
+                subject="Test",
+                message_text="",
+                inbox_dir=inbox,
+                job_id=job_id,
+                work_root=work_root,
+            )
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            set_job_kb_company(conn, job_id=job_id, kb_company="Eventranz")
+            set_sender_active_job(conn, sender=sender, job_id=job_id)
+            conn.close()
+
+            result = handle_command(
+                command_text="run",
+                work_root=work_root,
+                kb_root=kb_root,
+                target=sender,
+                sender=sender,
+                dry_run_notify=True,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result.get("status"), "queued")
+
+            conn = db_connect(paths)
+            job = get_job(conn, job_id)
+            self.assertEqual(job["status"], "queued")
+            q = get_active_queue_item(conn, job_id=job_id)
+            self.assertIsNotNone(q)
+            conn.close()
+
+            # Idempotent second run should not create a duplicate active queue item.
+            result2 = handle_command(
+                command_text="run",
+                work_root=work_root,
+                kb_root=kb_root,
+                target=sender,
+                sender=sender,
+                dry_run_notify=True,
+            )
+            self.assertTrue(result2["ok"])
+
+            conn = db_connect(paths)
+            row = conn.execute(
+                "SELECT COUNT(1) AS c FROM job_run_queue WHERE job_id=? AND state IN ('queued','running')",
+                (job_id,),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(int(row["c"]), 1)
+
+    @patch("scripts.skill_approval.send_message")
+    def test_cancel_cancels_queued_job(self, mocked_send):
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            (kb_root / "30_Reference" / "Eventranz").mkdir(parents=True, exist_ok=True)
+            sender = "+8613"
+
+            job_id = "job_test_cancel_queued"
+            inbox = work_root / "_INBOX" / "telegram" / job_id
+            inbox.mkdir(parents=True, exist_ok=True)
+            create_job(
+                source="telegram",
+                sender=sender,
+                subject="Test",
+                message_text="",
+                inbox_dir=inbox,
+                job_id=job_id,
+                work_root=work_root,
+            )
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            set_job_kb_company(conn, job_id=job_id, kb_company="Eventranz")
+            set_sender_active_job(conn, sender=sender, job_id=job_id)
+            conn.close()
+
+            result = handle_command(
+                command_text="run",
+                work_root=work_root,
+                kb_root=kb_root,
+                target=sender,
+                sender=sender,
+                dry_run_notify=True,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result.get("status"), "queued")
+
+            cancel = handle_command(
+                command_text="cancel",
+                work_root=work_root,
+                kb_root=kb_root,
+                target=sender,
+                sender=sender,
+                dry_run_notify=True,
+            )
+            self.assertTrue(cancel["ok"])
+            self.assertEqual(cancel.get("status"), "canceled")
+
+            conn = db_connect(paths)
+            job = get_job(conn, job_id)
+            self.assertEqual(job["status"], "canceled")
+            active = get_active_queue_item(conn, job_id=job_id)
+            self.assertIsNone(active)
+            row = conn.execute("SELECT state FROM job_run_queue WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+            conn.close()
+            self.assertEqual(str(row["state"]), "canceled")
+
+            # rerun should be allowed after cancellation
+            rerun = handle_command(
+                command_text="rerun",
+                work_root=work_root,
+                kb_root=kb_root,
+                target=sender,
+                sender=sender,
+                dry_run_notify=True,
+            )
+            self.assertTrue(rerun["ok"])
+            self.assertEqual(rerun.get("status"), "queued")
+
+    @patch("scripts.skill_approval.send_message")
+    def test_cancel_requests_kill_for_running_job(self, mocked_send):
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp) / "Translation Task"
+            kb_root = Path(tmp) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+            sender = "+8613"
+
+            job_id = "job_test_cancel_running"
+            inbox = work_root / "_INBOX" / "telegram" / job_id
+            inbox.mkdir(parents=True, exist_ok=True)
+            create_job(
+                source="telegram",
+                sender=sender,
+                subject="Test",
+                message_text="",
+                inbox_dir=inbox,
+                job_id=job_id,
+                work_root=work_root,
+            )
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            update_job_status(conn, job_id=job_id, status="running", errors=[])
+            set_sender_active_job(conn, sender=sender, job_id=job_id)
+            now = conn.execute("SELECT datetime('now')").fetchone()[0]  # sqlite current time
+            conn.execute(
+                """
+                INSERT INTO job_run_queue(
+                  job_id, state, attempt, notify_target, created_by_sender,
+                  enqueued_at, started_at, heartbeat_at, worker_id, pipeline_pid, pipeline_pgid
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (job_id, "running", 1, sender, sender, now, now, now, "w1", 123, 123),
+            )
+            conn.commit()
+            conn.close()
+
+            with patch("scripts.skill_approval.os.killpg") as mocked_killpg:
+                result = handle_command(
+                    command_text="cancel please",
+                    work_root=work_root,
+                    kb_root=kb_root,
+                    target=sender,
+                    sender=sender,
+                    dry_run_notify=True,
+                )
+            self.assertTrue(result["ok"])
+            self.assertTrue(result.get("kill_sent"))
+            mocked_killpg.assert_any_call(123, signal.SIGTERM)
+            mocked_killpg.assert_any_call(123, signal.SIGKILL)
+
+            conn = db_connect(paths)
+            row = conn.execute(
+                "SELECT cancel_requested_at FROM job_run_queue WHERE job_id=? AND state='running' ORDER BY id DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            conn.close()
+            self.assertTrue(str(row["cancel_requested_at"] or "").strip())
 
     @patch("scripts.skill_approval.send_message")
     def test_ok_marks_verified_without_delivery_copy(self, mocked_send):

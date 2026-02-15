@@ -122,6 +122,72 @@ def clawrag_sync(
     }
 
 
+def clawrag_delete(
+    *,
+    removed_paths: list[str],
+    base_url: str = DEFAULT_CLAWRAG_BASE_URL,
+    collection: str = "translation-kb",
+    timeout: int = 30,
+) -> dict[str, Any]:
+    if not removed_paths:
+        return {
+            "ok": True,
+            "backend": "clawrag",
+            "collection": collection,
+            "deleted_count": 0,
+            "mode": "noop",
+            "detail": "no_removed_paths",
+        }
+
+    documents = [{"path": str(Path(p).expanduser().resolve())} for p in removed_paths]
+    endpoint_attempts = [
+        (
+            "DELETE",
+            f"{base_url.rstrip('/')}/api/v1/rag/collections/{urllib.parse.quote(collection)}/documents/bulk",
+            {"documents": documents},
+        ),
+        (
+            "POST",
+            f"{base_url.rstrip('/')}/api/v1/rag/collections/{urllib.parse.quote(collection)}/documents/bulk",
+            {"documents": documents, "delete": True},
+        ),
+        (
+            "POST",
+            f"{base_url.rstrip('/')}/api/v1/rag/documents/delete",
+            {"collection": collection, "documents": documents},
+        ),
+        (
+            "POST",
+            f"{base_url.rstrip('/')}/api/v1/rag/collections/{urllib.parse.quote(collection)}/documents/delete",
+            {"documents": documents},
+        ),
+    ]
+
+    errors: list[dict[str, Any]] = []
+    for method, url, payload in endpoint_attempts:
+        ok, status, body, detail = _request_json(method=method, url=url, payload=payload, timeout=timeout)
+        if ok and status < 400:
+            return {
+                "ok": True,
+                "backend": "clawrag",
+                "collection": collection,
+                "deleted_count": len(documents),
+                "mode": "api",
+                "endpoint": url,
+                "response": body,
+            }
+        errors.append({"endpoint": url, "status_code": status, "detail": detail})
+
+    return {
+        "ok": False,
+        "backend": "clawrag",
+        "collection": collection,
+        "deleted_count": 0,
+        "mode": "api_failed",
+        "errors": errors,
+    }
+
+
 def _extract_hits(payload: Any) -> list[dict[str, Any]]:
     if payload is None:
         return []
@@ -219,6 +285,67 @@ def clawrag_search(
         "backend": "clawrag",
         "collection": collection,
         "hits": [],
+        "errors": errors,
+    }
+
+
+def clawrag_delete(
+    *,
+    removed_paths: list[str],
+    base_url: str = DEFAULT_CLAWRAG_BASE_URL,
+    collection: str = "translation-kb",
+    timeout: int = 30,
+) -> dict[str, Any]:
+    if not removed_paths:
+        return {
+            "ok": True,
+            "backend": "clawrag",
+            "collection": collection,
+            "deleted_count": 0,
+            "mode": "noop",
+            "detail": "no_removed_paths",
+        }
+
+    documents = [{"path": str(Path(p).expanduser().resolve())} for p in removed_paths]
+    endpoint_attempts = [
+        (
+            "DELETE",
+            f"{base_url.rstrip('/')}/api/v1/rag/collections/{urllib.parse.quote(collection)}/documents",
+            {"documents": documents},
+        ),
+        (
+            "POST",
+            f"{base_url.rstrip('/')}/api/v1/rag/collections/{urllib.parse.quote(collection)}/documents/delete",
+            {"documents": documents},
+        ),
+        (
+            "POST",
+            f"{base_url.rstrip('/')}/api/v1/rag/delete",
+            {"collection": collection, "documents": documents},
+        ),
+    ]
+
+    errors: list[dict[str, Any]] = []
+    for method, url, payload in endpoint_attempts:
+        ok, status, body, detail = _request_json(method=method, url=url, payload=payload, timeout=timeout)
+        if ok and status < 400:
+            return {
+                "ok": True,
+                "backend": "clawrag",
+                "collection": collection,
+                "deleted_count": len(documents),
+                "mode": "api",
+                "endpoint": url,
+                "response": body,
+            }
+        errors.append({"endpoint": url, "status_code": status, "detail": detail})
+
+    return {
+        "ok": False,
+        "backend": "clawrag",
+        "collection": collection,
+        "deleted_count": 0,
+        "mode": "api_failed",
         "errors": errors,
     }
 

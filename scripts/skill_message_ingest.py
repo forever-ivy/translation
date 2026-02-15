@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.skill_approval import handle_command, handle_interaction_reply
-from scripts.v4_pipeline import attach_file_to_job, create_job, run_job_pipeline
+from scripts.v4_pipeline import attach_file_to_job, create_job
 from scripts.v4_runtime import (
     DEFAULT_KB_ROOT,
     DEFAULT_NOTIFY_TARGET,
@@ -735,16 +735,12 @@ def main() -> int:
     should_run = args.auto_run and text.lower().strip().startswith("run")
     run_result: dict[str, Any] | None = None
     if should_run:
-        _notify_target(
-            target=reply_target,
-            message=f"\U0001f680 Starting execution\n\u23f3 Codex+Gemini translating\u2026",
-            dry_run=args.dry_run_notify,
-        )
-        run_result = run_job_pipeline(
-            job_id=job_id,
+        run_result = handle_command(
+            command_text=f"run {job_id}",
             work_root=work_root,
             kb_root=kb_root,
-            notify_target=reply_target,
+            target=reply_target,
+            sender=sender,
             dry_run_notify=args.dry_run_notify,
         )
 
@@ -760,8 +756,12 @@ def main() -> int:
         "attachment_failures": failures,
         "docx_count": info.get("docx_count", 0),
         "files_count": info.get("files_count", 0),
-        "status": "running" if should_run else "collecting",
-        "hint": "Files were bundled into one job. Send 'run' to start processing." if not should_run else "Run started.",
+        "status": str((run_result or {}).get("status") or ("queued" if should_run else "collecting")),
+        "hint": (
+            "Files were bundled into one job. Send 'run' to start processing."
+            if not should_run
+            else "Run accepted. Background worker will process it; send 'status' for updates."
+        ),
     }
     if run_result is not None:
         response["run_result"] = run_result

@@ -50,6 +50,7 @@ Legacy commands `approve/reject` are kept as compatibility aliases and are inter
 - `new`: create a fresh collecting job for current sender.
 - `run`: start pipeline for current active collecting job.
 - `status`: return user-readable status card.
+- `cancel`: force-cancel the current queued/running job immediately.
 - `ok`: mark job `verified` and archive your uploaded FINAL file(s) into KB reference (no file move).
 - `no {reason}`: mark `needs_revision`.
 - `rerun`: rerun current active job.
@@ -103,22 +104,28 @@ OPENCLAW_REQUIRE_NEW=1
 OPENCLAW_RAG_BACKEND=clawrag
 OPENCLAW_RAG_BASE_URL=http://127.0.0.1:8080
 OPENCLAW_RAG_COLLECTION=translation-kb
-OPENCLAW_KB_ISOLATION_MODE=reference_only
+OPENCLAW_RAG_COLLECTION_MODE=auto
+OPENCLAW_KB_ISOLATION_MODE=company_strict
+OPENCLAW_KB_RERANK_FINAL_K=12
+OPENCLAW_KB_RERANK_GLOSSARY_MIN=3
+OPENCLAW_KB_RERANK_TERMINOLOGY_GLOSSARY_RATIO=0.4
 OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=1
 OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite
+OPENCLAW_RUN_WORKER_AUTOSTART=1
 ```
 
 Notes:
 - `OPENCLAW_CODEX_AGENT` should point to a GPT-5.2-backed OpenClaw agent (e.g. bind `translator-core` to GPT-5.2 in OpenClaw).
 - If `OPENCLAW_FORMAT_QA_ENABLED=1` or `OPENCLAW_DOCX_QA_ENABLED=1`, you also need LibreOffice (`soffice`) on PATH and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) set for Gemini Vision.
 - Aesthetics warnings are controlled by `OPENCLAW_VISION_AESTHETICS_WARN_THRESHOLD` (default `0.7`); format fidelity remains the blocking gate.
+- When `OPENCLAW_KB_ISOLATION_MODE=company_strict`, KB files must be stored under `Knowledge Repository/{Section}/{Company}/...` (see `docs/KB_AND_MEMORY_SYSTEM.md`).
 
 ## Install
 
 ```bash
 cd /Users/Code/workflow/translation
 /Users/Code/workflow/translation/.venv/bin/pip install -r requirements.txt
-chmod +x scripts/setup_openclaw_v4.sh scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh
+chmod +x scripts/setup_openclaw_v4.sh scripts/run_telegram_bot.sh scripts/run_v4_email_poll.sh scripts/run_v4_pending_reminder.sh scripts/run_v4_run_worker.sh
 chmod +x scripts/install_openclaw_translation_skill.sh
 ```
 
@@ -164,6 +171,13 @@ cd /Users/Code/workflow/translation
 ./scripts/run_v4_email_poll.sh
 ```
 
+Run worker (executes queued `run` jobs in background):
+
+```bash
+cd /Users/Code/workflow/translation
+./scripts/run_v4_run_worker.sh
+```
+
 Pending reminder:
 
 ```bash
@@ -186,11 +200,11 @@ cd /Users/Code/workflow/translation
 
 1. Send `new` -> job enters `collecting`
 2. Upload files and/or task text (email or Telegram)
-3. Send `run` -> system asks you to pick a company (reply with a number), then continues the run
+3. Send `run` -> system asks you to pick a company (reply with a number), then enqueues the run (worker executes it out-of-band)
 3. System emits milestones:
-   - `collecting_update`
-   - `run_accepted`
-   - `kb_sync_started`
+  - `collecting_update`
+  - `run_accepted`
+  - `kb_sync_started`
    - `kb_sync_done`
    - `kb_retrieve_done`
    - `intent_classified`

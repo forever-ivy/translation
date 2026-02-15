@@ -21,7 +21,7 @@ from typing import Any
 
 from scripts.v4_runtime import DEFAULT_KB_ROOT, DEFAULT_NOTIFY_TARGET, DEFAULT_WORK_ROOT, send_message
 
-COMMAND_HEADS = {"new", "run", "status", "ok", "no", "rerun", "approve", "reject"}
+COMMAND_HEADS = {"new", "run", "status", "ok", "no", "rerun", "cancel", "stop", "abort", "approve", "reject"}
 ATTACHED_RE = re.compile(r"\[media attached:\s*(.+?)\s*\(([^)]*)\)\]", re.IGNORECASE)
 # OpenClaw unified prefix: [Telegram <chat_id> <date> <tz>] [openclaw] <text>
 TELEGRAM_PREFIX_RE = re.compile(
@@ -219,7 +219,7 @@ def _notify_hint(target: str, dry_run: bool = False) -> dict[str, Any]:
         "[router] Task mode is strict.\n"
         "Start with: new\n"
         "Then send files/text, and run\n"
-        "Other commands: status | ok | no {reason} | rerun"
+        "Other commands: status | cancel | ok | no {reason} | rerun"
     )
     return send_message(target=target, message=message, dry_run=dry_run)
 

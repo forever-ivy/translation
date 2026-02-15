@@ -7,10 +7,10 @@ import json
 import logging
 import re
 import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
+from scripts.attention_summary import attention_summary
 from scripts.openclaw_translation_orchestrator import run as run_translation
 
 log = logging.getLogger(__name__)
@@ -19,6 +19,7 @@ from scripts.v4_kb import retrieve_kb_with_fallback, sync_kb_with_rag
 from scripts.v4_runtime import (
     DEFAULT_NOTIFY_TARGET,
     RuntimePaths,
+    add_memory,
     add_job_file,
     append_log,
     db_connect,
@@ -27,6 +28,8 @@ from scripts.v4_runtime import (
     json_dumps,
     list_job_files,
     record_event,
+    resolve_rag_collection,
+    search_memories,
     set_sender_active_job,
     send_message,
     update_job_plan,
@@ -186,21 +189,31 @@ def _latest_message_meta(inbox_dir: Path) -> dict[str, Any]:
     }
 
 
-def _recall_cross_job_context(query: str) -> list[dict[str, Any]]:
-    """Recall relevant memories from openclaw-mem."""
+def _canonicalize_kb_company(*, kb_root: Path, kb_company: str) -> str:
+    company_norm = (kb_company or "").strip()
+    if not company_norm:
+        return ""
+    root = kb_root.expanduser().resolve()
+    sections = ["00_Glossary", "10_Style_Guide", "20_Domain_Knowledge", "30_Reference", "40_Templates"]
+    target = company_norm.casefold()
+    for section in sections:
+        section_root = root / section
+        if not section_root.exists() or not section_root.is_dir():
+            continue
+        for child in section_root.iterdir():
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if child.name.casefold() == target:
+                return child.name
+    return company_norm
+
+
+def _recall_cross_job_context(conn, *, company: str, query: str) -> list[dict[str, Any]]:
+    """Recall relevant cross-job memories (company-scoped) from local SQLite."""
     try:
-        proc = subprocess.run(
-            ["openclaw", "memory", "search", query, "--max-results", "5", "--json"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            result = json.loads(proc.stdout)
-            if isinstance(result, list):
-                return result[:5]
-            return list(result.get("results", result.get("memories", [])))[:5]
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-        pass
-    return []
+        return search_memories(conn, company=company, query=query, top_k=5)
+    except Exception:
+        return []
 
 
 def _read_change_log_points(*, review_dir: Path, limit: int = 12) -> list[str]:
@@ -246,6 +259,7 @@ def _summarize_kb_hits(kb_hits: list[dict[str, Any]], *, limit: int = 6) -> list
 
 def _store_job_memory(
     *,
+    conn,
     job_id: str,
     task_type: str,
     rounds_count: int,
@@ -281,11 +295,8 @@ def _store_job_memory(
     if len(text) > 1800:
         text = text[:1800] + "\n...(truncated)"
     try:
-        subprocess.run(
-            ["openclaw", "memory", "store", text],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (subprocess.TimeoutExpired, OSError):
+        add_memory(conn, company=company_norm, kind="decision", text=text, job_id=job_id)
+    except Exception:
         pass
 
 
@@ -311,6 +322,11 @@ def run_job_pipeline(
     update_job_status(conn, job_id=job_id, status="running", errors=[])
     set_sender_active_job(conn, sender=str(job.get("sender", "")).strip(), job_id=job_id)
 
+    kb_company_focus = _canonicalize_kb_company(kb_root=kb_root, kb_company=str(job.get("kb_company") or "").strip())
+    isolation_mode = str(os.getenv("OPENCLAW_KB_ISOLATION_MODE", "company_strict")).strip().lower() or "company_strict"
+    rag_collection_base = str(os.getenv("OPENCLAW_RAG_COLLECTION", "translation-kb")).strip() or "translation-kb"
+    rag_collection_mode = str(os.getenv("OPENCLAW_RAG_COLLECTION_MODE", "auto")).strip().lower() or "auto"
+
     notify_milestone(
         paths=paths,
         conn=conn,
@@ -327,7 +343,10 @@ def run_job_pipeline(
         report_path=kb_report_path,
         rag_backend=str(os.getenv("OPENCLAW_RAG_BACKEND", "clawrag")).strip().lower(),
         rag_base_url=str(os.getenv("OPENCLAW_RAG_BASE_URL", "http://127.0.0.1:8080")).strip(),
-        rag_collection=str(os.getenv("OPENCLAW_RAG_COLLECTION", "translation-kb")).strip() or "translation-kb",
+        rag_collection=rag_collection_base,
+        rag_collection_mode=rag_collection_mode,
+        isolation_mode=isolation_mode,
+        focus_company=kb_company_focus,
     )
     kb_report = dict(kb_sync_result.get("local_report") or {})
     rag_sync_report = dict(kb_sync_result.get("rag_report") or {})
@@ -366,9 +385,21 @@ def run_job_pipeline(
         conn.close()
         return {"ok": False, "job_id": job_id, "status": "incomplete_input", "errors": ["no_supported_attachments"]}
 
-    query = " ".join([job.get("subject", ""), job.get("message_text", "")]).strip()
     kb_company = str(job.get("kb_company") or "").strip()
-    isolation_mode = str(os.getenv("OPENCLAW_KB_ISOLATION_MODE", "reference_only")).strip().lower() or "reference_only"
+    kb_company = _canonicalize_kb_company(kb_root=kb_root, kb_company=kb_company) if kb_company else ""
+    query_parts = [str(job.get("subject", "") or "").strip(), str(job.get("message_text", "") or "").strip()]
+    if kb_company:
+        query_parts.append(f"Company: {kb_company}")
+    file_names = [str(c.get("name") or "").strip() for c in candidates[:8] if str(c.get("name") or "").strip()]
+    if file_names:
+        query_parts.append("Files: " + " ".join(file_names))
+    query = " ".join([p for p in query_parts if p]).strip()
+    rag_collection = resolve_rag_collection(
+        base_collection=rag_collection_base,
+        company=kb_company,
+        mode=rag_collection_mode,
+        isolation_mode=isolation_mode,
+    )
     kb_hits: list[dict[str, Any]] = []
     knowledge_backend = "local"
     pre_status_flags: list[str] = []
@@ -376,21 +407,21 @@ def run_job_pipeline(
         rag_fetch = retrieve_kb_with_fallback(
             conn=conn,
             query=query,
-            task_type="",
+            task_type=str(job.get("task_type") or ""),
             kb_root=kb_root,
             kb_company=kb_company,
             isolation_mode=isolation_mode,
             rag_backend=str(os.getenv("OPENCLAW_RAG_BACKEND", "clawrag")).strip().lower(),
             rag_base_url=str(os.getenv("OPENCLAW_RAG_BASE_URL", "http://127.0.0.1:8080")).strip(),
-            rag_collection=str(os.getenv("OPENCLAW_RAG_COLLECTION", "translation-kb")).strip() or "translation-kb",
-            top_k_clawrag=12,
-            top_k_local=8,
+            rag_collection=rag_collection,
+            top_k_clawrag=20,
+            top_k_local=12,
         )
-        kb_hits = _dedupe_hits(list(rag_fetch.get("hits") or []), limit=12 if rag_fetch.get("backend") == "clawrag" else 8)
+        kb_hits = _dedupe_hits(list(rag_fetch.get("hits") or []), limit=12)
         knowledge_backend = str(rag_fetch.get("backend") or "local")
         pre_status_flags.extend([str(x) for x in (rag_fetch.get("status_flags") or []) if str(x)])
 
-    cross_job_memories = _recall_cross_job_context(query) if query else []
+    cross_job_memories = _recall_cross_job_context(conn, company=kb_company, query=query) if query else []
 
     record_event(
         conn,
@@ -401,6 +432,7 @@ def run_job_pipeline(
             "hit_count": len(kb_hits),
             "backend": knowledge_backend,
             "hits": kb_hits[:12],
+            "rerank_report": (rag_fetch.get("rag_result") or {}).get("rerank_report") if query else {},
             "rag_sync_report": rag_sync_report,
         },
     )
@@ -564,6 +596,7 @@ def run_job_pipeline(
         )
         task_type = (result.get("intent") or {}).get("task_type", "unknown")
         _store_job_memory(
+            conn=conn,
             job_id=job_id,
             task_type=str(task_type),
             rounds_count=int(result.get("iteration_count", 0)),
@@ -572,7 +605,7 @@ def run_job_pipeline(
             task_label=str(job.get("task_label") or ""),
             kb_hits=kb_hits,
         )
-    elif result.get("status") in {"needs_attention", "failed"}:
+    elif result.get("status") == "needs_attention":
         rounds = (((result.get("quality_report") or {}).get("rounds")) or [])
         for rd in rounds:
             rd_no = rd.get("round")
@@ -587,12 +620,74 @@ def run_job_pipeline(
                 target=notify_target,
                 dry_run=dry_run_notify,
             )
+        why_lines = attention_summary(
+            status=str(result.get("status") or ""),
+            review_dir=str(result.get("review_dir") or ""),
+            status_flags=[str(x) for x in (result.get("status_flags") or [])],
+            errors=[str(x) for x in (result.get("errors") or [])],
+            artifacts=dict(result.get("artifacts") or {}),
+            max_items=3,
+        )
+        why_block = ""
+        if why_lines:
+            why_block = "\n\nWhy:\n" + "\n".join(f"- {x}" for x in why_lines[:3])
+        folder = str(result.get("review_dir") or "").strip()
+        folder_line = f"\U0001f4c1 {folder}\n" if folder else ""
         notify_milestone(
             paths=paths,
             conn=conn,
             job_id=job_id,
             milestone="needs_attention",
-            message=f"\u26a0\ufe0f Needs attention\n\U0001f4cb {_task_name}\nSend: status \u00b7 rerun \u00b7 no {{reason}}",
+            message=(
+                f"\u26a0\ufe0f Needs attention\n"
+                f"\U0001f4cb {_task_name}\n"
+                + folder_line
+                + why_block
+                + "\n\nSend: status \u00b7 rerun \u00b7 no {reason}"
+            ),
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+    elif result.get("status") == "failed":
+        rounds = (((result.get("quality_report") or {}).get("rounds")) or [])
+        for rd in rounds:
+            rd_no = rd.get("round")
+            if not rd_no:
+                continue
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone=f"round_{rd_no}_done",
+                message=f"\U0001f504 Round {rd_no} done\nCodex: {'\u2705' if rd.get('codex_pass') else '\u274c'} \u00b7 Gemini: {'\u2705' if rd.get('gemini_pass') else '\u274c'}",
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
+        why_lines = attention_summary(
+            status=str(result.get("status") or ""),
+            review_dir=str(result.get("review_dir") or ""),
+            status_flags=[str(x) for x in (result.get("status_flags") or [])],
+            errors=[str(x) for x in (result.get("errors") or [])],
+            artifacts=dict(result.get("artifacts") or {}),
+            max_items=3,
+        )
+        why_block = ""
+        if why_lines:
+            why_block = "\n\nWhy:\n" + "\n".join(f"- {x}" for x in why_lines[:3])
+        folder = str(result.get("review_dir") or "").strip()
+        folder_line = f"\U0001f4c1 {folder}\n" if folder else ""
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="failed",
+            message=(
+                f"\u274c Failed\n"
+                f"\U0001f4cb {_task_name}\n"
+                + folder_line
+                + why_block
+                + "\n\nSend: status \u00b7 rerun \u00b7 no {reason}"
+            ),
             target=notify_target,
             dry_run=dry_run_notify,
         )

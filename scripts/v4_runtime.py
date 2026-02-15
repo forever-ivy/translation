@@ -6,8 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import signal
 import sqlite3
 import subprocess
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +34,8 @@ SOURCE_GROUP_WEIGHTS = {
     "arabic_source": 1.0,
     "general": 0.8,
 }
+
+_MEMORIES_FTS_AVAILABLE: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,63 @@ def make_job_id(source: str) -> str:
     tail = uuid.uuid4().hex[:8]
     clean_source = source.lower().replace(" ", "_")
     return f"job_{clean_source}_{ts}_{tail}"
+
+
+def slugify_identifier(value: str, *, max_len: int = 48, default_prefix: str = "id") -> str:
+    """Generate a stable ASCII slug for IDs/collections/paths.
+
+    - Prefer human-readable ascii when possible (NFKD -> ascii).
+    - If nothing survives (e.g. Arabic/Chinese), fall back to a short SHA1.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    normalized = unicodedata.normalize("NFKD", raw)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_text).strip("-").lower()
+    if not cleaned:
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+        cleaned = f"{default_prefix}-{digest}"
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip("-")
+    return cleaned
+
+
+def resolve_rag_collection(
+    *,
+    base_collection: str,
+    company: str,
+    mode: str,
+    isolation_mode: str,
+) -> str:
+    """Resolve the ClawRAG collection name.
+
+    Modes:
+    - shared: use base_collection as-is
+    - per_company: suffix base_collection with company slug
+    - auto: per_company when isolation_mode=company_strict and company is set; otherwise shared
+
+    Placeholder:
+    - If base_collection contains "{company}", it is replaced by the company slug.
+    """
+    base = (base_collection or "").strip() or "translation-kb"
+    mode_norm = (mode or "").strip().lower() or "auto"
+    isolation_norm = (isolation_mode or "").strip().lower()
+    company_norm = (company or "").strip()
+    company_slug = slugify_identifier(company_norm, default_prefix="company") if company_norm else ""
+
+    if "{company}" in base:
+        return base.replace("{company}", company_slug or "unknown")
+
+    if mode_norm == "auto":
+        mode_norm = "per_company" if isolation_norm == "company_strict" and company_norm else "shared"
+
+    if mode_norm in {"per_company", "per-company", "company", "company_scoped", "company-scoped"} and company_norm:
+        if company_slug and (base.endswith(f"-{company_slug}") or base.endswith(f"_{company_slug}")):
+            return base
+        return f"{base}-{company_slug}" if company_slug else base
+
+    return base
 
 
 def ensure_runtime_paths(work_root: Path | str = DEFAULT_WORK_ROOT) -> RuntimePaths:
@@ -210,6 +272,47 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             final_uploads_json TEXT DEFAULT '[]',
             FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS job_run_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            notify_target TEXT DEFAULT '',
+            created_by_sender TEXT DEFAULT '',
+            enqueued_at TEXT NOT NULL,
+            started_at TEXT DEFAULT '',
+            finished_at TEXT DEFAULT '',
+            heartbeat_at TEXT DEFAULT '',
+            worker_id TEXT DEFAULT '',
+            last_error TEXT DEFAULT '',
+            cancel_requested_at TEXT DEFAULT '',
+            cancel_requested_by TEXT DEFAULT '',
+            cancel_reason TEXT DEFAULT '',
+            cancel_mode TEXT DEFAULT '',
+            pipeline_pid INTEGER NOT NULL DEFAULT 0,
+            pipeline_pgid INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_run_queue_state_time ON job_run_queue(state, enqueued_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_job_run_queue_active ON job_run_queue(job_id) WHERE state IN ('queued', 'running');
+
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company TEXT NOT NULL,
+            job_id TEXT DEFAULT '',
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memories_company ON memories(company);
+        CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+
+        CREATE TABLE IF NOT EXISTS kb_rag_collections (
+            collection TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            seeded_at TEXT NOT NULL
+        );
         """
     )
     conn.commit()
@@ -230,6 +333,169 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
+    for ddl in [
+        "ALTER TABLE job_run_queue ADD COLUMN cancel_requested_at TEXT DEFAULT ''",
+        "ALTER TABLE job_run_queue ADD COLUMN cancel_requested_by TEXT DEFAULT ''",
+        "ALTER TABLE job_run_queue ADD COLUMN cancel_reason TEXT DEFAULT ''",
+        "ALTER TABLE job_run_queue ADD COLUMN cancel_mode TEXT DEFAULT ''",
+        "ALTER TABLE job_run_queue ADD COLUMN pipeline_pid INTEGER DEFAULT 0",
+        "ALTER TABLE job_run_queue ADD COLUMN pipeline_pgid INTEGER DEFAULT 0",
+    ]:
+        try:
+            conn.execute(ddl)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+
+def _ensure_memories_fts(conn: sqlite3.Connection) -> bool:
+    """Best-effort: enable FTS5 BM25 retrieval for memories when supported."""
+    global _MEMORIES_FTS_AVAILABLE
+    if _MEMORIES_FTS_AVAILABLE is False:
+        return False
+
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+    ).fetchone()
+    if row:
+        _MEMORIES_FTS_AVAILABLE = True
+        return True
+
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE memories_fts USING fts5(text, content='memories', content_rowid='id', tokenize='unicode61')"
+        )
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+              INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+              INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+              INSERT INTO memories_fts(memories_fts, rowid, text) VALUES('delete', old.id, old.text);
+              INSERT INTO memories_fts(rowid, text) VALUES (new.id, new.text);
+            END;
+            """
+        )
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        conn.commit()
+        _MEMORIES_FTS_AVAILABLE = True
+        return True
+    except sqlite3.OperationalError:
+        _MEMORIES_FTS_AVAILABLE = False
+        return False
+
+
+def add_memory(
+    conn: sqlite3.Connection,
+    *,
+    company: str,
+    kind: str,
+    text: str,
+    job_id: str = "",
+) -> None:
+    company_norm = (company or "").strip()
+    if not company_norm:
+        return
+    kind_norm = (kind or "").strip() or "decision"
+    content = str(text or "").strip()
+    if not content:
+        return
+    if len(content) > 4000:
+        content = content[:4000] + "\n...(truncated)"
+    conn.execute(
+        "INSERT INTO memories(company, job_id, kind, text, created_at) VALUES(?,?,?,?,?)",
+        (company_norm, (job_id or "").strip(), kind_norm, content, utc_now_iso()),
+    )
+    conn.commit()
+
+
+def search_memories(
+    conn: sqlite3.Connection,
+    *,
+    company: str,
+    query: str,
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    company_norm = (company or "").strip()
+    q = (query or "").strip()
+    if not company_norm or not q:
+        return []
+
+    tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9\u0600-\u06FF_]+", q) if len(t) >= 2]
+    if not tokens:
+        return []
+
+    if _ensure_memories_fts(conn):
+        match_query = " OR ".join(sorted(set(tokens)))
+        rows = conn.execute(
+            """
+            SELECT
+              m.id AS id,
+              m.company AS company,
+              m.job_id AS job_id,
+              m.kind AS kind,
+              substr(m.text, 1, 700) AS snippet,
+              m.created_at AS created_at,
+              bm25(memories_fts) AS rank
+            FROM memories_fts
+            JOIN memories m ON m.id = memories_fts.rowid
+            WHERE memories_fts MATCH ?
+              AND m.company=?
+            LIMIT ?
+            """,
+            (match_query, company_norm, max(10, int(top_k) * 8)),
+        ).fetchall()
+
+        scored: list[dict[str, Any]] = []
+        for row in rows:
+            raw_rank = float(row["rank"] or 0.0)
+            inv = 1.0 / (1.0 + max(0.0, raw_rank))
+            scored.append(
+                {
+                    "id": int(row["id"]),
+                    "company": str(row["company"] or ""),
+                    "job_id": str(row["job_id"] or ""),
+                    "kind": str(row["kind"] or ""),
+                    "snippet": str(row["snippet"] or ""),
+                    "created_at": str(row["created_at"] or ""),
+                    "score": round(inv, 6),
+                }
+            )
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[: max(1, int(top_k))]
+
+    # Fallback: naive token count over recent memories.
+    rows = conn.execute(
+        "SELECT id, company, job_id, kind, text, created_at FROM memories WHERE company=? ORDER BY created_at DESC LIMIT 200",
+        (company_norm,),
+    ).fetchall()
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        text = str(row["text"] or "").lower()
+        if not text:
+            continue
+        hits = 0
+        for tk in tokens:
+            hits += text.count(tk)
+        if hits <= 0:
+            continue
+        scored.append(
+            {
+                "id": int(row["id"]),
+                "company": str(row["company"] or ""),
+                "job_id": str(row["job_id"] or ""),
+                "kind": str(row["kind"] or ""),
+                "snippet": str(row["text"] or "")[:700],
+                "created_at": str(row["created_at"] or ""),
+                "score": float(hits),
+            }
+        )
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[: max(1, int(top_k))]
 
 
 def infer_source_group(path: Path, kb_root: Path | None = None) -> str:
@@ -448,6 +714,498 @@ def list_jobs_by_status(conn: sqlite3.Connection, statuses: list[str]) -> list[d
                 job[key] = default
         out.append(job)
     return out
+
+
+def get_last_event(conn: sqlite3.Connection, *, job_id: str) -> dict[str, Any] | None:
+    job_id_norm = (job_id or "").strip()
+    if not job_id_norm:
+        return None
+    row = conn.execute(
+        "SELECT milestone, created_at FROM events WHERE job_id=? ORDER BY id DESC LIMIT 1",
+        (job_id_norm,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_queue_item(conn: sqlite3.Connection, *, job_id: str) -> dict[str, Any] | None:
+    job_id_norm = (job_id or "").strip()
+    if not job_id_norm:
+        return None
+    row = conn.execute(
+        """
+        SELECT *
+        FROM job_run_queue
+        WHERE job_id=?
+          AND state IN ('queued', 'running')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (job_id_norm,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def enqueue_run_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    notify_target: str = "",
+    created_by_sender: str = "",
+) -> dict[str, Any]:
+    """Idempotently enqueue a job for background execution.
+
+    If an active queue item already exists (queued/running), returns it without
+    creating a duplicate.
+    """
+
+    job_id_norm = (job_id or "").strip()
+    if not job_id_norm:
+        raise ValueError("job_id is required")
+    notify_norm = (notify_target or "").strip()
+    sender_norm = (created_by_sender or "").strip()
+
+    existing = get_active_queue_item(conn, job_id=job_id_norm)
+    if existing:
+        if notify_norm and not str(existing.get("notify_target") or "").strip():
+            conn.execute("UPDATE job_run_queue SET notify_target=? WHERE id=?", (notify_norm, int(existing["id"])))
+            conn.commit()
+            existing["notify_target"] = notify_norm
+        return existing
+
+    now = utc_now_iso()
+    try:
+        conn.execute(
+            """
+            INSERT INTO job_run_queue(
+              job_id, state, attempt, notify_target, created_by_sender,
+              enqueued_at, heartbeat_at
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (job_id_norm, "queued", 0, notify_norm, sender_norm, now, now),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Another process may have enqueued concurrently due to unique active index.
+        existing = get_active_queue_item(conn, job_id=job_id_norm)
+        if existing:
+            return existing
+        raise
+
+    # Keep jobs.status aligned for status cards; do not override a running job.
+    conn.execute(
+        "UPDATE jobs SET status=?, updated_at=? WHERE job_id=? AND status!='running'",
+        ("queued", now, job_id_norm),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT * FROM job_run_queue WHERE job_id=? ORDER BY id DESC LIMIT 1",
+        (job_id_norm,),
+    ).fetchone()
+    return dict(row) if row else {"job_id": job_id_norm, "state": "queued"}
+
+
+def set_queue_pipeline_process(
+    conn: sqlite3.Connection,
+    *,
+    queue_id: int,
+    worker_id: str,
+    pid: int,
+    pgid: int,
+) -> None:
+    """Persist child pipeline process identifiers for cancellation."""
+
+    conn.execute(
+        """
+        UPDATE job_run_queue
+        SET pipeline_pid=?,
+            pipeline_pgid=?,
+            heartbeat_at=?
+        WHERE id=?
+          AND worker_id=?
+          AND state='running'
+        """,
+        (
+            int(pid or 0),
+            int(pgid or 0),
+            utc_now_iso(),
+            int(queue_id),
+            (worker_id or "").strip() or "worker",
+        ),
+    )
+    conn.commit()
+
+
+def cancel_job_run(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    requested_by: str = "",
+    reason: str = "",
+    mode: str = "force",
+) -> dict[str, Any]:
+    """Cancel a queued/running job.
+
+    - queued  -> mark queue row canceled immediately.
+    - running -> set cancel_requested_* (worker should terminate the subprocess).
+    """
+
+    job_id_norm = (job_id or "").strip()
+    if not job_id_norm:
+        return {"ok": False, "error": "missing_job_id"}
+
+    by_norm = (requested_by or "").strip()
+    reason_norm = (reason or "").strip()
+    mode_norm = (mode or "").strip().lower() or "force"
+    if mode_norm not in {"soft", "force"}:
+        mode_norm = "force"
+    now = utc_now_iso()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT *
+            FROM job_run_queue
+            WHERE job_id=?
+              AND state IN ('queued','running')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id_norm,),
+        ).fetchone()
+        if not row:
+            conn.execute("COMMIT")
+            return {"ok": False, "error": "no_active_queue_item"}
+
+        q = dict(row)
+        qid = int(q["id"])
+        state = str(q.get("state") or "").strip().lower()
+
+        if state == "queued":
+            updated = conn.execute(
+                """
+                UPDATE job_run_queue
+                SET state='canceled',
+                    finished_at=?,
+                    heartbeat_at=?,
+                    last_error=?,
+                    cancel_requested_at=?,
+                    cancel_requested_by=?,
+                    cancel_reason=?,
+                    cancel_mode=?
+                WHERE id=?
+                  AND state='queued'
+                """,
+                (
+                    now,
+                    now,
+                    "canceled_by_user",
+                    now,
+                    by_norm,
+                    reason_norm,
+                    mode_norm,
+                    qid,
+                ),
+            ).rowcount
+            if updated == 1:
+                # Keep jobs.status aligned for status cards; do not override an actively running job.
+                conn.execute(
+                    "UPDATE jobs SET status=?, updated_at=? WHERE job_id=? AND status!='running'",
+                    ("canceled", now, job_id_norm),
+                )
+                conn.execute("COMMIT")
+                q["state"] = "canceled"
+                q["finished_at"] = now
+                q["last_error"] = "canceled_by_user"
+                q["cancel_requested_at"] = now
+                q["cancel_requested_by"] = by_norm
+                q["cancel_reason"] = reason_norm
+                q["cancel_mode"] = mode_norm
+                return {"ok": True, "action": "canceled", "queue": q}
+            # It was claimed concurrently; fall through to running path.
+            row = conn.execute("SELECT * FROM job_run_queue WHERE id=?", (qid,)).fetchone()
+            q = dict(row) if row else q
+            state = str(q.get("state") or "").strip().lower()
+
+        already = bool(str(q.get("cancel_requested_at") or "").strip())
+        conn.execute(
+            """
+            UPDATE job_run_queue
+            SET cancel_requested_at=CASE WHEN cancel_requested_at='' THEN ? ELSE cancel_requested_at END,
+                cancel_requested_by=CASE WHEN cancel_requested_by='' THEN ? ELSE cancel_requested_by END,
+                cancel_reason=CASE WHEN cancel_reason='' THEN ? ELSE cancel_reason END,
+                cancel_mode=CASE WHEN cancel_mode='' THEN ? ELSE cancel_mode END
+            WHERE id=?
+              AND state='running'
+            """,
+            (now, by_norm, reason_norm, mode_norm, qid),
+        )
+        conn.execute("COMMIT")
+
+        updated = conn.execute("SELECT * FROM job_run_queue WHERE id=?", (qid,)).fetchone()
+        q2 = dict(updated) if updated else q
+        return {"ok": True, "action": ("already_requested" if already else "cancel_requested"), "queue": q2}
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def claim_next_queued(conn: sqlite3.Connection, *, worker_id: str) -> dict[str, Any] | None:
+    """Atomically claim the next queued job for a worker."""
+
+    worker_norm = (worker_id or "").strip() or "worker"
+    now = utc_now_iso()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT id, job_id
+            FROM job_run_queue
+            WHERE state='queued'
+            ORDER BY enqueued_at ASC, id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            conn.execute("COMMIT")
+            return None
+        qid = int(row["id"])
+        updated = conn.execute(
+            """
+            UPDATE job_run_queue
+            SET state='running',
+                attempt=attempt+1,
+                worker_id=?,
+                started_at=?,
+                heartbeat_at=?
+            WHERE id=?
+              AND state='queued'
+            """,
+            (worker_norm, now, now, qid),
+        ).rowcount
+        if updated != 1:
+            conn.execute("ROLLBACK")
+            return None
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+    claimed = conn.execute("SELECT * FROM job_run_queue WHERE id=?", (qid,)).fetchone()
+    return dict(claimed) if claimed else None
+
+
+def heartbeat_queue_item(conn: sqlite3.Connection, *, queue_id: int, worker_id: str) -> None:
+    now = utc_now_iso()
+    conn.execute(
+        "UPDATE job_run_queue SET heartbeat_at=? WHERE id=? AND worker_id=? AND state='running'",
+        (now, int(queue_id), (worker_id or "").strip() or "worker"),
+    )
+    conn.commit()
+
+
+def finish_queue_item(
+    conn: sqlite3.Connection,
+    *,
+    queue_id: int,
+    worker_id: str,
+    state: str,
+    last_error: str = "",
+) -> None:
+    now = utc_now_iso()
+    state_norm = (state or "").strip().lower()
+    if state_norm not in {"succeeded", "failed", "canceled"}:
+        state_norm = "failed"
+    conn.execute(
+        """
+        UPDATE job_run_queue
+        SET state=?,
+            finished_at=?,
+            heartbeat_at=?,
+            last_error=?
+        WHERE id=?
+          AND worker_id=?
+        """,
+        (
+            state_norm,
+            now,
+            now,
+            (last_error or "").strip(),
+            int(queue_id),
+            (worker_id or "").strip() or "worker",
+        ),
+    )
+    conn.commit()
+
+    # If the worker failed before the pipeline could write a final job status,
+    # surface it on the job so `status` and `rerun` behave sanely.
+    if state_norm in {"failed", "canceled"}:
+        row = conn.execute("SELECT job_id FROM job_run_queue WHERE id=?", (int(queue_id),)).fetchone()
+        job_id = str(row["job_id"] or "").strip() if row else ""
+        if job_id:
+            job = get_job(conn, job_id)
+            if job and str(job.get("status") or "").strip().lower() in {"queued", "running"}:
+                token = (last_error or "").strip() or ("queue_failed" if state_norm == "failed" else "canceled")
+                errors = list(job.get("errors_json") or [])
+                tag = f"queue_{state_norm}:{token}"
+                if tag not in errors:
+                    errors.append(tag)
+                update_job_status(conn, job_id=job_id, status=("canceled" if state_norm == "canceled" else "failed"), errors=errors)
+
+
+def _kill_pipeline_best_effort(*, pgid: int, pid: int) -> None:
+    pg = int(pgid or 0)
+    p = int(pid or 0)
+    try:
+        if pg > 0 and hasattr(os, "killpg"):
+            os.killpg(pg, signal.SIGTERM)
+            os.killpg(pg, signal.SIGKILL)
+            return
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+    except Exception:
+        pass
+    if p <= 0:
+        return
+    try:
+        os.kill(p, signal.SIGTERM)
+        os.kill(p, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+
+
+def requeue_stuck_running(
+    conn: sqlite3.Connection,
+    *,
+    stuck_seconds: int,
+    max_attempts: int,
+) -> int:
+    """Requeue or fail running tasks whose heartbeat is too old.
+
+    Returns number of items updated.
+    """
+
+    stuck_s = max(60, int(stuck_seconds))
+    max_a = max(1, int(max_attempts))
+    now = datetime.now(UTC)
+    changed = 0
+
+    rows = conn.execute(
+        """
+        SELECT id, job_id, attempt, started_at, heartbeat_at, worker_id,
+               cancel_requested_at, pipeline_pid, pipeline_pgid
+        FROM job_run_queue
+        WHERE state='running'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        qid = int(row["id"])
+        job_id = str(row["job_id"] or "").strip()
+        attempt = int(row["attempt"] or 0)
+        hb = str(row["heartbeat_at"] or "").strip()
+        st = str(row["started_at"] or "").strip()
+        mark = hb or st
+        if not mark:
+            continue
+        try:
+            mark_dt = datetime.fromisoformat(mark)
+            if mark_dt.tzinfo is None:
+                mark_dt = mark_dt.replace(tzinfo=UTC)
+        except ValueError:
+            continue
+        age = (now - mark_dt).total_seconds()
+        if age < stuck_s:
+            continue
+
+        cancel_requested_at = str(row["cancel_requested_at"] or "").strip()
+        pipeline_pid = int(row["pipeline_pid"] or 0)
+        pipeline_pgid = int(row["pipeline_pgid"] or 0)
+        if pipeline_pid or pipeline_pgid:
+            _kill_pipeline_best_effort(pgid=pipeline_pgid, pid=pipeline_pid)
+
+        # Respect explicit cancellation: do not requeue.
+        if cancel_requested_at:
+            conn.execute(
+                """
+                UPDATE job_run_queue
+                SET state='canceled',
+                    finished_at=?,
+                    heartbeat_at=?,
+                    last_error=?
+                WHERE id=?
+                  AND state='running'
+                """,
+                (utc_now_iso(), utc_now_iso(), f"stuck_canceled:{age:.0f}s", qid),
+            )
+            changed += 1
+            if job_id:
+                job = get_job(conn, job_id)
+                if job and str(job.get("status") or "").strip().lower() in {"queued", "running"}:
+                    errors = list(job.get("errors_json") or [])
+                    tag = f"queue_canceled:stuck_canceled:{age:.0f}s"
+                    if tag not in errors:
+                        errors.append(tag)
+                    update_job_status(conn, job_id=job_id, status="canceled", errors=errors)
+            continue
+
+        if attempt >= max_a:
+            conn.execute(
+                """
+                UPDATE job_run_queue
+                SET state='failed',
+                    finished_at=?,
+                    last_error=?
+                WHERE id=?
+                  AND state='running'
+                """,
+                (utc_now_iso(), f"stuck_timeout:{age:.0f}s", qid),
+            )
+            changed += 1
+            if job_id:
+                job = get_job(conn, job_id)
+                if job and str(job.get("status") or "").strip().lower() in {"queued", "running"}:
+                    errors = list(job.get("errors_json") or [])
+                    tag = f"queue_failed:stuck_timeout:{age:.0f}s"
+                    if tag not in errors:
+                        errors.append(tag)
+                    update_job_status(conn, job_id=job_id, status="failed", errors=errors)
+            continue
+
+        conn.execute(
+            """
+            UPDATE job_run_queue
+            SET state='queued',
+                worker_id='',
+                started_at='',
+                heartbeat_at=?,
+                last_error=?
+            WHERE id=?
+              AND state='running'
+            """,
+            (utc_now_iso(), f"stuck_requeued:{age:.0f}s", qid),
+        )
+        changed += 1
+        if job_id:
+            job = get_job(conn, job_id)
+            if job and str(job.get("status") or "").strip().lower() == "running":
+                update_job_status(conn, job_id=job_id, status="queued", errors=list(job.get("errors_json") or []))
+
+    if changed:
+        conn.commit()
+    return changed
 
 
 def set_sender_active_job(conn: sqlite3.Connection, *, sender: str, job_id: str) -> None:

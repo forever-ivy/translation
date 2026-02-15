@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
+from scripts.attention_summary import attention_summary
 from scripts.openclaw_translation_orchestrator import run as run_translation
 from scripts.task_bundle_builder import infer_language, infer_role, infer_version
 from scripts.v4_kb import retrieve_kb
@@ -139,21 +140,53 @@ def main() -> int:
             dry_run=args.dry_run_notify,
         )
     elif result.get("status") == "needs_attention":
+        why_lines = attention_summary(
+            status=str(result.get("status") or ""),
+            review_dir=str(result.get("review_dir") or ""),
+            status_flags=[str(x) for x in (result.get("status_flags") or [])],
+            errors=[str(x) for x in (result.get("errors") or [])],
+            artifacts=dict(result.get("artifacts") or {}),
+            max_items=3,
+        )
+        why_block = ""
+        if why_lines:
+            why_block = "\nWhy:\n" + "\n".join(f"- {x}" for x in why_lines[:3])
         _notify(
             conn,
             job_id=args.job_id,
             milestone="needs_attention",
             target=args.target,
-            message=f"[{args.job_id}] needs_attention. Send: status {args.job_id} or rerun {args.job_id}.",
+            message=(
+                f"[{args.job_id}] needs_attention\n"
+                f"Folder: {result.get('review_dir')}"
+                + why_block
+                + f"\nSend: status {args.job_id} | rerun {args.job_id} | no {{reason}}"
+            ),
             dry_run=args.dry_run_notify,
         )
     else:
+        why_lines = attention_summary(
+            status=str(result.get("status") or "failed"),
+            review_dir=str(result.get("review_dir") or ""),
+            status_flags=[str(x) for x in (result.get("status_flags") or [])],
+            errors=[str(x) for x in (result.get("errors") or [])],
+            artifacts=dict(result.get("artifacts") or {}),
+            max_items=3,
+        )
+        why_block = ""
+        if why_lines:
+            why_block = "\nWhy:\n" + "\n".join(f"- {x}" for x in why_lines[:3])
         _notify(
             conn,
             job_id=args.job_id,
             milestone="failed",
             target=args.target,
-            message=f"[{args.job_id}] failed during execution.",
+            message=(
+                f"[{args.job_id}] failed\n"
+                f"Folder: {result.get('review_dir')}"
+                + why_block
+                + f"\nSend: rerun {args.job_id} | status {args.job_id}"
+            ),
             dry_run=args.dry_run_notify,
         )
 

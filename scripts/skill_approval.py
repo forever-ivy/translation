@@ -8,12 +8,12 @@ import json
 import os
 import re
 import shutil
+import signal
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from scripts.v4_pipeline import attach_file_to_job
-from scripts.v4_pipeline import run_job_pipeline
 from scripts.skill_status_card import build_status_card, no_active_job_hint
 from scripts.v4_runtime import (
     DEFAULT_KB_ROOT,
@@ -22,10 +22,14 @@ from scripts.v4_runtime import (
     add_job_final_upload,
     clear_job_pending_action,
     compute_sha256,
+    cancel_job_run,
     db_connect,
     ensure_runtime_paths,
+    enqueue_run_job,
     get_job,
     get_job_interaction,
+    get_last_event,
+    get_active_queue_item,
     get_sender_active_job,
     list_actionable_jobs_for_sender,
     list_job_final_uploads,
@@ -39,6 +43,7 @@ from scripts.v4_runtime import (
     set_job_archive_project,
     set_job_kb_company,
     set_job_pending_action,
+    slugify_identifier,
     update_job_status,
     utc_now_iso,
     write_job,
@@ -46,7 +51,7 @@ from scripts.v4_runtime import (
 
 ACTIVE_JOB_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision"}
 RUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision"}
-RERUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input"}
+RERUN_ALLOWED_STATUSES = {"collecting", "received", "missing_inputs", "needs_revision", "review_ready", "needs_attention", "failed", "incomplete_input", "canceled"}
 
 
 def _require_new_enabled() -> bool:
@@ -72,13 +77,23 @@ def _parse_command(text: str) -> tuple[str, str | None, str]:
         note = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
         return "new", None, note
 
+    if raw_action in {"cancel", "stop", "abort"}:
+        explicit_job: str | None = None
+        reason = ""
+        if len(parts) >= 2 and parts[1].startswith("job_"):
+            explicit_job = parts[1]
+            reason = " ".join(parts[2:]).strip()
+        else:
+            reason = " ".join(parts[1:]).strip()
+        return "cancel", explicit_job, reason
+
     action = raw_action
-    if action not in {"run", "status", "ok", "no", "rerun", "new"}:
+    if action not in {"run", "status", "ok", "no", "rerun", "new", "cancel"}:
         return "", None, ""
 
     explicit_job: str | None = None
     reason = ""
-    if action in {"run", "status", "ok", "rerun"}:
+    if action in {"run", "status", "ok", "rerun", "cancel"}:
         if len(parts) >= 2 and parts[1].startswith("job_"):
             explicit_job = parts[1]
     if action == "no":
@@ -126,7 +141,7 @@ def _resolve_job(
         active_job_id = get_sender_active_job(conn, sender=sender_norm)
         if active_job_id:
             job = get_job(conn, active_job_id)
-            if job and job.get("status") in ACTIVE_JOB_STATUSES.union({"review_ready", "needs_attention", "failed", "incomplete_input", "running"}):
+            if job and job.get("status") in ACTIVE_JOB_STATUSES.union({"queued", "review_ready", "needs_attention", "failed", "incomplete_input", "running", "canceled"}):
                 return job, {"source": "active_map", "multiple": 0}
 
         if allow_fallback:
@@ -160,6 +175,8 @@ def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_n
             pass
     final_uploads_count = len(list_job_final_uploads(conn, job_id=str(job["job_id"])))
     archived = bool(str(job.get("archived_at") or "").strip())
+    last_event = get_last_event(conn, job_id=str(job["job_id"])) or {}
+    queue_item = get_active_queue_item(conn, job_id=str(job["job_id"])) or {}
     return build_status_card(
         job=job,
         files_count=files_count,
@@ -171,6 +188,16 @@ def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_n
         pending_expires_at=pending_expires_at,
         final_uploads_count=final_uploads_count,
         archived=archived,
+        last_milestone=str(last_event.get("milestone") or "").strip(),
+        last_milestone_at=str(last_event.get("created_at") or "").strip(),
+        queue_state=str(queue_item.get("state") or "").strip(),
+        queue_attempt=int(queue_item.get("attempt") or 0),
+        queue_worker_id=str(queue_item.get("worker_id") or "").strip(),
+        queue_heartbeat_at=str(queue_item.get("heartbeat_at") or "").strip(),
+        queue_last_error=str(queue_item.get("last_error") or "").strip(),
+        queue_cancel_requested_at=str(queue_item.get("cancel_requested_at") or "").strip(),
+        queue_cancel_reason=str(queue_item.get("cancel_reason") or "").strip(),
+        queue_cancel_mode=str(queue_item.get("cancel_mode") or "").strip(),
     )
 
 
@@ -222,18 +249,21 @@ def _create_new_job(conn, *, paths, sender: str, note: str) -> dict[str, Any]:
     )
 
 
-def _discover_reference_companies(*, kb_root: Path) -> list[str]:
-    ref_root = (kb_root.expanduser().resolve() / "30_Reference")
-    if not ref_root.exists():
-        return []
-    companies: list[str] = []
-    for child in sorted(ref_root.iterdir(), key=lambda p: p.name.lower()):
-        if not child.is_dir():
+def _discover_kb_companies(*, kb_root: Path) -> list[str]:
+    root = kb_root.expanduser().resolve()
+    sections = ["00_Glossary", "10_Style_Guide", "20_Domain_Knowledge", "30_Reference", "40_Templates"]
+    companies: set[str] = set()
+    for section in sections:
+        section_root = root / section
+        if not section_root.exists() or not section_root.is_dir():
             continue
-        if child.name.startswith("."):
-            continue
-        companies.append(child.name)
-    return companies
+        for child in section_root.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name.startswith("."):
+                continue
+            companies.add(child.name)
+    return sorted(companies, key=lambda s: s.lower())
 
 
 def _company_menu(companies: list[str]) -> tuple[str, list[dict[str, Any]]]:
@@ -255,8 +285,8 @@ def _slugify(value: str, *, fallback: str = "project") -> str:
     raw = (value or "").strip()
     if not raw:
         return fallback
-    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")
-    return cleaned[:64] if cleaned else fallback
+    slug = slugify_identifier(raw, max_len=64, default_prefix=fallback).replace("-", "_")
+    return slug[:64] if slug else fallback
 
 
 def _default_archive_project(job: dict[str, Any], final_uploads: list[str]) -> str:
@@ -393,24 +423,32 @@ def handle_interaction_reply(
 
     # Continue the waiting action.
     if pending_action == "select_company_for_run":
-        update_job_status(conn, job_id=active_job_id, status="received", errors=[])
+        clear_job_pending_action(conn, job_id=active_job_id)
+        update_job_status(conn, job_id=active_job_id, status="queued", errors=[])
+        queued = enqueue_run_job(
+            conn,
+            job_id=active_job_id,
+            notify_target=target,
+            created_by_sender=sender_norm,
+        )
+        qstate = str(queued.get("state") or "queued").strip() or "queued"
+        review_dir = str(job.get("review_dir") or "").strip()
+        folder_line = f"\U0001f4c1 {review_dir}\n" if review_dir else ""
         _send_and_record(
             conn,
             job_id=active_job_id,
-            milestone="run_accepted",
+            milestone="run_enqueued" if qstate == "queued" else "run_already_running",
             target=target,
-            message="\U0001f680 Starting execution\n\u23f3 Codex+Gemini translating...",
+            message=(
+                f"\u23f3 Accepted \u00b7 {qstate}\n"
+                f"\U0001f194 {active_job_id}\n"
+                + folder_line
+                + "\nSend: status"
+            ),
             dry_run=dry_run_notify,
         )
         conn.close()
-        result = run_job_pipeline(
-            job_id=active_job_id,
-            work_root=work_root,
-            kb_root=kb_root,
-            notify_target=target,
-            dry_run_notify=dry_run_notify,
-        )
-        return {"ok": bool(result.get("ok")), "job_id": active_job_id, "result": result}
+        return {"ok": True, "job_id": active_job_id, "status": "queued", "queue": queued}
 
     if pending_action == "select_company_for_archive":
         company = str(selected.get("company") or "").strip()
@@ -599,7 +637,7 @@ def handle_command(
         conn.close()
         return {"ok": True, "job_id": created["job_id"], "status": "collecting"}
 
-    allow_fallback = action == "status"
+    allow_fallback = action in {"status", "cancel"}
     job, resolve_meta = _resolve_job(
         conn,
         sender=sender,
@@ -644,6 +682,105 @@ def handle_command(
         return {"ok": True, "job_id": job_id, "status": str(job.get("status")), "resolve": resolve_meta}
 
     current_status = str(job.get("status") or "")
+    current_norm = current_status.strip().lower()
+
+    if action == "cancel":
+        queue_item = get_active_queue_item(conn, job_id=job_id) or {}
+        if not queue_item:
+            msg = (
+                "\U0001f4ed Nothing to cancel\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"\U0001f194 {job_id}\n"
+                "\u23ed\ufe0f Send: status"
+            )
+            _send_and_record(conn, job_id=job_id, milestone="cancel_no_active_run", target=target, message=msg, dry_run=dry_run_notify)
+            conn.close()
+            return {"ok": True, "job_id": job_id, "status": current_status, "cancel": "noop"}
+
+        cancel_result = cancel_job_run(
+            conn,
+            job_id=job_id,
+            requested_by=sender,
+            reason=reason,
+            mode="force",
+        )
+        q = dict(cancel_result.get("queue") or {})
+        action2 = str(cancel_result.get("action") or "").strip()
+
+        if not cancel_result.get("ok"):
+            msg = (
+                "\U0001f4ed Nothing to cancel\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"\U0001f194 {job_id}\n"
+                "\u23ed\ufe0f Send: status"
+            )
+            _send_and_record(conn, job_id=job_id, milestone="cancel_no_active_run", target=target, message=msg, dry_run=dry_run_notify)
+            conn.close()
+            return {"ok": True, "job_id": job_id, "status": current_status, "cancel": "noop"}
+
+        if action2 == "canceled":
+            msg = (
+                "\u26d4\ufe0f Canceled\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"\U0001f194 {job_id}\n"
+                "\u23ed\ufe0f Send: rerun | new"
+            )
+            _send_and_record(conn, job_id=job_id, milestone="canceled", target=target, message=msg, dry_run=dry_run_notify)
+            conn.close()
+            return {"ok": True, "job_id": job_id, "status": "canceled", "queue": q}
+
+        # running -> cancel requested (force)
+        pgid = int(q.get("pipeline_pgid") or 0)
+        pid = int(q.get("pipeline_pid") or 0)
+        kill_sent = False
+        try:
+            if pgid > 0 and hasattr(os, "killpg"):
+                os.killpg(pgid, signal.SIGTERM)
+                os.killpg(pgid, signal.SIGKILL)
+                kill_sent = True
+            elif pid > 0:
+                os.kill(pid, signal.SIGTERM)
+                os.kill(pid, signal.SIGKILL)
+                kill_sent = True
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+        except Exception:
+            pass
+
+        status_line = "Cancel requested" if action2 != "already_requested" else "Already canceling"
+        msg = (
+            f"\u26d4\ufe0f {status_line}\n"
+            f"\U0001f4cb {_task_name}\n"
+            f"\U0001f194 {job_id}\n"
+            + ("\U0001f5f2 Sent kill signal\n" if kill_sent else "")
+            + "\u23ed\ufe0f Send: status"
+        )
+        _send_and_record(
+            conn,
+            job_id=job_id,
+            milestone="cancel_requested",
+            target=target,
+            message=msg,
+            dry_run=dry_run_notify,
+        )
+        conn.close()
+        return {"ok": True, "job_id": job_id, "status": current_status, "queue": q, "kill_sent": kill_sent}
+
+    if action in {"run", "rerun"} and current_norm in {"queued", "running"}:
+        queue_item = get_active_queue_item(conn, job_id=job_id) or {}
+        qstate = str(queue_item.get("state") or current_norm).strip() or current_norm
+        msg = (
+            f"\u23f3 Already {qstate}\n"
+            f"\U0001f4cb {_task_name}\n"
+            f"\U0001f194 {job_id}\n"
+            f"\u23ed\ufe0f Send: status"
+        )
+        _send_and_record(conn, job_id=job_id, milestone="run_already_queued", target=target, message=msg, dry_run=dry_run_notify)
+        conn.close()
+        return {"ok": True, "job_id": job_id, "status": current_status, "queue": queue_item}
+
     if action == "run" and current_status not in RUN_ALLOWED_STATUSES:
         msg = (
             f"\u26a0\ufe0f Cannot run\n"
@@ -699,7 +836,7 @@ def handle_command(
 
         kb_company = str(job.get("kb_company") or "").strip()
         if not kb_company:
-            companies = _discover_reference_companies(kb_root=kb_root)
+            companies = _discover_kb_companies(kb_root=kb_root)
             menu, options = _company_menu(companies)
             if not options:
                 _send_and_record(
@@ -707,7 +844,7 @@ def handle_command(
                     job_id=job_id,
                     milestone="archive_blocked",
                     target=target,
-                    message="\u26a0\ufe0f No companies configured. Create: KB/30_Reference/{Company}/",
+                    message="\u26a0\ufe0f No companies configured. Create: KB/{Section}/{Company}/ (e.g., 30_Reference/{Company}/)",
                     dry_run=dry_run_notify,
                 )
                 conn.close()
@@ -775,9 +912,22 @@ def handle_command(
         return {"ok": True, "job_id": job_id, "status": "needs_revision", "reason": reason_norm}
 
     if action in {"run", "rerun"}:
+        queue_item = get_active_queue_item(conn, job_id=job_id) or {}
+        if queue_item:
+            qstate = str(queue_item.get("state") or "queued").strip() or "queued"
+            msg = (
+                f"\u23f3 Already {qstate}\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"\U0001f194 {job_id}\n"
+                f"\u23ed\ufe0f Send: status"
+            )
+            _send_and_record(conn, job_id=job_id, milestone="run_already_queued", target=target, message=msg, dry_run=dry_run_notify)
+            conn.close()
+            return {"ok": True, "job_id": job_id, "status": current_status, "queue": queue_item}
+
         kb_company = str(job.get("kb_company") or "").strip()
         if not kb_company:
-            companies = _discover_reference_companies(kb_root=kb_root)
+            companies = _discover_kb_companies(kb_root=kb_root)
             menu, options = _company_menu(companies)
             if not options:
                 _send_and_record(
@@ -785,7 +935,7 @@ def handle_command(
                     job_id=job_id,
                     milestone="run_blocked",
                     target=target,
-                    message="\u26a0\ufe0f No companies configured. Create: KB/30_Reference/{Company}/",
+                    message="\u26a0\ufe0f No companies configured. Create: KB/{Section}/{Company}/ (e.g., 30_Reference/{Company}/)",
                     dry_run=dry_run_notify,
                 )
                 conn.close()
@@ -810,24 +960,32 @@ def handle_command(
             return {"ok": True, "job_id": job_id, "status": "awaiting_company_selection"}
 
         clear_job_pending_action(conn, job_id=job_id)
-        update_job_status(conn, job_id=job_id, status="received", errors=[])
+        update_job_status(conn, job_id=job_id, status="queued", errors=[])
+        queued = enqueue_run_job(
+            conn,
+            job_id=job_id,
+            notify_target=target,
+            created_by_sender=sender.strip(),
+        )
+        qstate = str(queued.get("state") or "queued").strip() or "queued"
+        review_dir = str(job.get("review_dir") or "").strip()
+        folder_line = f"\U0001f4c1 {review_dir}\n" if review_dir else ""
         _send_and_record(
             conn,
             job_id=job_id,
-            milestone="run_accepted",
+            milestone="run_enqueued" if qstate == "queued" else "run_already_running",
             target=target,
-            message=f"\U0001f680 Starting execution\n\U0001f4cb {_task_name}\n\u23f3 Codex+Gemini translating...",
+            message=(
+                f"\u23f3 Accepted \u00b7 {qstate}\n"
+                f"\U0001f4cb {_task_name}\n"
+                f"\U0001f194 {job_id}\n"
+                + folder_line
+                + "\nSend: status"
+            ),
             dry_run=dry_run_notify,
         )
         conn.close()
-        result = run_job_pipeline(
-            job_id=job_id,
-            work_root=work_root,
-            kb_root=kb_root,
-            notify_target=target,
-            dry_run_notify=dry_run_notify,
-        )
-        return {"ok": bool(result.get("ok")), "job_id": job_id, "result": result}
+        return {"ok": True, "job_id": job_id, "status": "queued", "queue": queued}
 
     conn.close()
     return {"ok": False, "error": "unreachable"}
