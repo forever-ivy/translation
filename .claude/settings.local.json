@@ -79,6 +79,48 @@
           "Regression prevention"
         ],
         "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+      },
+      {
+        "id": "kb-memory",
+        "role": "KB & Memory Librarian",
+        "description": "Responsible for Knowledge Repository structure, KB sync/retrieve (local + ClawRAG), company/reference isolation, archiving FINAL uploads into reference, and openclaw-mem write/read behavior.",
+        "focusAreas": [
+          "docs/KB_AND_MEMORY_SYSTEM.md",
+          "scripts/v4_kb.py",
+          "scripts/v4_pipeline.py",
+          "scripts/v4_runtime.py",
+          "scripts/skill_approval.py",
+          "scripts/skill_message_ingest.py",
+          "docs/IMPLEMENTATION_NOTES.md"
+        ],
+        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+      },
+      {
+        "id": "security-auditor",
+        "role": "Security Auditor",
+        "description": "Responsible for hardening ingestion/routing, validating limits (size/type), preventing path traversal, minimizing leakage/exfil risks, and keeping security docs/checklists accurate.",
+        "focusAreas": [
+          "scripts/skill_message_ingest.py",
+          "scripts/skill_message_router.py",
+          "scripts/telegram_bot.py",
+          "scripts/v4_runtime.py",
+          "docs/SECURITY_ROTATION_CHECKLIST.md",
+          "config/env.example"
+        ],
+        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+      },
+      {
+        "id": "docs-maintainer",
+        "role": "Documentation Maintainer",
+        "description": "Responsible for keeping README/docs/skill docs in sync with actual behavior, and ensuring user-facing commands and workflows are correct and discoverable.",
+        "focusAreas": [
+          "README.md",
+          "docs/",
+          "skills/translation-router/SKILL.md",
+          "config/env.example",
+          "config/env.v4.local.example"
+        ],
+        "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
       }
     ],
     "coordinationRules": {

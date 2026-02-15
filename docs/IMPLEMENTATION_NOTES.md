@@ -20,21 +20,22 @@
 7. Output path is `_VERIFY/{job_id}` only.
 8. Verify bundle no longer emits Draft artifacts (only `Final.docx` + `Final-Reflow.docx`).
 9. `ok` marks `verified` and archives user-uploaded FINAL file(s) into KB reference (still no auto-delivery copy).
-10. Contextual command interface:
+10. Post-run attachments (when a job is `review_ready/needs_attention`) now prompt for destination unless explicit intent is provided (`final`/`ok` text), to prevent mistakenly treating new-task uploads as FINAL files.
+11. Contextual command interface:
    - `new | run | status | ok | no {reason} | rerun`
-11. Sender-active-job mapping remains persisted in SQLite.
-12. WhatsApp strict router mode remains:
+12. Sender-active-job mapping remains persisted in SQLite.
+13. WhatsApp strict router mode remains:
    - route inbound task messages to dispatcher, not free-form chat
    - extract `[media attached: ...]` local file paths
    - strip inline `<file ...>` blocks to reduce token pressure
-13. Translation model calls enforce `--thinking high` by default:
+14. Translation model calls enforce `--thinking high` by default:
    - env override: `OPENCLAW_TRANSLATION_THINKING`
-14. Execution metadata includes:
+15. Execution metadata includes:
    - `thinking_level`
    - `router_mode`
    - `token_guard_applied`
    - `knowledge_backend`
-15. Added spreadsheet-aware execution:
+16. Added spreadsheet-aware execution:
    - task type `SPREADSHEET_TRANSLATION`
    - format-preserving `.xlsx` output by applying a cell translation map into a copy of the source workbook
    - output is:

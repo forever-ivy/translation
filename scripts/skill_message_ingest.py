@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 from datetime import UTC, datetime, timedelta
 import json
 import os
+import re
 import shutil
 import urllib.parse
 import urllib.request
@@ -28,6 +30,7 @@ from scripts.v4_runtime import (
     list_job_files,
     make_job_id,
     send_message,
+    set_job_pending_action,
     update_job_status,
     utc_now_iso,
 )
@@ -276,17 +279,31 @@ def _infer_suffix_from_mime(mime: str) -> str:
     return ""
 
 
+_ALLOWED_ATTACHMENT_SUFFIXES = {".xlsx", ".docx", ".csv"}
+
+
+def _max_attachment_bytes() -> int:
+    raw = str(os.getenv("OPENCLAW_ATTACHMENT_DOWNLOAD_MAX_MB", "35")).strip()
+    try:
+        mb = int(raw)
+    except ValueError:
+        mb = 35
+    return max(1, mb) * 1024 * 1024
+
+
 def _download_to_path(url: str, *, dest: Path, max_bytes: int, timeout_seconds: int) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "openclaw/translation-ingest"})
     with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
         length = resp.headers.get("Content-Length")
+        length_int: int | None = None
         if length:
             try:
-                if int(length) > max_bytes:
-                    raise ValueError("download_too_large")
-            except ValueError:
-                pass
+                length_int = int(str(length).strip())
+            except (ValueError, TypeError):
+                length_int = None
+        if length_int is not None and length_int > max_bytes:
+            raise ValueError("download_too_large")
         total = 0
         with open(dest, "wb") as fh:
             while True:
@@ -300,33 +317,122 @@ def _download_to_path(url: str, *, dest: Path, max_bytes: int, timeout_seconds: 
 
 
 def _save_attachment_to_path(item: dict[str, Any], *, target_path: Path) -> tuple[bool, str]:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    max_bytes = _max_attachment_bytes()
+
     if item.get("path"):
         src = Path(str(item["path"])).expanduser()
         if not src.exists():
             return False, "missing_path"
+        if target_path.suffix.lower() not in _ALLOWED_ATTACHMENT_SUFFIXES:
+            return False, f"blocked_suffix:{target_path.suffix.lower() or 'none'}"
+        try:
+            if src.stat().st_size > max_bytes:
+                return False, "file_too_large"
+        except OSError:
+            pass
         shutil.copy2(src, target_path)
         return True, "copied_path"
     if item.get("local_path"):
         src = Path(str(item["local_path"])).expanduser()
         if not src.exists():
             return False, "missing_local_path"
+        if target_path.suffix.lower() not in _ALLOWED_ATTACHMENT_SUFFIXES:
+            return False, f"blocked_suffix:{target_path.suffix.lower() or 'none'}"
+        try:
+            if src.stat().st_size > max_bytes:
+                return False, "file_too_large"
+        except OSError:
+            pass
         shutil.copy2(src, target_path)
         return True, "copied_local_path"
     if item.get("content_base64"):
-        target_path.write_bytes(base64.b64decode(str(item["content_base64"]).encode("utf-8")))
+        if target_path.suffix.lower() not in _ALLOWED_ATTACHMENT_SUFFIXES:
+            return False, f"blocked_suffix:{target_path.suffix.lower() or 'none'}"
+        encoded = str(item.get("content_base64") or "")
+        if not encoded.strip():
+            return False, "empty_base64"
+        # Fast fail without decoding huge payloads (base64 expands ~4/3).
+        max_b64_chars = int((max_bytes * 4) / 3) + 32
+        if len(encoded) > max_b64_chars:
+            return False, "payload_too_large"
+        try:
+            decoded = base64.b64decode(encoded.encode("utf-8"), validate=True)
+        except (binascii.Error, ValueError):
+            return False, "invalid_base64"
+        if len(decoded) > max_bytes:
+            return False, "payload_too_large"
+        target_path.write_bytes(decoded)
         return True, "decoded_base64"
 
     url = _attachment_url(item)
     if url and _is_http_url(url):
         suffix = target_path.suffix.lower()
-        if suffix not in {".xlsx", ".docx", ".csv"}:
+        if suffix not in _ALLOWED_ATTACHMENT_SUFFIXES:
             return False, f"download_blocked_suffix:{suffix or 'none'}"
-        max_mb = int(os.getenv("OPENCLAW_ATTACHMENT_DOWNLOAD_MAX_MB", "35"))
-        timeout_seconds = int(os.getenv("OPENCLAW_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS", "60"))
-        max_bytes = max(1, max_mb) * 1024 * 1024
-        _download_to_path(url, dest=target_path, max_bytes=max_bytes, timeout_seconds=timeout_seconds)
+        timeout_raw = str(os.getenv("OPENCLAW_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS", "60")).strip()
+        try:
+            timeout_seconds = int(timeout_raw)
+        except ValueError:
+            timeout_seconds = 60
+        try:
+            _download_to_path(url, dest=target_path, max_bytes=max_bytes, timeout_seconds=timeout_seconds)
+        except ValueError as e:
+            if str(e) == "download_too_large":
+                return False, "download_too_large"
+            return False, "download_error"
+        except Exception:
+            return False, "download_error"
         return True, "downloaded_url"
     return False, "unsupported_attachment"
+
+
+def _explicit_final_intent(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    head = lowered.split(" ", 1)[0]
+    if head in {"final", "ok"}:
+        return True
+    return " final" in lowered or lowered.startswith("final ")
+
+
+_SAFE_DIR_RE = re.compile(r"[^A-Za-z0-9._+-]+")
+
+
+def _safe_dir_component(value: str, *, fallback: str = "unknown") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return fallback
+    cleaned = _SAFE_DIR_RE.sub("_", raw).strip("_")
+    return cleaned or fallback
+
+
+def _stage_dir(*, work_root: Path, sender: str, message_id: str) -> Path:
+    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    sender_part = _safe_dir_component(sender, fallback="sender")
+    msg_part = _safe_dir_component(message_id, fallback=f"msg_{ts}")
+    return work_root.expanduser().resolve() / "_STAGING" / sender_part / msg_part
+
+
+def _attachment_intent_menu(*, job_id: str, files_count: int) -> tuple[str, list[dict[str, Any]]]:
+    options = [
+        {"action": "final", "label": "Attach as FINAL for current task"},
+        {"action": "new", "label": "Start NEW task with these files"},
+        {"action": "discard", "label": "Discard (move to trash)"},
+    ]
+    lines = [
+        "\U0001f4ce Files received",
+        f"\U0001f194 Current task: {job_id}",
+        f"\U0001f4ce Attachments: {files_count}",
+        "",
+        "Where should these files go?",
+        "",
+    ]
+    for idx, opt in enumerate(options, start=1):
+        lines.append(f"{idx}) {opt['label']}")
+    lines.extend(["", "Reply with a number (e.g., 1)."])
+    return "\n".join(lines), options
 
 
 def main() -> int:
@@ -406,6 +512,85 @@ def main() -> int:
             job = get_job(conn, post_run_job_id)
             conn.close()
             if job:
+                if not _explicit_final_intent(text):
+                    staging_dir = _stage_dir(work_root=work_root, sender=sender, message_id=message_id)
+                    staging_dir.mkdir(parents=True, exist_ok=True)
+
+                    saved_files: list[str] = []
+                    failures: list[str] = []
+                    for idx, item in enumerate(attachments, start=1):
+                        url = _attachment_url(item)
+                        mime_hint = str(item.get("mime_type") or item.get("mimeType") or "")
+                        file_name = _safe_basename(
+                            item.get("name")
+                            or item.get("fileName")
+                            or (Path(urllib.parse.urlparse(url).path).name if url else "")
+                            or f"staged_{idx}"
+                        )
+                        if not Path(file_name).suffix:
+                            inferred = _infer_suffix_from_mime(mime_hint)
+                            if inferred:
+                                file_name = f"{file_name}{inferred}"
+                        target_path = staging_dir / file_name
+                        if target_path.exists():
+                            stem = target_path.stem
+                            suffix = target_path.suffix
+                            target_path = staging_dir / f"{stem}_{idx}_{int(datetime.now(UTC).timestamp())}{suffix}"
+                        ok, reason = _save_attachment_to_path(item, target_path=target_path)
+                        if not ok:
+                            failures.append(f"{file_name}:{reason}")
+                            continue
+                        saved_files.append(str(target_path.resolve()))
+
+                    if not saved_files:
+                        _notify_target(
+                            target=reply_target,
+                            message=f"\u26a0\ufe0f No files saved\nFailed: {', '.join(failures[:3])}" if failures else "\u26a0\ufe0f No files saved",
+                            dry_run=args.dry_run_notify,
+                        )
+                        print(json.dumps({"ok": False, "mode": "attachment_intent_gate", "error": "no_files_saved"}, ensure_ascii=False))
+                        return 0
+
+                    menu, options = _attachment_intent_menu(job_id=post_run_job_id, files_count=len(saved_files))
+                    # Store staging info in every option.
+                    for opt in options:
+                        opt.update(
+                            {
+                                "staging_dir": str(staging_dir.resolve()),
+                                "files": saved_files,
+                                "post_run_job_id": post_run_job_id,
+                            }
+                        )
+                    conn = db_connect(paths)
+                    set_job_pending_action(
+                        conn,
+                        job_id=post_run_job_id,
+                        sender=str(job.get("sender") or sender).strip(),
+                        pending_action="select_attachment_destination",
+                        options=options,
+                        expires_at=(datetime.now(UTC) + timedelta(minutes=20)).isoformat(),
+                    )
+                    conn.close()
+
+                    _notify_target(
+                        target=reply_target,
+                        message=menu + (f"\n\u26a0\ufe0f Failed: {', '.join(failures[:3])}" if failures else ""),
+                        dry_run=args.dry_run_notify,
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "mode": "attachment_intent_gate",
+                                "job_id": post_run_job_id,
+                                "staging_dir": str(staging_dir.resolve()),
+                                "saved_files": saved_files,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 0
+
                 review_dir = Path(str(job.get("review_dir") or "")).expanduser().resolve()
                 dest_dir = review_dir / "FinalUploads"
                 dest_dir.mkdir(parents=True, exist_ok=True)
@@ -421,7 +606,7 @@ def main() -> int:
                         or (Path(urllib.parse.urlparse(url).path).name if url else "")
                         or f"final_upload_{idx}"
                     )
-                    if url and not Path(file_name).suffix:
+                    if not Path(file_name).suffix:
                         inferred = _infer_suffix_from_mime(mime_hint)
                         if inferred:
                             file_name = f"{file_name}{inferred}"
@@ -440,14 +625,25 @@ def main() -> int:
                     conn.close()
                     saved_files.append(str(target_path.resolve()))
 
-                _notify_target(
-                    target=reply_target,
-                    message=(
-                        f"\U0001f4ce Final file(s) received: {len(saved_files)}\nSend: ok to archive"
-                        + (f"\n\u26a0\ufe0f Failed: {', '.join(failures[:3])}" if failures else "")
-                    ),
-                    dry_run=args.dry_run_notify,
-                )
+                if text.strip().lower().startswith("ok"):
+                    handle_command(
+                        command_text="ok",
+                        work_root=work_root,
+                        kb_root=kb_root,
+                        target=reply_target,
+                        sender=sender,
+                        dry_run_notify=args.dry_run_notify,
+                    )
+                else:
+                    _notify_target(
+                        target=reply_target,
+                        message=(
+                            f"\U0001f4ce Final file(s) received: {len(saved_files)}\nSend: ok to archive"
+                            + (f"\n\u26a0\ufe0f Failed: {', '.join(failures[:3])}" if failures else "")
+                        ),
+                        dry_run=args.dry_run_notify,
+                    )
+
                 print(
                     json.dumps(
                         {
@@ -519,7 +715,7 @@ def main() -> int:
             or (Path(urllib.parse.urlparse(url).path).name if url else "")
             or f"tg_attachment_{idx}"
         )
-        if url and not Path(file_name).suffix:
+        if not Path(file_name).suffix:
             inferred = _infer_suffix_from_mime(mime_hint)
             if inferred:
                 file_name = f"{file_name}{inferred}"

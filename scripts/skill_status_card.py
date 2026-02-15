@@ -95,6 +95,10 @@ def build_status_card(
     multiple_hint: int = 0,
     require_new: bool = True,
     task_label: str = "",
+    pending_action: str = "",
+    pending_expires_at: str = "",
+    final_uploads_count: int = 0,
+    archived: bool = False,
 ) -> str:
     job_id = str(job.get("job_id") or "unknown")
     status = str(job.get("status") or "unknown")
@@ -123,7 +127,11 @@ def build_status_card(
     lines.extend([
         f"\U0001f4cc Stage: {_status_label(status)}",
         (f"\U0001f3e2 Company: {job.get('kb_company')}" if str(job.get("kb_company") or "").strip() else ""),
+        (f"\u23f3 Pending: {pending_action}" if str(pending_action or "").strip() else ""),
+        (f"\u23f1\ufe0f Expires: {pending_expires_at}" if str(pending_expires_at or "").strip() else ""),
         files_line,
+        (f"\U0001f4e5 Final uploads: {int(final_uploads_count)}" if int(final_uploads_count or 0) > 0 else ""),
+        (f"\U0001f4c1 Archived: {'yes' if archived else 'no'}"),
         f"\U0001f504 Rounds: {rounds}",
         (f"\U0001f3f7\ufe0f Version: {pipeline_version}" if pipeline_version else ""),
         f"\u23ed\ufe0f Next: {next_action_for_status(status, require_new=require_new)}",

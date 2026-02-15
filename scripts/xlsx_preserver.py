@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from copy import copy as _copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -178,7 +179,9 @@ def beautify_xlsx_non_structural(
 
         align = cell.alignment
         try:
-            cell.alignment = align.copy(wrap_text=True)
+            new_align = _copy(align)
+            new_align.wrap_text = True
+            cell.alignment = new_align
         except Exception:
             # Fallback: set wrap_text only when copy not available
             cell.alignment = type(align)(**{**align.__dict__, "wrap_text": True})  # pragma: no cover
@@ -253,4 +256,3 @@ def apply_translation_map(
         "missing_cells": missing_cells,
         "skipped_formulas": skipped_formulas,
     }
-

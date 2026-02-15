@@ -8,6 +8,10 @@ Arabic-to-English translation automation system (V6.0). Uses OpenClaw as the sol
 
 The user prefers human-in-the-loop delivery: the system writes only to `_VERIFY/{job_id}`, and the user manually moves files to the final folder.
 
+## Agent Teams (multi-agent dev)
+
+This repo includes a ready-to-use Agent Teams config at `.claude/settings.local.json` (for Claude Code). Roles and collaboration workflow are documented in `docs/DEV_AGENT_TEAM.md`.
+
 ## Commands
 
 ### Run tests

@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from scripts.v4_pipeline import attach_file_to_job
 from scripts.v4_pipeline import run_job_pipeline
 from scripts.skill_status_card import build_status_card, no_active_job_hint
 from scripts.v4_runtime import (
@@ -146,6 +147,19 @@ def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_n
     files_count = len(files)
     docx_count = sum(1 for item in files if Path(str(item.get("path", ""))).suffix.lower() == ".docx")
     task_label = str(job.get("task_label") or "")
+    interaction = get_job_interaction(conn, job_id=str(job["job_id"])) or {}
+    pending_action = str(interaction.get("pending_action") or "").strip()
+    pending_expires_at = str(interaction.get("expires_at") or "").strip()
+    if pending_action and pending_expires_at:
+        try:
+            if datetime.fromisoformat(pending_expires_at) < datetime.now(UTC):
+                clear_job_pending_action(conn, job_id=str(job["job_id"]))
+                pending_action = ""
+                pending_expires_at = ""
+        except ValueError:
+            pass
+    final_uploads_count = len(list_job_final_uploads(conn, job_id=str(job["job_id"])))
+    archived = bool(str(job.get("archived_at") or "").strip())
     return build_status_card(
         job=job,
         files_count=files_count,
@@ -153,6 +167,10 @@ def _status_text(conn, job: dict[str, Any], *, multiple_hint: int = 0, require_n
         multiple_hint=multiple_hint,
         require_new=require_new,
         task_label=task_label,
+        pending_action=pending_action,
+        pending_expires_at=pending_expires_at,
+        final_uploads_count=final_uploads_count,
+        archived=archived,
     )
 
 
@@ -356,21 +374,22 @@ def handle_interaction_reply(
         return {"ok": False, "error": "invalid_selection"}
 
     selected = options[idx - 1]
-    company = str(selected.get("company") or "").strip()
-    if not company:
-        conn.close()
-        return {"ok": False, "error": "invalid_option"}
+    if pending_action in {"select_company_for_run", "select_company_for_archive"}:
+        company = str(selected.get("company") or "").strip()
+        if not company:
+            conn.close()
+            return {"ok": False, "error": "invalid_option"}
 
-    set_job_kb_company(conn, job_id=active_job_id, kb_company=company)
-    clear_job_pending_action(conn, job_id=active_job_id)
-    _send_and_record(
-        conn,
-        job_id=active_job_id,
-        milestone="company_selected",
-        target=target,
-        message=f"\u2705 Company selected: {company}",
-        dry_run=dry_run_notify,
-    )
+        set_job_kb_company(conn, job_id=active_job_id, kb_company=company)
+        clear_job_pending_action(conn, job_id=active_job_id)
+        _send_and_record(
+            conn,
+            job_id=active_job_id,
+            milestone="company_selected",
+            target=target,
+            message=f"\u2705 Company selected: {company}",
+            dry_run=dry_run_notify,
+        )
 
     # Continue the waiting action.
     if pending_action == "select_company_for_run":
@@ -394,6 +413,7 @@ def handle_interaction_reply(
         return {"ok": bool(result.get("ok")), "job_id": active_job_id, "result": result}
 
     if pending_action == "select_company_for_archive":
+        company = str(selected.get("company") or "").strip()
         final_uploads = list_job_final_uploads(conn, job_id=active_job_id)
         if not final_uploads:
             conn.close()
@@ -421,6 +441,137 @@ def handle_interaction_reply(
         )
         conn.close()
         return {"ok": True, "job_id": active_job_id, "status": "verified", "archive": archive_result}
+
+    if pending_action == "select_attachment_destination":
+        action = str(selected.get("action") or "").strip().lower()
+        staging_dir = Path(str(selected.get("staging_dir") or "")).expanduser()
+        files_raw = selected.get("files")
+        staged_files: list[Path] = []
+        if isinstance(files_raw, list):
+            for item in files_raw:
+                p = Path(str(item)).expanduser()
+                staged_files.append(p)
+        if not staged_files and staging_dir.is_dir():
+            staged_files = [p for p in sorted(staging_dir.iterdir()) if p.is_file()]
+        if not staged_files:
+            clear_job_pending_action(conn, job_id=active_job_id)
+            conn.close()
+            send_message(target=target, message="\u26a0\ufe0f No staged files found.", dry_run=dry_run_notify)
+            return {"ok": False, "error": "no_staged_files"}
+
+        if action == "final":
+            review_dir = Path(str(job.get("review_dir") or "")).expanduser().resolve()
+            dest_dir = review_dir / "FinalUploads"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            moved: list[str] = []
+            failures: list[str] = []
+            for idx2, src in enumerate(staged_files, start=1):
+                if not src.exists() or not src.is_file():
+                    continue
+                dst = dest_dir / src.name
+                if dst.exists():
+                    dst = dest_dir / f"{dst.stem}_{idx2}_{int(datetime.now(UTC).timestamp())}{dst.suffix}"
+                try:
+                    shutil.move(str(src), str(dst))
+                except Exception:
+                    failures.append(src.name)
+                    continue
+                add_job_final_upload(conn, job_id=active_job_id, sender=sender_norm, path=dst)
+                moved.append(str(dst.resolve()))
+
+            clear_job_pending_action(conn, job_id=active_job_id)
+            _send_and_record(
+                conn,
+                job_id=active_job_id,
+                milestone="final_uploads_staged",
+                target=target,
+                message=(
+                    f"\U0001f4ce Final file(s) received: {len(moved)}\n"
+                    "Send: ok to archive"
+                    + (f"\n\u26a0\ufe0f Failed: {', '.join(failures[:3])}" if failures else "")
+                ),
+                dry_run=dry_run_notify,
+            )
+            conn.close()
+            return {"ok": True, "job_id": active_job_id, "status": str(job.get("status") or ""), "moved": moved}
+
+        if action == "new":
+            # Create a new collecting job and move staged files into its inbox.
+            created = _create_new_job(conn, paths=paths, sender=sender_norm, note="")
+            new_job_id = str(created["job_id"])
+            new_inbox = Path(str(created.get("inbox_dir") or "")).expanduser().resolve()
+            new_inbox.mkdir(parents=True, exist_ok=True)
+            moved: list[str] = []
+            failures: list[str] = []
+            for idx2, src in enumerate(staged_files, start=1):
+                if not src.exists() or not src.is_file():
+                    continue
+                dst = new_inbox / src.name
+                if dst.exists():
+                    dst = new_inbox / f"{dst.stem}_{idx2}_{int(datetime.now(UTC).timestamp())}{dst.suffix}"
+                try:
+                    shutil.move(str(src), str(dst))
+                except Exception:
+                    failures.append(src.name)
+                    continue
+                attach_file_to_job(work_root=work_root, job_id=new_job_id, path=dst)
+                moved.append(str(dst.resolve()))
+
+            # Clear the pending action on the previous job (active_job_id), even though active sender job has changed.
+            clear_job_pending_action(conn, job_id=active_job_id)
+            _send_and_record(
+                conn,
+                job_id=new_job_id,
+                milestone="new_from_staging",
+                target=target,
+                message=(
+                    f"\u2705 New task created: {new_job_id}\n"
+                    f"\U0001f4ce Files: {len(moved)}\n"
+                    "Send: run"
+                    + (f"\n\u26a0\ufe0f Failed: {', '.join(failures[:3])}" if failures else "")
+                ),
+                dry_run=dry_run_notify,
+            )
+            conn.close()
+            return {"ok": True, "job_id": new_job_id, "status": "collecting", "moved": moved}
+
+        if action == "discard":
+            work_root_path = work_root.expanduser().resolve()
+            trash_root = work_root_path / "_TRASH" / "_STAGING"
+            trash_root.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            safe_name = f"{sender_norm}_{ts}".replace("/", "_")
+            dest = trash_root / safe_name
+            try:
+                if staging_dir.is_dir():
+                    shutil.move(str(staging_dir), str(dest))
+                else:
+                    dest.mkdir(parents=True, exist_ok=True)
+                    for src in staged_files:
+                        if src.exists() and src.is_file():
+                            shutil.move(str(src), str(dest / src.name))
+            except Exception:
+                clear_job_pending_action(conn, job_id=active_job_id)
+                conn.close()
+                send_message(target=target, message="\u26a0\ufe0f Failed to discard staged files.", dry_run=dry_run_notify)
+                return {"ok": False, "error": "discard_failed"}
+
+            clear_job_pending_action(conn, job_id=active_job_id)
+            _send_and_record(
+                conn,
+                job_id=active_job_id,
+                milestone="staging_discarded",
+                target=target,
+                message=f"\u2705 Discarded staged files (moved to trash): {dest}",
+                dry_run=dry_run_notify,
+            )
+            conn.close()
+            return {"ok": True, "job_id": active_job_id, "status": str(job.get("status") or ""), "trash": str(dest.resolve())}
+
+        clear_job_pending_action(conn, job_id=active_job_id)
+        conn.close()
+        send_message(target=target, message="\u26a0\ufe0f Invalid selection.", dry_run=dry_run_notify)
+        return {"ok": False, "error": "invalid_option"}
 
     conn.close()
     return {"ok": False, "error": "unsupported_pending_action", "pending_action": pending_action}
