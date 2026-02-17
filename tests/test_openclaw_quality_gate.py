@@ -2,7 +2,12 @@
 
 import unittest
 
-from scripts.openclaw_quality_gate import compute_runtime_timeout, evaluate_quality, evaluate_round
+from scripts.openclaw_quality_gate import (
+    check_preservation_fidelity,
+    compute_runtime_timeout,
+    evaluate_quality,
+    evaluate_round,
+)
 
 
 class OpenClawQualityGateTest(unittest.TestCase):
@@ -37,6 +42,124 @@ class OpenClawQualityGateTest(unittest.TestCase):
             gemini_enabled=True,
         )
         self.assertTrue(out["pass"])
+
+
+class PreservationFidelityTest(unittest.TestCase):
+    def test_passes_when_all_preserved(self):
+        draft = {
+            "docx_translation_map": [
+                {"id": "p:0", "text": "Hello World"},
+                {"id": "p:1", "text": "Good morning"},
+            ]
+        }
+        preserved = {
+            "p:0": "Hello World",
+            "p:1": "Good morning",
+        }
+        passed, fidelity, errors = check_preservation_fidelity(draft, preserved)
+        self.assertTrue(passed)
+        self.assertEqual(fidelity, 1.0)
+        self.assertEqual(len(errors), 0)
+
+    def test_fails_when_text_modified(self):
+        draft = {
+            "docx_translation_map": [
+                {"id": "p:0", "text": "Hello Universe"},  # Changed
+                {"id": "p:1", "text": "Good morning"},
+            ]
+        }
+        preserved = {
+            "p:0": "Hello World",
+            "p:1": "Good morning",
+        }
+        passed, fidelity, errors = check_preservation_fidelity(draft, preserved)
+        self.assertFalse(passed)
+        self.assertLess(fidelity, 1.0)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["unit_id"], "p:0")
+
+    def test_handles_missing_unit(self):
+        draft = {
+            "docx_translation_map": [
+                {"id": "p:0", "text": "Hello World"},
+                # p:1 is missing
+            ]
+        }
+        preserved = {
+            "p:0": "Hello World",
+            "p:1": "Good morning",
+        }
+        passed, fidelity, errors = check_preservation_fidelity(draft, preserved)
+        self.assertFalse(passed)
+        self.assertEqual(len(errors), 1)
+
+    def test_empty_preserved_map(self):
+        draft = {"docx_translation_map": [{"id": "p:0", "text": "Hello"}]}
+        passed, fidelity, errors = check_preservation_fidelity(draft, {})
+        self.assertTrue(passed)
+        self.assertEqual(fidelity, 1.0)
+
+    def test_normalizes_whitespace(self):
+        draft = {
+            "docx_translation_map": [
+                {"id": "p:0", "text": "Hello   World"},  # Extra spaces
+            ]
+        }
+        preserved = {
+            "p:0": "Hello World",
+        }
+        passed, fidelity, errors = check_preservation_fidelity(draft, preserved)
+        self.assertTrue(passed)  # Should pass after normalization
+
+    def test_evaluate_round_with_preservation(self):
+        draft = {
+            "docx_translation_map": [
+                {"id": "p:0", "text": "Hello World"},
+            ]
+        }
+        preserved = {"p:0": "Hello World"}
+
+        out = evaluate_round(
+            round_index=1,
+            previous_unresolved=[],
+            metrics={
+                "terminology_rate": 0.96,
+                "structure_complete_rate": 0.97,
+                "target_language_purity": 0.98,
+                "numbering_consistency": 0.97,
+                "hard_fail_items": [],
+            },
+            gemini_enabled=True,
+            draft=draft,
+            preserved_text_map=preserved,
+        )
+        self.assertTrue(out["pass"])
+        self.assertEqual(out["metrics"]["preservation_fidelity"], 1.0)
+
+    def test_evaluate_round_fails_on_preservation_violation(self):
+        draft = {
+            "docx_translation_map": [
+                {"id": "p:0", "text": "Wrong text"},
+            ]
+        }
+        preserved = {"p:0": "Correct text"}
+
+        out = evaluate_round(
+            round_index=1,
+            previous_unresolved=[],
+            metrics={
+                "terminology_rate": 0.96,
+                "structure_complete_rate": 0.97,
+                "target_language_purity": 0.98,
+                "numbering_consistency": 0.97,
+                "hard_fail_items": [],
+            },
+            gemini_enabled=True,
+            draft=draft,
+            preserved_text_map=preserved,
+        )
+        self.assertFalse(out["pass"])
+        self.assertIn("preservation_fidelity_below_threshold", out["findings"])
 
 
 if __name__ == "__main__":

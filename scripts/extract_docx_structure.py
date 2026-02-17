@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Extract ordered paragraph/table structure from a DOCX file as JSON."""
+"""Extract ordered paragraph/table structure from a DOCX file as JSON.
+
+Produces StructuredDoc format with:
+- Block-level checksums for precise change detection
+- Questionnaire detection for survey-style tables
+- Structure checksums for drift detection
+"""
 
 from __future__ import annotations
 
@@ -18,6 +24,38 @@ from docx.oxml.text.paragraph import CT_P
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
+# Import questionnaire detection
+try:
+    from scripts.questionnaire_detector import (
+        compute_block_checksum,
+        compute_structure_checksum,
+        extract_questions_from_table,
+    )
+except ImportError:
+    # Fallback for direct script execution
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "questionnaire_detector",
+        Path(__file__).parent / "questionnaire_detector.py",
+    )
+    if spec and spec.loader:
+        qd_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(qd_module)
+        compute_block_checksum = qd_module.compute_block_checksum
+        compute_structure_checksum = qd_module.compute_structure_checksum
+        extract_questions_from_table = qd_module.extract_questions_from_table
+    else:
+
+        def compute_block_checksum(block: dict[str, Any]) -> str:
+            return hashlib.sha256(json.dumps(block, ensure_ascii=False).encode()).hexdigest()[:16]
+
+        def compute_structure_checksum(blocks: list[dict[str, Any]]) -> str:
+            return hashlib.sha256(json.dumps(blocks, ensure_ascii=False).encode()).hexdigest()[:16]
+
+        def extract_questions_from_table(rows: list[list[str]], table_index: int = 0) -> dict[str, Any]:
+            return {"is_questionnaire": False, "total_questions": 0}
+
 
 def normalize_text(text: str) -> str:
     text = text.replace("\u00a0", " ")
@@ -30,11 +68,19 @@ def has_arabic(text: str) -> bool:
 
 
 def extract_structure(input_path: Path) -> dict[str, Any]:
+    """Extract structure from a DOCX file with checksums and questionnaire detection.
+
+    Returns a StructuredDoc with:
+    - blocks: List of paragraphs/tables with block-level checksums
+    - checksums: Document-level checksums (content, structure, counts)
+    - questionnaire_info: Detected questionnaire information (if applicable)
+    """
     doc = Document(str(input_path))
     blocks: list[dict[str, Any]] = []
     paragraph_count = 0
     table_count = 0
     block_index = 0
+    questionnaire_info: dict[str, Any] | None = None
 
     for child in doc.element.body.iterchildren():
         block_index += 1
@@ -44,14 +90,15 @@ def extract_structure(input_path: Path) -> dict[str, Any]:
             if not text:
                 continue
             paragraph_count += 1
-            blocks.append(
-                {
-                    "kind": "paragraph",
-                    "index": block_index,
-                    "style": para.style.name if para.style else "",
-                    "text": text,
-                }
-            )
+            block = {
+                "kind": "paragraph",
+                "index": block_index,
+                "style": para.style.name if para.style else "",
+                "text": text,
+            }
+            # Add block-level checksum
+            block["checksum"] = compute_block_checksum(block)
+            blocks.append(block)
         elif isinstance(child, CT_Tbl):
             table = Table(child, doc)
             table_count += 1
@@ -59,14 +106,21 @@ def extract_structure(input_path: Path) -> dict[str, Any]:
             for row in table.rows:
                 cells = [normalize_text(cell.text.replace("\n", " / ")) for cell in row.cells]
                 rows.append(cells)
-            blocks.append(
-                {
-                    "kind": "table",
-                    "index": block_index,
-                    "table_index": table_count,
-                    "rows": rows,
-                }
-            )
+            block = {
+                "kind": "table",
+                "index": block_index,
+                "table_index": table_count,
+                "rows": rows,
+            }
+            # Add block-level checksum
+            block["checksum"] = compute_block_checksum(block)
+            blocks.append(block)
+
+            # Check if this table is a questionnaire
+            if questionnaire_info is None:
+                q_info = extract_questions_from_table(rows, table_index=table_count)
+                if q_info.is_questionnaire:
+                    questionnaire_info = q_info.to_dict()
 
     sample_text = " ".join(
         item["text"]
@@ -74,18 +128,38 @@ def extract_structure(input_path: Path) -> dict[str, Any]:
         if item["kind"] == "paragraph" and item.get("text")
     )[:2500]
 
-    digest = hashlib.sha256(json.dumps(blocks, ensure_ascii=False).encode("utf-8")).hexdigest()
+    # Content hash (all block content)
+    content_checksum = hashlib.sha256(
+        json.dumps(blocks, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
-    return {
-        "source_file": str(input_path.resolve()),
-        "file_name": input_path.name,
+    # Structure hash (structural elements only, not text content)
+    structure_checksum = compute_structure_checksum(blocks)
+
+    # Build checksums object
+    checksums = {
+        "content_checksum": content_checksum,
+        "structure_checksum": structure_checksum,
         "paragraph_count": paragraph_count,
         "table_count": table_count,
         "block_count": len(blocks),
+        "question_count": questionnaire_info.get("total_questions", 0) if questionnaire_info else 0,
+    }
+
+    result: dict[str, Any] = {
+        "source_file": str(input_path.resolve()),
+        "file_name": input_path.name,
         "language_hint": "ar" if has_arabic(sample_text) else "en",
-        "content_hash": digest,
+        "content_hash": content_checksum,
+        "checksums": checksums,
         "blocks": blocks,
     }
+
+    # Add questionnaire info if detected
+    if questionnaire_info:
+        result["questionnaire_info"] = questionnaire_info
+
+    return result
 
 
 def main() -> int:

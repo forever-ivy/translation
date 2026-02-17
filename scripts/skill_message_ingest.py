@@ -279,7 +279,7 @@ def _infer_suffix_from_mime(mime: str) -> str:
     return ""
 
 
-_ALLOWED_ATTACHMENT_SUFFIXES = {".xlsx", ".docx", ".csv"}
+_ALLOWED_ATTACHMENT_SUFFIXES = {".xlsx", ".docx", ".csv", ".pdf"}
 
 
 def _max_attachment_bytes() -> int:

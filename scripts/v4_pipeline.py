@@ -12,6 +12,14 @@ from typing import Any
 
 from scripts.attention_summary import attention_summary
 from scripts.openclaw_translation_orchestrator import run as run_translation
+from scripts.pdf_translator import (
+    is_pdf2zh_available,
+    translate_pdf,
+    translate_pdf_fallback_text,
+    translate_pdf_with_ocr_fallback,
+    translate_pdf_vision,
+    check_pdf2zh_installation,
+)
 
 log = logging.getLogger(__name__)
 from scripts.detail_validator import validate_job_artifacts, ValidationReportGenerator
@@ -112,7 +120,7 @@ def _build_candidates(job_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for item in job_files:
         p = Path(item["path"])
-        if p.suffix.lower() not in {".docx", ".xlsx", ".csv"}:
+        if p.suffix.lower() not in {".docx", ".xlsx", ".csv", ".pdf"}:
             continue
         candidates.append(
             {
@@ -124,6 +132,109 @@ def _build_candidates(job_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return candidates
+
+
+def _process_pdf_files(
+    *,
+    candidates: list[dict[str, Any]],
+    review_dir: Path,
+    source_lang: str = "ar",
+    target_lang: str = "en",
+    pdf2zh_timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    """
+    Process PDF files from candidates.
+
+    If pdf2zh is available, translates PDFs preserving layout.
+    Otherwise, extracts text as fallback.
+
+    Returns:
+        dict with:
+        - pdf_files: list of PDF candidate dicts
+        - non_pdf_candidates: list of non-PDF candidates
+        - translated_pdfs: list of paths to translated PDF files
+        - extracted_texts: list of paths to extracted text files
+        - warnings: list of warning messages
+        - errors: list of error messages
+    """
+    pdf_files = [c for c in candidates if Path(c["path"]).suffix.lower() == ".pdf"]
+    non_pdf_candidates = [c for c in candidates if Path(c["path"]).suffix.lower() != ".pdf"]
+
+    result: dict[str, Any] = {
+        "pdf_files": pdf_files,
+        "non_pdf_candidates": non_pdf_candidates,
+        "translated_pdfs": [],
+        "extracted_texts": [],
+        "warnings": [],
+        "errors": [],
+    }
+
+    if not pdf_files:
+        return result
+
+    pdf_output_dir = review_dir / "PDF_Output"
+    pdf_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if is_pdf2zh_available():
+        log.info("pdf2zh available, translating %d PDF file(s)", len(pdf_files))
+        for pdf_candidate in pdf_files:
+            pdf_path = Path(pdf_candidate["path"])
+            # Use OCR fallback for scanned PDFs
+            translate_result = translate_pdf_with_ocr_fallback(
+                pdf_path,
+                pdf_output_dir,
+                service="google",
+                source_lang=source_lang,
+                target_lang=target_lang,
+                timeout_seconds=pdf2zh_timeout_seconds,
+            )
+            if translate_result.get("ok"):
+                if translate_result.get("docx_path"):
+                    # Vision translation produced a DOCX
+                    result["translated_pdfs"].append(translate_result["docx_path"])
+                    result["warnings"].append(
+                        f"Vision-LLM translation used for {pdf_path.name} (DOCX output)"
+                    )
+                else:
+                    if translate_result.get("mono_path"):
+                        result["translated_pdfs"].append(translate_result["mono_path"])
+                    if translate_result.get("dual_path"):
+                        result["translated_pdfs"].append(translate_result["dual_path"])
+                if translate_result.get("ocr_used"):
+                    result["warnings"].append(
+                        f"OCR preprocessing used for scanned PDF: {pdf_path.name}"
+                    )
+            else:
+                error_msg = translate_result.get("error", "unknown error")
+                result["errors"].append(f"PDF translation failed for {pdf_path.name}: {error_msg}")
+                # Fallback to text extraction
+                fallback_result = translate_pdf_fallback_text(pdf_path, pdf_output_dir, source_lang=source_lang)
+                if fallback_result.get("ok"):
+                    result["extracted_texts"].append(fallback_result["text_path"])
+                    result["warnings"].append(
+                        f"PDF layout not preserved for {pdf_path.name}, extracted text only"
+                    )
+                else:
+                    result["errors"].append(
+                        f"PDF fallback extraction also failed for {pdf_path.name}: {fallback_result.get('error')}"
+                    )
+    else:
+        install_info = check_pdf2zh_installation()
+        result["warnings"].append(
+            f"pdf2zh not installed. PDF translation will use text extraction only.\n{install_info['message']}"
+        )
+        log.warning("pdf2zh not available, falling back to text extraction for %d PDF(s)", len(pdf_files))
+        for pdf_candidate in pdf_files:
+            pdf_path = Path(pdf_candidate["path"])
+            extract_result = translate_pdf_fallback_text(pdf_path, pdf_output_dir, source_lang=source_lang)
+            if extract_result.get("ok"):
+                result["extracted_texts"].append(extract_result["text_path"])
+            else:
+                result["errors"].append(
+                    f"PDF extraction failed for {pdf_path.name}: {extract_result.get('error')}"
+                )
+
+    return result
 
 
 def _dedupe_hits(hits: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -372,19 +483,184 @@ def run_job_pipeline(
     ).strip().lower() not in {"0", "false", "off", "no"}
     router_mode = "strict" if strict_router_enabled else "hybrid"
 
-    if not candidates:
-        update_job_status(conn, job_id=job_id, status="incomplete_input", errors=["no_supported_attachments"])
-        notify_milestone(
-            paths=paths,
-            conn=conn,
-            job_id=job_id,
-            milestone="failed",
-            message=f"\U0001f4ed No supported files\nSupported: .docx .xlsx .csv",
-            target=notify_target,
-            dry_run=dry_run_notify,
+    # Process PDF files - translate with pdf2zh or extract text as fallback
+    pdf_result = _process_pdf_files(
+        candidates=candidates,
+        review_dir=review_dir,
+        source_lang="ar",
+        target_lang="en",
+    )
+    pdf_files = pdf_result["pdf_files"]
+    candidates = pdf_result["non_pdf_candidates"]  # Continue with non-PDF candidates
+    pdf_translated = pdf_result["translated_pdfs"]
+    pdf_extracted = pdf_result["extracted_texts"]
+    pdf_warnings = pdf_result["warnings"]
+    pdf_errors = pdf_result["errors"]
+
+    # If we extracted text from PDFs (fallback mode), feed those .txt files into the main
+    # translation pipeline so the user still gets an English output (layout won't be preserved).
+    extracted_candidates: list[dict[str, Any]] = []
+    for extracted_path in pdf_extracted:
+        try:
+            p = Path(str(extracted_path)).expanduser().resolve()
+        except Exception:
+            continue
+        if not p.exists():
+            continue
+        extracted_candidates.append(
+            {
+                "path": str(p),
+                "name": p.name,
+                "language": infer_language(p),
+                "version": infer_version(p),
+                "role": "source",
+            }
         )
-        conn.close()
-        return {"ok": False, "job_id": job_id, "status": "incomplete_input", "errors": ["no_supported_attachments"]}
+    if extracted_candidates:
+        candidates.extend(extracted_candidates)
+
+    # Record PDF processing results
+    if pdf_files:
+        record_event(
+            conn,
+            job_id=job_id,
+            milestone="pdf_processed",
+            payload={
+                "pdf_count": len(pdf_files),
+                "translated_count": len(pdf_translated),
+                "extracted_count": len(pdf_extracted),
+                "warnings": pdf_warnings,
+                "errors": pdf_errors,
+            },
+        )
+        if pdf_translated:
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone="pdf_translated",
+                message=f"\U0001f4c4 PDF translated \u00b7 {len(pdf_translated)} file(s)",
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
+        elif pdf_extracted:
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone="pdf_extracted",
+                message=f"\U0001f4c4 PDF text extracted \u00b7 {len(pdf_extracted)} file(s)\n\u26a0\ufe0f Layout not preserved (pdf2zh not available)",
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
+        for warn in pdf_warnings[:2]:
+            log.warning("PDF processing warning: %s", warn)
+
+    # Handle PDF-only jobs: if all files were PDFs and they were processed, consider job complete
+    if not candidates:
+        if pdf_translated or pdf_extracted:
+            # PDF-only job with successful processing
+            artifacts = {
+                "pdf_translated": [str(p) for p in pdf_translated],
+                "pdf_extracted": [str(p) for p in pdf_extracted],
+            }
+            update_job_result(
+                conn,
+                job_id=job_id,
+                status="review_ready",
+                iteration_count=1,
+                double_pass=False,
+                status_flags=pdf_warnings,
+                artifacts=artifacts,
+                errors=pdf_errors,
+            )
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone="review_ready",
+                message=(
+                    f"\u2705 PDF translation complete\n"
+                    f"\U0001f4c1 {review_dir}\n"
+                    + ("\n\u26a0\ufe0f Layout not preserved" if pdf_extracted else "")
+                    + "\n\nSend: ok \u00b7 no {reason}"
+                ),
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
+            conn.close()
+            return {
+                "ok": True,
+                "job_id": job_id,
+                "status": "review_ready",
+                "review_dir": str(review_dir),
+                "artifacts": artifacts,
+                "status_flags": pdf_warnings,
+                "errors": pdf_errors,
+            }
+        else:
+            if pdf_files:
+                pdf_names = []
+                for item in pdf_files:
+                    raw_path = str(item.get("path") or "")
+                    raw_name = str(item.get("name") or "")
+                    pdf_names.append(Path(raw_path).name if raw_path else raw_name)
+                pdf_names = [n for n in pdf_names if n]
+                file_line = f"\U0001f4c4 {pdf_names[0]}" if len(pdf_names) == 1 else f"\U0001f4c4 PDF(s): {', '.join(pdf_names[:3])}"
+                reason = ""
+                if pdf_errors:
+                    reason_raw = str(pdf_errors[0])
+                    reason = reason_raw.split(": ", 1)[1].strip() if ": " in reason_raw else reason_raw
+                msg_lines = [
+                    "\u26a0\ufe0f PDF received, but it has no extractable text",
+                    file_line,
+                ]
+                if reason:
+                    msg_lines.append(f"Reason: {reason}")
+                msg_lines.extend(
+                    [
+                        "",
+                        "This usually means the PDF is scanned/image-based. Run OCR (make it searchable) and upload again, or export as DOCX.",
+                        "Optional: install pdf2zh for layout-preserving PDF translation: pip install pdf2zh",
+                        "",
+                        "Send: rerun",
+                    ]
+                )
+                errors_out = [str(e) for e in (pdf_errors or []) if str(e)]
+                if not errors_out:
+                    errors_out = ["pdf_processing_failed"]
+                update_job_status(conn, job_id=job_id, status="needs_revision", status_flags=pdf_warnings, errors=errors_out)
+                notify_milestone(
+                    paths=paths,
+                    conn=conn,
+                    job_id=job_id,
+                    milestone="needs_revision",
+                    message="\n".join(msg_lines),
+                    target=notify_target,
+                    dry_run=dry_run_notify,
+                )
+                conn.close()
+                return {
+                    "ok": False,
+                    "job_id": job_id,
+                    "status": "needs_revision",
+                    "review_dir": str(review_dir),
+                    "errors": errors_out,
+                    "status_flags": pdf_warnings,
+                }
+
+            update_job_status(conn, job_id=job_id, status="incomplete_input", errors=["no_supported_attachments"])
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone="failed",
+                message=f"\U0001f4ed No supported files\nSupported: .docx .xlsx .csv .pdf",
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
+            conn.close()
+            return {"ok": False, "job_id": job_id, "status": "incomplete_input", "errors": ["no_supported_attachments"]}
 
     kb_company = str(job.get("kb_company") or "").strip()
     kb_company = _canonicalize_kb_company(kb_root=kb_root, kb_company=kb_company) if kb_company else ""
@@ -633,15 +909,25 @@ def run_job_pipeline(
                 payload={"error": str(e)},
             )
 
+    # Merge PDF artifacts into final result
+    final_artifacts = dict(result.get("artifacts", {}))
+    if pdf_translated:
+        final_artifacts["pdf_translated"] = [str(p) for p in pdf_translated]
+    if pdf_extracted:
+        final_artifacts["pdf_extracted"] = [str(p) for p in pdf_extracted]
+
+    # Add PDF warnings/errors to status flags
+    final_status_flags = list(result.get("status_flags", [])) + pdf_warnings
+
     update_job_result(
         conn,
         job_id=job_id,
         status=result.get("status", "failed"),
         iteration_count=int(result.get("iteration_count", 0)),
         double_pass=bool(result.get("double_pass")),
-        status_flags=list(result.get("status_flags", [])),
-        artifacts=dict(result.get("artifacts", {})),
-        errors=list(result.get("errors", [])),
+        status_flags=final_status_flags,
+        artifacts=final_artifacts,
+        errors=list(result.get("errors", [])) + pdf_errors,
     )
 
     if result.get("status") == "review_ready":

@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "structured_document.schema.json",
+  "title": "StructuredDocument",
+  "description": "Structured representation of a DOCX document with checksums and questionnaire detection",
+  "type": "object",
+  "required": ["source_file", "file_name", "content_hash", "blocks"],
+  "properties": {
+    "source_file": {
+      "type": "string",
+      "description": "Absolute path to the source DOCX file"
+    },
+    "file_name": {
+      "type": "string",
+      "description": "Base name of the source file"
+    },
+    "language_hint": {
+      "type": "string",
+      "enum": ["ar", "en", "fr", "es", "de", "pt", "zh", "tr", "unknown"],
+      "description": "Detected primary language of the document"
+    },
+    "content_hash": {
+      "type": "string",
+      "description": "SHA-256 hash of the full content (64 hex chars)"
+    },
+    "checksums": {
+      "type": "object",
+      "description": "Document-level checksums and counts",
+      "properties": {
+        "content_checksum": {
+          "type": "string",
+          "description": "SHA-256 hash of all blocks content"
+        },
+        "structure_checksum": {
+          "type": "string",
+          "description": "16-char hash of structural elements (kinds, counts, not text)"
+        },
+        "paragraph_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of paragraph blocks"
+        },
+        "table_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of table blocks"
+        },
+        "block_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of blocks"
+        },
+        "question_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of detected questionnaire questions (0 if not a questionnaire)"
+        }
+      },
+      "required": ["content_checksum", "structure_checksum", "paragraph_count", "table_count", "block_count", "question_count"]
+    },
+    "questionnaire_info": {
+      "type": "object",
+      "description": "Information about detected questionnaire (only present if is_questionnaire is true)",
+      "properties": {
+        "is_questionnaire": {
+          "type": "boolean",
+          "description": "Whether this document contains a questionnaire"
+        },
+        "total_questions": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of questions detected"
+        },
+        "question_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of stable question IDs (e.g., q:1, q:domain:1)"
+        },
+        "questions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/QuestionInfo"}
+        },
+        "domains": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of detected domain/category names"
+        },
+        "response_scale": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Detected response scale values (e.g., 1-5, Likert levels)"
+        },
+        "table_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Index of the questionnaire table in the document"
+        }
+      },
+      "required": ["is_questionnaire", "total_questions", "question_ids"]
+    },
+    "blocks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/Block"},
+      "description": "Ordered list of document blocks (paragraphs and tables)"
+    }
+  },
+  "$defs": {
+    "Block": {
+      "type": "object",
+      "required": ["kind", "index", "checksum"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["paragraph", "table"],
+          "description": "Type of block"
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Block index in document order"
+        },
+        "checksum": {
+          "type": "string",
+          "description": "16-char hash for this block"
+        },
+        "text": {
+          "type": "string",
+          "description": "Paragraph text (only for kind=paragraph)"
+        },
+        "style": {
+          "type": "string",
+          "description": "Paragraph style name (only for kind=paragraph)"
+        },
+        "table_index": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Table index (only for kind=table)"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "description": "Table rows as cell text arrays (only for kind=table)"
+        }
+      }
+    },
+    "QuestionInfo": {
+      "type": "object",
+      "properties": {
+        "question_id": {
+          "type": "string",
+          "description": "Stable question identifier"
+        },
+        "text": {
+          "type": "string",
+          "description": "Question text"
+        },
+        "domain": {
+          "type": ["string", "null"],
+          "description": "Domain/category this question belongs to"
+        },
+        "row_index": {
+          "type": "integer",
+          "description": "Row index in the questionnaire table"
+        },
+        "response_scale": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Available response options"
+        }
+      },
+      "required": ["question_id", "text", "row_index"]
+    }
+  },
+  "additionalProperties": true
+}

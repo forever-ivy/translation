@@ -23,6 +23,7 @@ class QualityThresholds:
     max_rounds: int = 3
     format_fidelity_min: float = 0.85
     format_qa_max_retries: int = 2
+    preservation_fidelity_min: float = 1.0  # Require exact preservation
 
 
 def _safe_float(value: Any, fallback: float) -> float:
@@ -30,6 +31,80 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _normalize_text_for_comparison(text: str) -> str:
+    """Normalize text for comparison by removing extra whitespace."""
+    import re
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def check_preservation_fidelity(
+    draft: dict[str, Any],
+    preserved_text_map: dict[str, str],
+) -> tuple[bool, float, list[dict[str, Any]]]:
+    """Verify that preserved sections match exactly.
+
+    This is critical for REVISION_UPDATE tasks where unchanged sections
+    must be copied verbatim from the English V1 baseline.
+
+    Args:
+        draft: The draft output containing docx_translation_map
+        preserved_text_map: Map of unit_id -> expected text to preserve
+
+    Returns:
+        Tuple of (pass, fidelity_score, errors)
+        - pass: True if all preserved sections match exactly
+        - fidelity_score: Ratio of correctly preserved sections (0.0 to 1.0)
+        - errors: List of errors with details for mismatched sections
+    """
+    if not preserved_text_map:
+        return True, 1.0, []
+
+    # Extract output map from draft
+    output_map: dict[str, str] = {}
+    entries = draft.get("docx_translation_map") or []
+    if isinstance(entries, dict):
+        for k, v in entries.items():
+            output_map[str(k)] = str(v or "")
+    elif isinstance(entries, list):
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            unit_id = str(item.get("id") or item.get("unit_id") or "")
+            text = str(item.get("text") or "")
+            if unit_id:
+                output_map[unit_id] = text
+
+    errors: list[dict[str, Any]] = []
+    preserved_count = 0
+
+    for unit_id, expected_text in preserved_text_map.items():
+        actual_text = output_map.get(unit_id, "")
+
+        # Normalize for comparison
+        expected_norm = _normalize_text_for_comparison(expected_text)
+        actual_norm = _normalize_text_for_comparison(actual_text)
+
+        if expected_norm == actual_norm:
+            preserved_count += 1
+        else:
+            errors.append({
+                "unit_id": unit_id,
+                "expected_snippet": expected_text[:200] if len(expected_text) > 200 else expected_text,
+                "actual_snippet": actual_text[:200] if len(actual_text) > 200 else actual_text,
+                "error_type": "preservation_violation",
+                "expected_length": len(expected_text),
+                "actual_length": len(actual_text),
+            })
+
+    total = len(preserved_text_map)
+    fidelity_score = preserved_count / total if total > 0 else 1.0
+    passed = preserved_count == total
+
+    return passed, round(fidelity_score, 4), errors
 
 
 def _critical_section_changed(delta_pack: dict[str, Any], thresholds: QualityThresholds) -> bool:
@@ -59,6 +134,8 @@ def evaluate_round(
     metrics: dict[str, Any],
     gemini_enabled: bool,
     thresholds: QualityThresholds | None = None,
+    draft: dict[str, Any] | None = None,
+    preserved_text_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     t = thresholds or QualityThresholds()
 
@@ -79,6 +156,17 @@ def evaluate_round(
         findings.append("numbering_consistency_below_threshold")
     findings.extend(f"hard_fail:{x}" for x in hard_fail_items)
 
+    # Check preservation fidelity for REVISION_UPDATE tasks
+    preservation_fidelity = 1.0
+    preservation_errors: list[dict[str, Any]] = []
+    if draft and preserved_text_map:
+        pres_pass, preservation_fidelity, preservation_errors = check_preservation_fidelity(
+            draft, preserved_text_map
+        )
+        if not pres_pass:
+            findings.append("preservation_fidelity_below_threshold")
+            hard_fail_items.append(f"preservation_violations:{len(preservation_errors)}")
+
     unresolved = sorted(set(findings))
     prev_set = set(previous_unresolved)
     unresolved_set = set(unresolved)
@@ -92,7 +180,7 @@ def evaluate_round(
     gemini_pass = codex_pass and purity_rate >= t.purity_min if gemini_enabled else codex_pass
     double_pass = codex_pass and (gemini_pass if gemini_enabled else True)
 
-    return {
+    result: dict[str, Any] = {
         "round": round_index,
         "metrics": {
             "terminology_rate": round(terminology_rate, 4),
@@ -100,6 +188,7 @@ def evaluate_round(
             "target_language_purity": round(purity_rate, 4),
             "numbering_consistency": round(numbering_rate, 4),
             "hard_fail_items": hard_fail_items,
+            "preservation_fidelity": preservation_fidelity,
         },
         "findings": findings,
         "resolved": resolved,
@@ -108,6 +197,9 @@ def evaluate_round(
         "gemini_pass": gemini_pass,
         "pass": double_pass,
     }
+    if preservation_errors:
+        result["preservation_errors"] = preservation_errors[:10]  # Limit to first 10 errors
+    return result
 
 
 def summarize_quality_report(rounds: list[dict[str, Any]], timeout_hit: bool) -> dict[str, Any]:

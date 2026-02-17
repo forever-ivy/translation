@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,9 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+# Configure logging
+log = logging.getLogger(__name__)
+
 # Allow running this file directly.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -24,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.build_delta_pack import build_delta, flatten_blocks
 from scripts.docx_preserver import extract_units as extract_docx_units
 from scripts.docx_preserver import units_to_payload as docx_units_to_payload
+from scripts.revision_pack import RevisionPack, build_revision_pack, format_revision_context_for_prompt
 from scripts.extract_docx_structure import extract_structure
 from scripts.openclaw_artifact_writer import write_artifacts
 from scripts.openclaw_quality_gate import QualityThresholds, compute_runtime_timeout, evaluate_quality
@@ -120,9 +125,13 @@ CODEX_AGENT = os.getenv("OPENCLAW_CODEX_AGENT", "translator-core")
 
 TASK_TOOL_INSTRUCTIONS: dict[str, str] = {
     "REVISION_UPDATE": (
-        "Compare the old and new source documents side by side. "
-        "Preserve unchanged target-language wording exactly. Only update target-language segments "
-        "that correspond to changed source-language paragraphs. Flag any ambiguous changes."
+        "REVISION UPDATE: Update the English document to match Arabic V2 changes. "
+        "CRITICAL: You will receive a revision_pack with sections marked as PRESERVE EXACTLY or TRANSLATE. "
+        "For PRESERVE EXACTLY sections: Copy the English text verbatim - no changes whatsoever. "
+        "For TRANSLATE sections: Translate the updated Arabic V2 text. "
+        "For NEW sections: Translate the new Arabic V2 content. "
+        "The revision_pack.preserved_text_map contains the exact texts you must copy without modification. "
+        "Your docx_translation_map must include ALL unit IDs from the template."
     ),
     "NEW_TRANSLATION": (
         "Translate the source document from scratch. Maintain paragraph and heading structure. "
@@ -845,9 +854,15 @@ def _build_delta_pack(
     }
 
 
-def _build_execution_context(meta: dict[str, Any], candidates: list[dict[str, Any]], intent: dict[str, Any], kb_hits: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_execution_context(
+    meta: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    intent: dict[str, Any],
+    kb_hits: list[dict[str, Any]],
+    revision_pack: RevisionPack | None = None,
+) -> dict[str, Any]:
     task_type = str(intent.get("task_type", "LOW_CONTEXT_TASK"))
-    return {
+    context: dict[str, Any] = {
         "job_id": meta.get("job_id"),
         "subject": meta.get("subject", ""),
         "message_text": meta.get("message_text", ""),
@@ -863,18 +878,34 @@ def _build_execution_context(meta: dict[str, Any], candidates: list[dict[str, An
             "manual_delivery_only": True,
         },
     }
+    # Add revision pack for REVISION_UPDATE tasks
+    if revision_pack:
+        context["revision_pack"] = revision_pack.to_dict()
+        context["revision_context_prompt"] = format_revision_context_for_prompt(revision_pack)
+    return context
 
 
 def _codex_generate(context: dict[str, Any], previous_draft: dict[str, Any] | None, findings: list[str], round_index: int) -> dict[str, Any]:
     task_type = str((context.get("task_intent") or {}).get("task_type", "LOW_CONTEXT_TASK"))
     tool_instructions = TASK_TOOL_INSTRUCTIONS.get(task_type, TASK_TOOL_INSTRUCTIONS["LOW_CONTEXT_TASK"])
 
+    # Build revision context section for REVISION_UPDATE tasks
+    revision_context_section = ""
+    if task_type == "REVISION_UPDATE" and context.get("revision_context_prompt"):
+        revision_context_section = f"""
+CRITICAL REVISION CONTEXT:
+{context.get("revision_context_prompt")}
+
+PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
+{json.dumps(context.get("revision_pack", {}).get("preserved_text_map", {}), ensure_ascii=False)}
+"""
+
     prompt = f"""
 You are Codex translator. Work on this translation job and return strict JSON only.
 
 Round: {round_index}
 Previous unresolved findings: {json.dumps(findings, ensure_ascii=False)}
-
+{revision_context_section}
 Execution context:
 {json.dumps(context, ensure_ascii=False)}
 
@@ -903,6 +934,7 @@ Rules:
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
 - Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
   Use plain text only. For lists use "• " or "1) " style, not Markdown.
 - If context is insufficient, keep "codex_pass": false and explain in unresolved.
@@ -1035,12 +1067,23 @@ def _glm_generate(context: dict[str, Any], previous_draft: dict[str, Any] | None
     task_type = str((context.get("task_intent") or {}).get("task_type", "LOW_CONTEXT_TASK"))
     tool_instructions = TASK_TOOL_INSTRUCTIONS.get(task_type, TASK_TOOL_INSTRUCTIONS["LOW_CONTEXT_TASK"])
 
+    # Build revision context section for REVISION_UPDATE tasks
+    revision_context_section = ""
+    if task_type == "REVISION_UPDATE" and context.get("revision_context_prompt"):
+        revision_context_section = f"""
+CRITICAL REVISION CONTEXT:
+{context.get("revision_context_prompt")}
+
+PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
+{json.dumps(context.get("revision_pack", {}).get("preserved_text_map", {}), ensure_ascii=False)}
+"""
+
     prompt = f"""
 You are a translation generator (GLM). Work on this translation job and return strict JSON only.
 
 Round: {round_index}
 Previous unresolved findings: {json.dumps(findings, ensure_ascii=False)}
-
+{revision_context_section}
 Execution context:
 {json.dumps(context, ensure_ascii=False)}
 
@@ -1069,6 +1112,7 @@ Rules:
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
 - Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
   Use plain text only. For lists use "• " or "1) " style, not Markdown.
 - If context is insufficient, keep "codex_pass": false and explain in unresolved.
@@ -1468,6 +1512,27 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         candidates = _enrich_structures(_collect_candidates(meta))
         router_mode = str(meta.get("router_mode") or "strict")
         token_guard_applied = bool(meta.get("token_guard_applied", False))
+
+        # Log questionnaire detection for each candidate
+        for candidate in candidates:
+            struct = candidate.get("structure")
+            if struct:
+                checksums = struct.get("checksums", {})
+                questionnaire_info = struct.get("questionnaire_info")
+                if questionnaire_info and questionnaire_info.get("is_questionnaire"):
+                    log.info(
+                        "Detected questionnaire in %s: %d questions, %d domains",
+                        candidate.get("name", "unknown"),
+                        questionnaire_info.get("total_questions", 0),
+                        len(questionnaire_info.get("domains", [])),
+                    )
+                elif checksums.get("question_count", 0) > 0:
+                    log.info(
+                        "Document %s has %d questions detected",
+                        candidate.get("name", "unknown"),
+                        checksums.get("question_count", 0),
+                    )
+
         if not candidates:
             response = {
                 "ok": False,
@@ -1585,7 +1650,85 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             source_language=str(intent.get("source_language") or "unknown"),
         )
         kb_hits = list(meta.get("knowledge_context") or [])
-        execution_context = _build_execution_context(meta, candidates, intent, kb_hits)
+
+        # Build revision pack for REVISION_UPDATE tasks
+        revision_pack: RevisionPack | None = None
+        if task_type == "REVISION_UPDATE":
+            source_language = str(intent.get("source_language") or "ar")
+            target_language = str(intent.get("target_language") or "en")
+
+            # Find the three required structures
+            arabic_v1_struct = None
+            arabic_v2_struct = None
+            english_v1_struct = None
+
+            for c in candidates:
+                lang = str(c.get("language") or "").lower()
+                ver = str(c.get("version") or "").lower()
+                struct = c.get("structure", {})
+
+                if lang == source_language and ver == "v1":
+                    arabic_v1_struct = struct
+                elif lang == source_language and ver == "v2":
+                    arabic_v2_struct = struct
+                elif lang == target_language and ver == "v1":
+                    english_v1_struct = struct
+
+            # Build revision pack if all three structures are available
+            if arabic_v1_struct and arabic_v2_struct and english_v1_struct:
+                try:
+                    revision_pack = build_revision_pack(
+                        arabic_v1_structure=arabic_v1_struct,
+                        arabic_v2_structure=arabic_v2_struct,
+                        english_v1_structure=english_v1_struct,
+                        job_id=job_id,
+                    )
+                    status_flags.append("revision_pack_built")
+
+                    # Check for structure integrity issues
+                    if revision_pack.structure_issues:
+                        for issue in revision_pack.structure_issues:
+                            severity = issue.get("severity", "warning")
+                            issue_type = issue.get("type", "unknown")
+                            status_flags.append(f"structure_issue:{issue_type}")
+
+                            if severity == "error":
+                                log.error(
+                                    "Structure integrity issue [%s]: %s",
+                                    issue_type,
+                                    issue.get("message", ""),
+                                )
+                                # For question count mismatch, warn but continue
+                                if issue_type == "question_count_mismatch":
+                                    status_flags.append("structure_drift_detected")
+                                    errors.append(issue.get("message", ""))
+                            else:
+                                log.warning(
+                                    "Structure integrity issue [%s]: %s",
+                                    issue_type,
+                                    issue.get("message", ""),
+                                )
+
+                except Exception as exc:
+                    status_flags.append("revision_pack_error")
+                    errors.append(f"revision_pack_build_failed: {exc}")
+            else:
+                status_flags.append("revision_pack_incomplete_inputs")
+
+                # Log which structures are missing for REVISION_UPDATE
+                missing = []
+                if not arabic_v1_struct:
+                    missing.append(f"{source_language} V1")
+                if not arabic_v2_struct:
+                    missing.append(f"{source_language} V2")
+                if not english_v1_struct:
+                    missing.append(f"{target_language} V1 (baseline)")
+                log.warning(
+                    "REVISION_UPDATE missing required structures: %s",
+                    ", ".join(missing),
+                )
+
+        execution_context = _build_execution_context(meta, candidates, intent, kb_hits, revision_pack=revision_pack)
 
         # --- Format-preserving payloads (XLSX/DOCX) ---
         format_preserve: dict[str, Any] = {}
@@ -2288,6 +2431,13 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
 
 def main() -> int:
+    # Configure logging for CLI usage
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta-json")
     parser.add_argument("--meta-json-file")
