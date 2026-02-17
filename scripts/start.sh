@@ -139,7 +139,7 @@ start_telegram() {
 
     # Start worker first if autostart is enabled
     if is_truthy "${OPENCLAW_RUN_WORKER_AUTOSTART:-1}"; then
-        start_worker
+        start_worker || log_warn "Worker auto-start skipped (may already be running)"
     fi
 
     nohup "$PYTHON_BIN" -m scripts.telegram_bot >>"$log_file" 2>&1 &
@@ -241,31 +241,56 @@ stop_service() {
     name=$(service_name "$service")
     local pid
 
-    if ! is_running "$service"; then
-        log_warn "$name is not running"
-        return 0
+    # Determine the process pattern for pkill fallback
+    local proc_pattern
+    case "$service" in
+        telegram) proc_pattern="scripts.telegram_bot" ;;
+        worker)   proc_pattern="scripts.skill_run_worker" ;;
+        *)        proc_pattern="" ;;
+    esac
+
+    # Try PID file first
+    if is_running "$service"; then
+        pid=$(get_pid "$service")
+        log_info "Stopping $name (PID: $pid)..."
+        kill "$pid" 2>/dev/null || true
+
+        local i=0
+        while [[ $i -lt 5 ]]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+
+        if kill -0 "$pid" 2>/dev/null; then
+            log_warn "Force killing $name..."
+            kill -9 "$pid" 2>/dev/null || true
+        fi
     fi
 
-    pid=$(get_pid "$service")
-    log_info "Stopping $name (PID: $pid)..."
+    # Fallback: kill by process name if still running (handles stale PID files)
+    if [[ -n "$proc_pattern" ]]; then
+        local real_pid
+        real_pid=$(pgrep -f "$proc_pattern" 2>/dev/null | head -1 || true)
+        if [[ -n "$real_pid" ]]; then
+            log_info "Stopping stale $name (PID: $real_pid via pgrep)..."
+            kill "$real_pid" 2>/dev/null || true
 
-    # Try graceful shutdown first
-    kill "$pid" 2>/dev/null || true
+            local i=0
+            while [[ $i -lt 5 ]]; do
+                if ! kill -0 "$real_pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 1
+                i=$((i + 1))
+            done
 
-    # Wait up to 5 seconds
-    local i=0
-    while [[ $i -lt 5 ]]; do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            break
+            if kill -0 "$real_pid" 2>/dev/null; then
+                kill -9 "$real_pid" 2>/dev/null || true
+            fi
         fi
-        sleep 1
-        i=$((i + 1))
-    done
-
-    # Force kill if still running
-    if kill -0 "$pid" 2>/dev/null; then
-        log_warn "Force killing $name..."
-        kill -9 "$pid" 2>/dev/null || true
     fi
 
     clear_pid "$service"

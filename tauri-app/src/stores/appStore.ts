@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import * as tauri from "@/lib/tauri";
+import type { ToastItem, ToastType } from "@/components/ui/toast";
 
 export type ServiceStatusType = "running" | "stopped" | "degraded" | "unknown";
 
@@ -54,11 +55,23 @@ export interface QualityReport {
   purityScore: number;
 }
 
+export interface DockerContainer {
+  name: string;
+  status: "running" | "stopped" | "not_found";
+  image: string;
+}
+
 interface AppState {
   // Services
   services: Service[];
   setServices: (services: Service[]) => void;
   updateService: (name: string, data: Partial<Service>) => void;
+
+  // Docker
+  dockerContainers: DockerContainer[];
+  fetchDockerStatus: () => Promise<void>;
+  startDocker: () => Promise<void>;
+  stopDocker: () => Promise<void>;
 
   // Jobs
   jobs: Job[];
@@ -89,10 +102,27 @@ interface AppState {
   setError: (error: string | null) => void;
   activeTab: string;
   setActiveTab: (tab: string) => void;
+  sidebarCollapsed: boolean;
+  setSidebarCollapsed: (collapsed: boolean) => void;
+
+  // Refresh animation state
+  isRefreshing: boolean;
+  refreshCurrentPage: () => Promise<void>;
+
+  // Toasts
+  toasts: ToastItem[];
+  addToast: (type: ToastType, message: string) => void;
+  dismissToast: (id: string) => void;
+
+  // Theme
+  theme: "light" | "dark" | "system";
+  setTheme: (theme: "light" | "dark" | "system") => void;
 
   // Async Actions
   fetchServices: () => Promise<void>;
   fetchPreflightChecks: () => Promise<void>;
+  autoFixPreflight: () => Promise<void>;
+  startOpenclaw: () => Promise<void>;
   fetchConfig: () => Promise<void>;
   fetchJobs: (status?: string) => Promise<void>;
   fetchJobMilestones: (jobId: string) => Promise<void>;
@@ -103,6 +133,8 @@ interface AppState {
   saveConfig: (config: AppConfig) => Promise<void>;
   fetchLogs: (service: string, lines?: number) => Promise<void>;
 }
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const useAppStore = create<AppState>((set, get) => ({
   // Services
@@ -117,6 +149,59 @@ export const useAppStore = create<AppState>((set, get) => ({
         s.name === name ? { ...s, ...data } : s
       ),
     })),
+
+  // Docker
+  dockerContainers: [],
+  fetchDockerStatus: async () => {
+    try {
+      const containers = await tauri.getDockerStatus();
+      set({
+        dockerContainers: containers.map((c) => ({
+          name: c.name,
+          status: c.status as "running" | "stopped" | "not_found",
+          image: c.image,
+        })),
+      });
+    } catch {
+      set({ dockerContainers: [] });
+    }
+  },
+  startDocker: async () => {
+    set({ isLoading: true });
+    try {
+      const containers = await tauri.startDockerServices();
+      set({
+        dockerContainers: containers.map((c) => ({
+          name: c.name,
+          status: c.status as "running" | "stopped" | "not_found",
+          image: c.image,
+        })),
+      });
+      const running = containers.filter((c) => c.status === "running").length;
+      if (running === containers.length) {
+        get().addToast("success", "ClawRAG containers started");
+      } else {
+        get().addToast("warning", `${running}/${containers.length} containers running`);
+      }
+    } catch (err) {
+      get().addToast("error", `Failed to start Docker: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+  stopDocker: async () => {
+    set({ isLoading: true });
+    try {
+      await tauri.stopDockerServices();
+      await delay(2000);
+      await get().fetchDockerStatus();
+      get().addToast("success", "ClawRAG containers stopped");
+    } catch (err) {
+      get().addToast("error", `Failed to stop Docker: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
 
   // Jobs
   jobs: [],
@@ -147,6 +232,55 @@ export const useAppStore = create<AppState>((set, get) => ({
   setError: (error) => set({ error }),
   activeTab: "dashboard",
   setActiveTab: (activeTab) => set({ activeTab }),
+  sidebarCollapsed: false,
+  setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
+
+  // Refresh animation state
+  isRefreshing: false,
+  refreshCurrentPage: async () => {
+    if (get().isRefreshing) return;
+    set({ isRefreshing: true });
+
+    const { activeTab } = get();
+
+    // Fetch all relevant data based on current tab
+    try {
+      if (activeTab === "dashboard") {
+        await Promise.all([
+          get().fetchServices(),
+          get().fetchJobs(),
+          get().fetchDockerStatus(),
+        ]);
+      } else if (activeTab === "services") {
+        await Promise.all([
+          get().fetchServices(),
+          get().fetchPreflightChecks(),
+          get().fetchDockerStatus(),
+        ]);
+      } else if (activeTab === "jobs") {
+        await get().fetchJobs();
+      }
+    } finally {
+      set({ isRefreshing: false });
+    }
+  },
+
+  // Toasts
+  toasts: [],
+  addToast: (type, message) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    set((state) => ({ toasts: [...state.toasts.slice(-4), { id, type, message }] }));
+  },
+  dismissToast: (id) => {
+    set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) }));
+  },
+
+  // Theme
+  theme: (localStorage.getItem("theme") as "light" | "dark" | "system") || "system",
+  setTheme: (theme) => {
+    localStorage.setItem("theme", theme);
+    set({ theme });
+  },
 
   // Async Actions
   fetchServices: async () => {
@@ -160,10 +294,9 @@ export const useAppStore = create<AppState>((set, get) => ({
           uptime: s.uptime,
           restarts: s.restarts,
         })),
-        error: null,
       });
     } catch (err) {
-      set({ error: `Failed to fetch services: ${err}` });
+      get().addToast("error", `Failed to fetch services: ${err}`);
     }
   },
 
@@ -177,10 +310,59 @@ export const useAppStore = create<AppState>((set, get) => ({
           status: c.status as "pass" | "warning" | "blocker",
           message: c.message,
         })),
-        error: null,
       });
     } catch (err) {
-      set({ error: `Failed to run preflight checks: ${err}` });
+      get().addToast("error", `Preflight checks failed: ${err}`);
+    }
+  },
+
+  autoFixPreflight: async () => {
+    set({ isLoading: true });
+    try {
+      const checks = await tauri.autoFixPreflight();
+      set({
+        preflightChecks: checks.map((c) => ({
+          name: c.name,
+          key: c.key,
+          status: c.status as "pass" | "warning" | "blocker",
+          message: c.message,
+        })),
+      });
+      const blockers = checks.filter((c) => c.status === "blocker");
+      if (blockers.length === 0) {
+        get().addToast("success", "All issues resolved");
+      } else {
+        get().addToast("warning", `${blockers.length} issues require manual fix`);
+      }
+    } catch (err) {
+      get().addToast("error", `Auto-fix failed: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  startOpenclaw: async () => {
+    set({ isLoading: true });
+    try {
+      const checks = await tauri.startOpenclaw();
+      set({
+        preflightChecks: checks.map((c) => ({
+          name: c.name,
+          key: c.key,
+          status: c.status as "pass" | "warning" | "blocker",
+          message: c.message,
+        })),
+      });
+      const openclaw = checks.find((c) => c.key === "openclaw");
+      if (openclaw?.status === "pass") {
+        get().addToast("success", "OpenClaw started successfully");
+      } else {
+        get().addToast("error", "Failed to start OpenClaw");
+      }
+    } catch (err) {
+      get().addToast("error", `Failed to start OpenClaw: ${err}`);
+    } finally {
+      set({ isLoading: false });
     }
   },
 
@@ -195,10 +377,9 @@ export const useAppStore = create<AppState>((set, get) => ({
           requireNew: config.require_new,
           ragBackend: config.rag_backend,
         },
-        error: null,
       });
     } catch (err) {
-      set({ error: `Failed to fetch config: ${err}` });
+      get().addToast("error", `Failed to fetch config: ${err}`);
     }
   },
 
@@ -214,10 +395,9 @@ export const useAppStore = create<AppState>((set, get) => ({
           createdAt: j.created_at,
           updatedAt: j.updated_at,
         })),
-        error: null,
       });
     } catch (err) {
-      set({ error: `Failed to fetch jobs: ${err}` });
+      get().addToast("error", `Failed to fetch jobs: ${err}`);
     }
   },
 
@@ -230,10 +410,9 @@ export const useAppStore = create<AppState>((set, get) => ({
           timestamp: m.timestamp,
           payload: m.payload,
         })),
-        error: null,
       });
     } catch (err) {
-      set({ error: `Failed to fetch milestones: ${err}` });
+      get().addToast("error", `Failed to fetch milestones: ${err}`);
     }
   },
 
@@ -257,10 +436,9 @@ export const useAppStore = create<AppState>((set, get) => ({
               purityScore: quality.purity_score,
             }
           : null,
-        error: null,
       });
     } catch (err) {
-      set({ error: `Failed to fetch artifacts: ${err}` });
+      get().addToast("error", `Failed to fetch artifacts: ${err}`);
     }
   },
 
@@ -268,10 +446,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       await tauri.startAllServices();
-      // Wait a moment then refresh
-      setTimeout(() => get().fetchServices(), 2000);
+      await delay(2000);
+      await get().fetchServices();
+      const { services } = get();
+      const running = services.filter((s) => s.status === "running").length;
+      if (running === services.length) {
+        get().addToast("success", "All services started successfully");
+      } else if (running > 0) {
+        get().addToast("warning", `${running}/${services.length} services running`);
+      } else {
+        get().addToast("error", "Services failed to start");
+      }
     } catch (err) {
-      set({ error: `Failed to start services: ${err}` });
+      get().addToast("error", `Failed to start services: ${err}`);
     } finally {
       set({ isLoading: false });
     }
@@ -281,9 +468,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       await tauri.stopAllServices();
+      await delay(2000);
       await get().fetchServices();
+      get().addToast("success", "All services stopped");
     } catch (err) {
-      set({ error: `Failed to stop services: ${err}` });
+      get().addToast("error", `Failed to stop services: ${err}`);
     } finally {
       set({ isLoading: false });
     }
@@ -293,10 +482,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       await tauri.restartAllServices();
-      // Wait a moment then refresh
-      setTimeout(() => get().fetchServices(), 3000);
+      await delay(2000);
+      await get().fetchServices();
+      get().addToast("success", "All services restarted");
     } catch (err) {
-      set({ error: `Failed to restart services: ${err}` });
+      get().addToast("error", `Failed to restart services: ${err}`);
     } finally {
       set({ isLoading: false });
     }
@@ -312,9 +502,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         require_new: config.requireNew,
         rag_backend: config.ragBackend,
       });
-      set({ config, error: null });
+      set({ config });
+      get().addToast("success", "Settings saved successfully");
     } catch (err) {
-      set({ error: `Failed to save config: ${err}` });
+      get().addToast("error", `Failed to save config: ${err}`);
     } finally {
       set({ isLoading: false });
     }
@@ -336,9 +527,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
         return { time: "", level: "INFO", service, message: line };
       });
-      set({ logs, selectedLogService: service, error: null });
+      set({ logs, selectedLogService: service });
     } catch (err) {
-      set({ error: `Failed to fetch logs: ${err}` });
+      get().addToast("error", `Failed to fetch logs: ${err}`);
     }
   },
 }));

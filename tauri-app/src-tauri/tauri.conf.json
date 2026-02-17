@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Translation Manager",
+  "productName": "Inifity",
   "version": "0.1.0",
-  "identifier": "com.ivy.translation-manager",
+  "identifier": "com.ivy.inifity",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Translation Manager",
+        "title": "Inifity",
         "width": 1200,
         "height": 800,
         "minWidth": 900,
@@ -36,7 +36,7 @@
       "icons/icon.ico"
     ],
     "category": "Productivity",
-    "shortDescription": "Translation system management dashboard",
-    "longDescription": "Desktop application for managing the Arabic-to-English translation automation system"
+    "shortDescription": "Inifity - Translation automation dashboard",
+    "longDescription": "Inifity desktop application for managing the Arabic-to-English translation automation system"
   }
 }

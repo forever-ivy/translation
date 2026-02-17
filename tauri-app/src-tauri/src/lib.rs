@@ -101,11 +101,10 @@ impl Default for AppState {
 }
 
 // ============================================================================
-// Service Management Commands
+// Inner helper functions (avoid State<AppState> clone issues)
 // ============================================================================
 
-#[tauri::command]
-async fn get_service_status(state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
+fn get_service_status_inner(state: &AppState) -> Result<Vec<ServiceStatus>, String> {
     let mut services = vec![
         ServiceStatus {
             name: "Telegram Bot".to_string(),
@@ -142,7 +141,6 @@ async fn get_service_status(state: State<'_, AppState>) -> Result<Vec<ServiceSta
                     service.status = "running".to_string();
                     service.pid = Some(pid);
 
-                    // Calculate uptime from pid file mtime
                     if let Ok(metadata) = fs::metadata(&pid_file) {
                         if let Ok(modified) = metadata.modified() {
                             let elapsed = std::time::SystemTime::now()
@@ -169,46 +167,118 @@ async fn get_service_status(state: State<'_, AppState>) -> Result<Vec<ServiceSta
     Ok(services)
 }
 
-#[tauri::command]
-async fn start_all_services(state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
-    let start_script = format!("{}/start.sh", state.scripts_path);
+fn get_config_inner(state: &AppState) -> Result<AppConfig, String> {
+    let env_path = format!("{}/.env.v4.local", state.config_path);
 
-    let output = Command::new(&start_script)
-        .args(["--all"])
-        .output()
-        .map_err(|e| format!("Failed to start services: {}", e))?;
+    let content = fs::read_to_string(&env_path)
+        .map_err(|e| format!("Failed to read config: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Start failed: {}", stderr));
+    let mut config = AppConfig {
+        work_root: String::new(),
+        kb_root: String::new(),
+        strict_router: false,
+        require_new: false,
+        rag_backend: "local".to_string(),
+    };
+
+    // Helper to extract value after first '=' and strip quotes
+    fn extract_value(line: &str) -> String {
+        if let Some(pos) = line.find('=') {
+            let value = &line[pos + 1..];
+            value.trim().trim_matches('"').to_string()
+        } else {
+            String::new()
+        }
     }
 
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    get_service_status(state).await
+    for line in content.lines() {
+        if line.starts_with("V4_WORK_ROOT=") {
+            config.work_root = extract_value(line);
+        } else if line.starts_with("V4_KB_ROOT=") {
+            config.kb_root = extract_value(line);
+        } else if line.starts_with("OPENCLAW_STRICT_ROUTER=") {
+            config.strict_router = line.contains("1");
+        } else if line.starts_with("OPENCLAW_REQUIRE_NEW=") {
+            config.require_new = line.contains("1");
+        } else if line.starts_with("OPENCLAW_RAG_BACKEND=") {
+            config.rag_backend = extract_value(line);
+        }
+    }
+
+    Ok(config)
+}
+
+fn run_start_script(state: &AppState, flag: &str) -> Result<String, String> {
+    let start_script = format!("{}/start.sh", state.scripts_path);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+
+    let output = Command::new("bash")
+        .arg(&start_script)
+        .arg(flag)
+        .current_dir(&state.config_path)
+        .env("HOME", &home)
+        .env("PATH", format!(
+            "{}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            home
+        ))
+        .env("TERM", "dumb")
+        .output()
+        .map_err(|e| format!("Failed to execute start.sh {}: {}", flag, e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        let detail = if !stderr.is_empty() { &stderr } else { &stdout };
+        return Err(format!(
+            "start.sh {} exited with code {:?}: {}",
+            flag,
+            output.status.code(),
+            detail
+        ));
+    }
+
+    Ok(stdout)
+}
+
+fn stop_services_inner(state: &AppState) -> Result<(), String> {
+    run_start_script(state, "--stop")?;
+    Ok(())
+}
+
+fn start_services_inner(state: &AppState) -> Result<(), String> {
+    run_start_script(state, "--all")?;
+    Ok(())
+}
+
+// ============================================================================
+// Service Management Commands
+// ============================================================================
+
+#[tauri::command]
+async fn get_service_status(state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
+    get_service_status_inner(&state)
+}
+
+#[tauri::command]
+async fn start_all_services(state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
+    start_services_inner(&state)?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    get_service_status_inner(&state)
 }
 
 #[tauri::command]
 async fn stop_all_services(state: State<'_, AppState>) -> Result<(), String> {
-    let start_script = format!("{}/start.sh", state.scripts_path);
-
-    let output = Command::new(&start_script)
-        .args(["--stop"])
-        .output()
-        .map_err(|e| format!("Failed to stop services: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Stop failed: {}", stderr));
-    }
-
-    Ok(())
+    stop_services_inner(&state)
 }
 
 #[tauri::command]
 async fn restart_all_services(state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
-    stop_all_services(state.clone()).await?;
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    start_all_services(state).await
+    stop_services_inner(&state)?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    start_services_inner(&state)?;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    get_service_status_inner(&state)
 }
 
 // ============================================================================
@@ -216,7 +286,47 @@ async fn restart_all_services(state: State<'_, AppState>) -> Result<Vec<ServiceS
 // ============================================================================
 
 #[tauri::command]
-fn run_preflight_check(state: State<'_, AppState>) -> Vec<PreflightCheck> {
+fn auto_fix_preflight(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+
+    // Try to create venv if missing
+    let venv_path = format!("{}/.venv", state.config_path);
+    if !PathBuf::from(&venv_path).exists() {
+        let _ = Command::new("python3")
+            .args(["-m", "venv", &venv_path])
+            .current_dir(&state.config_path)
+            .status();
+    }
+
+    // Try to install requirements if venv exists
+    let req_path = format!("{}/requirements.txt", state.config_path);
+    let pip_path = format!("{}/bin/pip", venv_path);
+    if PathBuf::from(&pip_path).exists() && PathBuf::from(&req_path).exists() {
+        let _ = Command::new(&pip_path)
+            .args(["install", "-r", &req_path, "-q"])
+            .current_dir(&state.config_path)
+            .status();
+    }
+
+    // Try to create .env.v4.local template if missing
+    let env_path = format!("{}/.env.v4.local", state.config_path);
+    if !PathBuf::from(&env_path).exists() {
+        let template = r#"# Translation system configuration
+V4_WORK_ROOT=
+V4_KB_ROOT=
+OPENCLAW_STRICT_ROUTER=0
+OPENCLAW_REQUIRE_NEW=0
+OPENCLAW_RAG_BACKEND=local
+"#;
+        let _ = fs::write(&env_path, template);
+    }
+
+    // Re-run preflight checks
+    let checks = run_preflight_check_inner(&state);
+    Ok(checks)
+}
+
+fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
     let mut checks = Vec::new();
 
     // Python check
@@ -266,18 +376,41 @@ fn run_preflight_check(state: State<'_, AppState>) -> Vec<PreflightCheck> {
         message: if env_exists { "Config file exists".to_string() } else { "Create .env.v4.local from template".to_string() },
     });
 
-    // OpenClaw check
-    let openclaw_ok = Command::new("openclaw")
-        .args(["health", "--json"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    // OpenClaw check - try multiple paths with proper environment
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+    let openclaw_paths = [
+        format!("{}/.local/bin/openclaw", home),
+        "/usr/local/bin/openclaw".to_string(),
+        "/opt/homebrew/bin/openclaw".to_string(),
+    ];
+
+    let mut openclaw_ok = false;
+    for path in &openclaw_paths {
+        if !std::path::Path::new(path).exists() {
+            continue;
+        }
+        let result = Command::new(path)
+            .args(["health", "--json"])
+            .env("HOME", &home)
+            .env("PATH", format!(
+                "{}:{}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+                std::env::var("PATH").unwrap_or_default(),
+                home
+            ))
+            .output();
+        if let Ok(output) = result {
+            if output.status.success() {
+                openclaw_ok = true;
+                break;
+            }
+        }
+    }
 
     checks.push(PreflightCheck {
         name: "OpenClaw".to_string(),
         key: "openclaw".to_string(),
-        status: if openclaw_ok { "pass".to_string() } else { "warning".to_string() },
-        message: if openclaw_ok { "OpenClaw is running".to_string() } else { "OpenClaw not available".to_string() },
+        status: if openclaw_ok { "pass".to_string() } else { "blocker".to_string() },
+        message: if openclaw_ok { "OpenClaw is running".to_string() } else { "Run: openclaw gateway --force".to_string() },
     });
 
     // LibreOffice check (optional)
@@ -297,40 +430,58 @@ fn run_preflight_check(state: State<'_, AppState>) -> Vec<PreflightCheck> {
     checks
 }
 
+#[tauri::command]
+async fn start_openclaw(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+    let openclaw_paths = [
+        format!("{}/.local/bin/openclaw", home),
+        "/usr/local/bin/openclaw".to_string(),
+        "/opt/homebrew/bin/openclaw".to_string(),
+    ];
+
+    let mut started = false;
+    for path in &openclaw_paths {
+        if PathBuf::from(&path).exists() {
+            let result = Command::new(&path)
+                .args(["gateway", "--force"])
+                .env("HOME", &home)
+                .env("PATH", format!(
+                    "{}:{}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+                    std::env::var("PATH").unwrap_or_default(),
+                    home
+                ))
+                .spawn();
+
+            if result.is_ok() {
+                started = true;
+                // Wait a moment for gateway to start
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                break;
+            }
+        }
+    }
+
+    if !started {
+        return Err("OpenClaw not found. Please install it first.".to_string());
+    }
+
+    // Re-run preflight checks
+    let checks = run_preflight_check_inner(&state);
+    Ok(checks)
+}
+
+#[tauri::command]
+fn run_preflight_check(state: State<'_, AppState>) -> Vec<PreflightCheck> {
+    run_preflight_check_inner(&state)
+}
+
 // ============================================================================
 // Config Commands
 // ============================================================================
 
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
-    let env_path = format!("{}/.env.v4.local", state.config_path);
-
-    let content = fs::read_to_string(&env_path)
-        .map_err(|e| format!("Failed to read config: {}", e))?;
-
-    let mut config = AppConfig {
-        work_root: String::new(),
-        kb_root: String::new(),
-        strict_router: false,
-        require_new: false,
-        rag_backend: "local".to_string(),
-    };
-
-    for line in content.lines() {
-        if line.starts_with("V4_WORK_ROOT=") {
-            config.work_root = line.split('=').nth(1).unwrap_or("").to_string();
-        } else if line.starts_with("V4_KB_ROOT=") {
-            config.kb_root = line.split('=').nth(1).unwrap_or("").to_string();
-        } else if line.starts_with("OPENCLAW_STRICT_ROUTER=") {
-            config.strict_router = line.contains("1");
-        } else if line.starts_with("OPENCLAW_REQUIRE_NEW=") {
-            config.require_new = line.contains("1");
-        } else if line.starts_with("OPENCLAW_RAG_BACKEND=") {
-            config.rag_backend = line.split('=').nth(1).unwrap_or("local").to_string();
-        }
-    }
-
-    Ok(config)
+    get_config_inner(&state)
 }
 
 #[tauri::command]
@@ -375,33 +526,51 @@ fn get_jobs(status: Option<String>, limit: Option<u32>, state: State<'_, AppStat
         .map_err(|e| format!("Failed to open database: {}", e))?;
 
     let limit = limit.unwrap_or(50);
-    let sql = match status {
-        Some(s) => format!(
-            "SELECT job_id, status, task_type, sender, created_at, updated_at FROM jobs WHERE status = '{}' ORDER BY created_at DESC LIMIT {}",
-            s, limit
-        ),
-        None => format!(
-            "SELECT job_id, status, task_type, sender, created_at, updated_at FROM jobs ORDER BY created_at DESC LIMIT {}",
-            limit
-        ),
-    };
 
-    let mut stmt = conn.prepare(&sql)
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+    let mut jobs = Vec::new();
 
-    let jobs = stmt.query_map([], |row| {
-        Ok(JobInfo {
-            job_id: row.get(0)?,
-            status: row.get(1)?,
-            task_type: row.get(2)?,
-            sender: row.get(3)?,
-            created_at: row.get(4)?,
-            updated_at: row.get(5)?,
-        })
-    })
-    .map_err(|e| format!("Failed to query jobs: {}", e))?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect jobs: {}", e))?;
+    match status {
+        Some(s) => {
+            let mut stmt = conn.prepare(
+                "SELECT job_id, status, task_type, sender, created_at, updated_at FROM jobs WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2"
+            ).map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+            let rows = stmt.query_map(rusqlite::params![s, limit], |row| {
+                Ok(JobInfo {
+                    job_id: row.get(0)?,
+                    status: row.get(1)?,
+                    task_type: row.get(2)?,
+                    sender: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            }).map_err(|e| format!("Failed to query jobs: {}", e))?;
+
+            for row in rows {
+                jobs.push(row.map_err(|e| format!("Failed to collect jobs: {}", e))?);
+            }
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT job_id, status, task_type, sender, created_at, updated_at FROM jobs ORDER BY created_at DESC LIMIT ?1"
+            ).map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+            let rows = stmt.query_map(rusqlite::params![limit], |row| {
+                Ok(JobInfo {
+                    job_id: row.get(0)?,
+                    status: row.get(1)?,
+                    task_type: row.get(2)?,
+                    sender: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            }).map_err(|e| format!("Failed to query jobs: {}", e))?;
+
+            for row in rows {
+                jobs.push(row.map_err(|e| format!("Failed to collect jobs: {}", e))?);
+            }
+        }
+    }
 
     Ok(jobs)
 }
@@ -413,15 +582,11 @@ fn get_job_milestones(job_id: String, state: State<'_, AppState>) -> Result<Vec<
     let conn = Connection::open(&state.db_path)
         .map_err(|e| format!("Failed to open database: {}", e))?;
 
-    let sql = format!(
-        "SELECT job_id, event_type, timestamp, payload FROM events WHERE job_id = '{}' ORDER BY timestamp ASC",
-        job_id
-    );
+    let mut stmt = conn.prepare(
+        "SELECT job_id, milestone, created_at, payload_json FROM events WHERE job_id = ?1 ORDER BY created_at ASC"
+    ).map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-    let mut stmt = conn.prepare(&sql)
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let milestones = stmt.query_map([], |row| {
+    let milestones = stmt.query_map(rusqlite::params![job_id], |row| {
         Ok(Milestone {
             job_id: row.get(0)?,
             event_type: row.get(1)?,
@@ -442,8 +607,7 @@ fn get_job_milestones(job_id: String, state: State<'_, AppState>) -> Result<Vec<
 
 #[tauri::command]
 fn list_verify_artifacts(job_id: String, state: State<'_, AppState>) -> Result<Vec<Artifact>, String> {
-    // Get work_root from config
-    let config = get_config(state.clone())?;
+    let config = get_config_inner(&state)?;
     let verify_path = format!("{}/_VERIFY/{}", config.work_root, job_id);
 
     let path = PathBuf::from(&verify_path);
@@ -485,7 +649,7 @@ fn list_verify_artifacts(job_id: String, state: State<'_, AppState>) -> Result<V
 
 #[tauri::command]
 fn get_quality_report(job_id: String, state: State<'_, AppState>) -> Result<Option<QualityReport>, String> {
-    let config = get_config(state)?;
+    let config = get_config_inner(&state)?;
     let report_path = format!("{}/_VERIFY/{}/quality_report.json", config.work_root, job_id);
 
     let path = PathBuf::from(&report_path);
@@ -496,7 +660,6 @@ fn get_quality_report(job_id: String, state: State<'_, AppState>) -> Result<Opti
     let content = fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read quality report: {}", e))?;
 
-    // Parse the JSON and extract relevant fields
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse quality report: {}", e))?;
 
@@ -509,8 +672,132 @@ fn get_quality_report(job_id: String, state: State<'_, AppState>) -> Result<Opti
 
 #[tauri::command]
 fn get_verify_folder_path(state: State<'_, AppState>) -> Result<String, String> {
-    let config = get_config(state)?;
+    let config = get_config_inner(&state)?;
     Ok(format!("{}/_VERIFY", config.work_root))
+}
+
+// ============================================================================
+// Docker / ClawRAG Commands
+// ============================================================================
+
+const CLAWRAG_CONTAINERS: &[&str] = &[
+    "clawrag-gateway",
+    "clawrag-backend",
+    "clawrag-chromadb",
+    "clawrag-ollama",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerContainer {
+    pub name: String,
+    pub status: String, // "running" | "stopped" | "not_found"
+    pub image: String,
+}
+
+const DOCKER_PATHS: &[&str] = &[
+    "/usr/local/bin/docker",
+    "/opt/homebrew/bin/docker",
+    "/usr/bin/docker",
+];
+
+fn find_docker() -> Option<String> {
+    for path in DOCKER_PATHS {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn docker_available() -> bool {
+    if let Some(docker) = find_docker() {
+        Command::new(&docker)
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+fn docker_cmd(args: &[&str]) -> Result<std::process::Output, String> {
+    let docker = find_docker().ok_or("Docker binary not found")?;
+    Command::new(&docker)
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run docker: {}", e))
+}
+
+fn parse_docker_containers(stdout: &str) -> Vec<DockerContainer> {
+    let mut containers: Vec<DockerContainer> = Vec::new();
+    for name in CLAWRAG_CONTAINERS {
+        let mut found = false;
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 3 && parts[0] == *name {
+                let status = if parts[1].starts_with("Up") { "running" } else { "stopped" };
+                containers.push(DockerContainer {
+                    name: name.to_string(),
+                    status: status.to_string(),
+                    image: parts[2].to_string(),
+                });
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            containers.push(DockerContainer {
+                name: name.to_string(),
+                status: "not_found".to_string(),
+                image: String::new(),
+            });
+        }
+    }
+    containers
+}
+
+#[tauri::command]
+fn get_docker_status() -> Result<Vec<DockerContainer>, String> {
+    if !docker_available() {
+        return Err("Docker is not running".to_string());
+    }
+
+    let output = docker_cmd(&["ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_docker_containers(&stdout))
+}
+
+#[tauri::command]
+async fn start_docker_services() -> Result<Vec<DockerContainer>, String> {
+    if !docker_available() {
+        return Err("Docker is not running. Please start Docker Desktop first.".to_string());
+    }
+
+    for name in CLAWRAG_CONTAINERS {
+        let _ = docker_cmd(&["start", name]);
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let output = docker_cmd(&["ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_docker_containers(&stdout))
+}
+
+#[tauri::command]
+async fn stop_docker_services() -> Result<(), String> {
+    if !docker_available() {
+        return Err("Docker is not running".to_string());
+    }
+
+    for name in CLAWRAG_CONTAINERS {
+        let _ = docker_cmd(&["stop", name]);
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -519,10 +806,36 @@ fn get_verify_folder_path(state: State<'_, AppState>) -> Result<String, String> 
 
 #[tauri::command]
 fn open_in_finder(path: String) -> Result<(), String> {
-    Command::new("open")
-        .args(["-R", &path])
-        .spawn()
+    let path_buf = PathBuf::from(&path);
+
+    // Check if path exists
+    if !path_buf.exists() {
+        // Try to open parent folder if it exists
+        if let Some(parent) = path_buf.parent() {
+            if parent.exists() {
+                let status = Command::new("open")
+                    .arg(parent)
+                    .status()
+                    .map_err(|e| format!("Failed to open Finder: {}", e))?;
+
+                if status.success() {
+                    return Err(format!("Folder not found. Opened parent directory instead."));
+                }
+            }
+        }
+        return Err(format!("Path does not exist: {}", path));
+    }
+
+    // Use open command - if it's a directory, open it; if file, reveal in Finder
+    let status = Command::new("open")
+        .arg(&path)
+        .status()
         .map_err(|e| format!("Failed to open Finder: {}", e))?;
+
+    if !status.success() {
+        return Err(format!("Failed to open path: {}", path));
+    }
+
     Ok(())
 }
 
@@ -558,6 +871,8 @@ pub fn run() {
             stop_all_services,
             restart_all_services,
             run_preflight_check,
+            auto_fix_preflight,
+            start_openclaw,
             get_config,
             save_config,
             get_jobs,
@@ -565,6 +880,9 @@ pub fn run() {
             list_verify_artifacts,
             get_quality_report,
             get_verify_folder_path,
+            get_docker_status,
+            start_docker_services,
+            stop_docker_services,
             open_in_finder,
             read_log_file,
         ])
@@ -586,14 +904,12 @@ pub fn run() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => {
-                        // Show/ focus main window
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
                     }
                     "restart" => {
-                        // Emit event to restart services
                         let _ = app.emit("tray-restart-services", ());
                     }
                     "quit" => {

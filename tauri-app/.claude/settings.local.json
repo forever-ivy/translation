@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(openclaw health:*)",
+      "Bash(echo:*)",
+      "Bash(/Users/ivy/.local/bin/openclaw health:*)"
+    ]
+  }
+}

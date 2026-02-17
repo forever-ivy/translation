@@ -56,6 +56,12 @@ export interface QualityReport {
   purity_score: number;
 }
 
+export interface DockerContainer {
+  name: string;
+  status: string; // "running" | "stopped" | "not_found"
+  image: string;
+}
+
 // ============================================================================
 // Service Commands
 // ============================================================================
@@ -79,6 +85,12 @@ export const restartAllServices = (): Promise<ServiceStatus[]> =>
 export const runPreflightCheck = (): Promise<PreflightCheck[]> =>
   invoke<PreflightCheck[]>("run_preflight_check");
 
+export const autoFixPreflight = (): Promise<PreflightCheck[]> =>
+  invoke<PreflightCheck[]>("auto_fix_preflight");
+
+export const startOpenclaw = (): Promise<PreflightCheck[]> =>
+  invoke<PreflightCheck[]>("start_openclaw");
+
 // ============================================================================
 // Config Commands
 // ============================================================================
@@ -88,9 +100,6 @@ export const getConfig = (): Promise<AppConfig> =>
 
 export const saveConfig = (config: AppConfig): Promise<void> =>
   invoke<void>("save_config", { config });
-
-export const validateConfig = (config: AppConfig): Promise<{ valid: boolean; errors: string[] }> =>
-  invoke<{ valid: boolean; errors: string[] }>("validate_config", { config });
 
 // ============================================================================
 // Job Commands
@@ -108,9 +117,6 @@ export const getJobMilestones = (jobId: string): Promise<Milestone[]> =>
 
 export const listVerifyArtifacts = (jobId: string): Promise<Artifact[]> =>
   invoke<Artifact[]>("list_verify_artifacts", { jobId });
-
-export const readArtifact = (path: string): Promise<string> =>
-  invoke<string>("read_artifact", { path });
 
 export const getQualityReport = (jobId: string): Promise<QualityReport | null> =>
   invoke<QualityReport | null>("get_quality_report", { jobId });
@@ -131,3 +137,16 @@ export const openInFinder = (path: string): Promise<void> =>
 
 export const getVerifyFolderPath = (): Promise<string> =>
   invoke<string>("get_verify_folder_path");
+
+// ============================================================================
+// Docker / ClawRAG Commands
+// ============================================================================
+
+export const getDockerStatus = (): Promise<DockerContainer[]> =>
+  invoke<DockerContainer[]>("get_docker_status");
+
+export const startDockerServices = (): Promise<DockerContainer[]> =>
+  invoke<DockerContainer[]>("start_docker_services");
+
+export const stopDockerServices = (): Promise<void> =>
+  invoke<void>("stop_docker_services");

@@ -48,7 +48,13 @@
       "Bash(/Users/Code/workflow/translation/scripts/start.sh:*)",
       "Bash(pnpm:*)",
       "Bash(rustc:*)",
-      "Bash(sudo chown:*)"
+      "Bash(sudo chown:*)",
+      "Bash(npm install:*)",
+      "Bash(npm run build:*)",
+      "Bash(cargo build:*)",
+      "Bash(sqlite3:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker info:*)"
     ]
   }
 }
