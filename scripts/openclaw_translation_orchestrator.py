@@ -1917,12 +1917,14 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     if rev.get("ok"):
                         codex_review = rev["data"]
                     else:
+                        _write_raw_error_artifacts(round_dir, "gemini_review_codex", rev)
                         gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:codex")))
                 if glm_data:
                     rev = _gemini_review(execution_context, glm_data, round_idx)
                     if rev.get("ok"):
                         glm_review = rev["data"]
                     else:
+                        _write_raw_error_artifacts(round_dir, "gemini_review_glm", rev)
                         gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:glm")))
 
                 if not codex_review and not glm_review:
@@ -1996,6 +1998,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     if gemini_final.get("ok"):
                         gemini_data = gemini_final["data"]
                     else:
+                        _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
                         gemini_enabled = False
                         status_flags.append("degraded_single_model")
                         gemini_data = {
@@ -2072,6 +2075,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     if gemini_final.get("ok"):
                         gemini_data = gemini_final["data"]
                     else:
+                        _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
                         gemini_enabled = False
                         status_flags.append("degraded_single_model")
                         gemini_data = {
