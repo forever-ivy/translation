@@ -61,6 +61,26 @@ export interface DockerContainer {
   image: string;
 }
 
+export interface ApiProvider {
+  id: string;
+  name: string;
+  authType: "oauth" | "api_key" | "none";
+  status: "configured" | "missing" | "expired";
+  hasKey: boolean;
+  email?: string;
+  expiresAt?: number;
+}
+
+export interface ApiUsage {
+  provider: string;
+  used: number;
+  limit: number;
+  remaining: number;
+  unit: string;
+  resetAt?: number;
+  fetchedAt: number;
+}
+
 interface AppState {
   // Services
   services: Service[];
@@ -132,6 +152,15 @@ interface AppState {
   restartServices: () => Promise<void>;
   saveConfig: (config: AppConfig) => Promise<void>;
   fetchLogs: (service: string, lines?: number) => Promise<void>;
+
+  // API Providers
+  apiProviders: ApiProvider[];
+  apiUsage: Record<string, ApiUsage>;
+  fetchApiProviders: () => Promise<void>;
+  fetchApiUsage: (provider: string) => Promise<void>;
+  fetchAllApiUsage: () => Promise<void>;
+  setApiKey: (provider: string, key: string) => Promise<void>;
+  deleteApiKey: (provider: string) => Promise<void>;
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -530,6 +559,84 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ logs, selectedLogService: service });
     } catch (err) {
       get().addToast("error", `Failed to fetch logs: ${err}`);
+    }
+  },
+
+  // API Providers
+  apiProviders: [],
+  apiUsage: {},
+  fetchApiProviders: async () => {
+    try {
+      const providers = await tauri.getApiProviders();
+      set({
+        apiProviders: providers.map((p) => ({
+          id: p.id,
+          name: p.name,
+          authType: p.auth_type as "oauth" | "api_key" | "none",
+          status: p.status as "configured" | "missing" | "expired",
+          hasKey: p.has_key,
+          email: p.email,
+          expiresAt: p.expires_at,
+        })),
+      });
+    } catch (err) {
+      get().addToast("error", `Failed to fetch API providers: ${err}`);
+    }
+  },
+  fetchApiUsage: async (provider: string) => {
+    try {
+      const usage = await tauri.getApiUsage(provider);
+      if (usage) {
+        set((state) => ({
+          apiUsage: {
+            ...state.apiUsage,
+            [provider]: {
+              provider: usage.provider,
+              used: usage.used,
+              limit: usage.limit,
+              remaining: usage.remaining,
+              unit: usage.unit,
+              resetAt: usage.reset_at,
+              fetchedAt: usage.fetched_at,
+            },
+          },
+        }));
+      }
+    } catch (err) {
+      // Silently ignore usage fetch errors
+      console.error(`Failed to fetch usage for ${provider}:`, err);
+    }
+  },
+  fetchAllApiUsage: async () => {
+    const { apiProviders } = get();
+    for (const provider of apiProviders) {
+      if (provider.authType === "api_key" && provider.hasKey) {
+        await get().fetchApiUsage(provider.id);
+      }
+    }
+  },
+  setApiKey: async (provider: string, key: string) => {
+    try {
+      await tauri.setApiKey(provider, key);
+      await get().fetchApiProviders();
+      get().addToast("success", `API key saved for ${provider}`);
+    } catch (err) {
+      get().addToast("error", `Failed to save API key: ${err}`);
+    }
+  },
+  deleteApiKey: async (provider: string) => {
+    try {
+      await tauri.deleteApiKey(provider);
+      await get().fetchApiProviders();
+      // Clear usage data
+      set((state) => {
+        const newUsage = { ...state.apiUsage };
+        delete newUsage[provider];
+        return { apiUsage: newUsage };
+      });
+      get().addToast("success", `API key removed for ${provider}`);
+    } catch (err) {
+      get().addToast("error", `Failed to remove API key: ${err}`);
     }
   },
 }));

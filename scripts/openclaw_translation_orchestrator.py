@@ -192,7 +192,7 @@ GLM_GENERATOR_AGENT = os.getenv("OPENCLAW_GLM_GENERATOR_AGENT", GLM_AGENT)
 GLM_ENABLED = os.getenv("OPENCLAW_GLM_ENABLED", "0").strip() == "1"
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 GLM_API_BASE_URL = os.getenv("GLM_API_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
-GLM_MODEL = os.getenv("OPENCLAW_GLM_MODEL", "zhipu/glm-5")
+GLM_MODEL = os.getenv("OPENCLAW_GLM_MODEL", "zai/glm-5")
 
 
 def _normalize_text(text: str) -> str:
@@ -488,31 +488,105 @@ def _candidate_payload(candidates: list[dict[str, Any]], *, include_text: bool =
 
 
 def _extract_json_from_text(text: str) -> dict[str, Any]:
-    raw = text.strip()
+    raw = (text or "").strip()
     if not raw:
         raise ValueError("empty response text")
+
+    def _coerce_first_dict(value: Any) -> dict[str, Any] | None:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    return item
+        return None
+
+    # 1) Strict JSON only.
     try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
+        coerced = _coerce_first_dict(json.loads(raw))
+        if coerced is not None:
+            return coerced
     except json.JSONDecodeError:
         pass
 
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
-    if fenced:
-        try:
-            return json.loads(fenced.group(1))
-        except json.JSONDecodeError:
-            pass
+    # 2) Allow trailing garbage after a valid JSON value.
+    decoder = json.JSONDecoder()
+    try:
+        value, _end = decoder.raw_decode(raw)
+        coerced = _coerce_first_dict(value)
+        if coerced is not None:
+            return coerced
+    except json.JSONDecodeError:
+        pass
 
-    first = raw.find("{")
-    last = raw.rfind("}")
-    if first >= 0 and last > first:
-        sub = raw[first : last + 1]
-        try:
-            return json.loads(sub)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"failed to parse JSON from model output: {exc}") from exc
+    # 3) Best-effort scan: pick the dict that most resembles one of our expected schemas.
+    dict_candidates: list[dict[str, Any]] = []
+    for cand in _iter_json_candidates(raw, limit=24):
+        coerced = _coerce_first_dict(cand)
+        if coerced is not None:
+            dict_candidates.append(coerced)
+    if dict_candidates:
+        keysets = [
+            {
+                "final_text",
+                "final_reflow_text",
+                "draft_a_text",
+                "draft_b_text",
+                "docx_translation_map",
+                "docx_translation_blocks",
+                "docx_table_cells",
+                "xlsx_translation_map",
+                "review_brief_points",
+                "change_log_points",
+                "resolved",
+                "unresolved",
+                "codex_pass",
+                "reasoning_summary",
+            },
+            {
+                "task_type",
+                "task_label",
+                "source_language",
+                "target_language",
+                "required_inputs",
+                "missing_inputs",
+                "confidence",
+                "reasoning_summary",
+                "estimated_minutes",
+                "complexity_score",
+            },
+            {
+                "findings",
+                "resolved",
+                "unresolved",
+                "pass",
+                "terminology_rate",
+                "structure_complete_rate",
+                "target_language_purity",
+                "numbering_consistency",
+                "reasoning_summary",
+            },
+            {
+                "findings",
+                "pass",
+                "terminology_score",
+                "completeness_score",
+                "naturalness_score",
+                "reasoning_summary",
+            },
+        ]
+
+        def _score(obj: dict[str, Any]) -> tuple[int, int]:
+            keys = set(obj.keys())
+            best_hits = 0
+            for ks in keysets:
+                hits = sum(1 for k in ks if k in keys)
+                if hits > best_hits:
+                    best_hits = hits
+            return (best_hits, len(keys))
+
+        return max(dict_candidates, key=_score)
+
     raise ValueError("no JSON object in model output")
 
 
@@ -1780,6 +1854,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         errors: list[str] = []
         gemini_enabled = bool(meta.get("gemini_available", True))
         system_round_root = Path(review_dir) / ".system" / "rounds"
+        system_round_root.mkdir(parents=True, exist_ok=True)
         disallow_markdown = _env_flag("OPENCLAW_DISALLOW_MARKDOWN", "1")
         vision_in_round = _env_flag("OPENCLAW_VISION_QA_IN_ROUND", "1")
         vision_fix_limit = max(0, int(os.getenv("OPENCLAW_VISION_QA_MAX_RETRIES", "2")))
@@ -1788,12 +1863,39 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         preserve_coverage_by_round: dict[str, Any] = {}
         vision_trials_by_round: dict[str, Any] = {}
 
+        def _write_raw_error_artifacts(round_dir: Path, name: str, result: dict[str, Any]) -> None:
+            if result.get("ok"):
+                return
+            payload: dict[str, Any] = {"ok": False, "error": str(result.get("error") or "")}
+            detail = result.get("detail")
+            if detail is not None:
+                payload["detail"] = detail
+            _write_json(round_dir / f"{name}_error.json", payload)
+
+            raw_text = str(result.get("raw_text") or "").strip()
+            if not raw_text and isinstance(detail, dict):
+                for k in ("raw_text", "text", "stdout", "stderr"):
+                    val = detail.get(k)
+                    if isinstance(val, str) and val.strip():
+                        raw_text = val
+                        break
+            if raw_text:
+                cap = int(os.getenv("OPENCLAW_RAW_MODEL_OUTPUT_MAX_CHARS", "200000"))
+                safe_text = raw_text[: max(1000, cap)]
+                (round_dir / f"raw_{name}.txt").write_text(safe_text, encoding="utf-8", errors="replace")
+
         for round_idx in range(1, thresholds.max_rounds + 1):
+            round_dir = system_round_root / f"round_{round_idx}"
+            round_dir.mkdir(parents=True, exist_ok=True)
+
             codex_gen = _codex_generate(execution_context, current_draft, previous_findings, round_idx)
             glm_gen = _glm_generate(execution_context, current_draft, previous_findings, round_idx)
 
             codex_data: dict[str, Any] | None = codex_gen.get("data") if codex_gen.get("ok") else None
             glm_data: dict[str, Any] | None = glm_gen.get("data") if glm_gen.get("ok") else None
+
+            _write_raw_error_artifacts(round_dir, "codex_generate", codex_gen)
+            _write_raw_error_artifacts(round_dir, "glm_generate", glm_gen)
 
             generation_errors: dict[str, str] = {}
             if not codex_data:
@@ -1802,6 +1904,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 generation_errors["glm"] = str(glm_gen.get("error", "glm_generation_failed"))
             if not codex_data and not glm_data:
                 errors.append(f"no_generator_candidates:{generation_errors}")
+                _write_json(round_dir / "generation_errors.json", {"errors": generation_errors})
                 break
 
             codex_review: dict[str, Any] | None = None
@@ -1992,7 +2095,6 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     vision_in_round=vision_in_round,
                 )
 
-            round_dir = system_round_root / f"round_{round_idx}"
             candidate_refs: dict[str, str] = {}
             review_refs: dict[str, str] = {}
             if codex_data:

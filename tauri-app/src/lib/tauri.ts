@@ -150,3 +150,43 @@ export const startDockerServices = (): Promise<DockerContainer[]> =>
 
 export const stopDockerServices = (): Promise<void> =>
   invoke<void>("stop_docker_services");
+
+// ============================================================================
+// API Provider Types
+// ============================================================================
+
+export interface ApiProvider {
+  id: string;
+  name: string;
+  auth_type: "oauth" | "api_key" | "none";
+  status: "configured" | "missing" | "expired";
+  has_key: boolean;
+  email?: string;
+  expires_at?: number;
+}
+
+export interface ApiUsage {
+  provider: string;
+  used: number;
+  limit: number;
+  remaining: number;
+  unit: string;
+  reset_at?: number;
+  fetched_at: number;
+}
+
+// ============================================================================
+// API Provider Commands
+// ============================================================================
+
+export const getApiProviders = (): Promise<ApiProvider[]> =>
+  invoke<ApiProvider[]>("get_api_providers");
+
+export const getApiUsage = (provider: string): Promise<ApiUsage | null> =>
+  invoke<ApiUsage | null>("get_api_usage", { provider });
+
+export const setApiKey = (provider: string, key: string): Promise<void> =>
+  invoke<void>("set_api_key", { provider, key });
+
+export const deleteApiKey = (provider: string): Promise<void> =>
+  invoke<void>("delete_api_key", { provider });

@@ -13,8 +13,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import subprocess
 import urllib.request
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -45,18 +47,45 @@ def _extract_first_json_object(raw: str) -> dict[str, Any]:
     raise ValueError("no JSON object found in response text")
 
 
+@lru_cache(maxsize=1)
+def _resolve_soffice_bin() -> str:
+    override = os.environ.get("OPENCLAW_SOFFICE_BIN", "").strip()
+    candidates: list[str] = []
+    if override:
+        candidates.append(override)
+    found = shutil.which("soffice")
+    if found:
+        candidates.append(found)
+    # macOS default install path.
+    candidates.append("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+
+    for cand in candidates:
+        if not cand:
+            continue
+        path = Path(cand).expanduser()
+        if path.exists() and os.access(str(path), os.X_OK):
+            return str(path)
+
+    raise RuntimeError(
+        "LibreOffice (soffice) not found. Install LibreOffice or set OPENCLAW_SOFFICE_BIN to the soffice binary path."
+    )
+
+
 def render_docx_to_images(docx_path: Path, output_dir: Path) -> list[Path]:
     """Convert docx to one-or-more PNGs via LibreOffice headless."""
     output_dir.mkdir(parents=True, exist_ok=True)
     outdir = str(output_dir)
     try:
+        soffice_bin = _resolve_soffice_bin()
         subprocess.run(
-            ["soffice", "--headless", "--convert-to", "png", "--outdir", outdir, str(docx_path)],
+            [soffice_bin, "--headless", "--convert-to", "png", "--outdir", outdir, str(docx_path)],
             check=True,
             capture_output=True,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("LibreOffice (soffice) is required for DOCX vision QA.") from exc
+        raise RuntimeError(
+            "LibreOffice (soffice) not found. Install LibreOffice or set OPENCLAW_SOFFICE_BIN to the soffice binary path."
+        ) from exc
 
     stem = docx_path.stem
     produced = sorted(output_dir.glob(f"{stem}*.png"), key=lambda p: p.name.lower())

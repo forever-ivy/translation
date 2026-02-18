@@ -79,7 +79,7 @@ ensure_agent "translator-core" "$PRIMARY_MODEL"
 ensure_agent "review-core" "$FALLBACK_MODEL"
 ensure_agent "qa-gate" "$PRIMARY_MODEL"
 
-GLM_MODEL="${OPENCLAW_GLM_MODEL:-zhipu/glm-5}"
+GLM_MODEL="${OPENCLAW_GLM_MODEL:-zai/glm-5}"
 if [[ "${OPENCLAW_GLM_ENABLED:-0}" == "1" ]]; then
   ensure_agent "glm-reviewer" "$GLM_MODEL"
 fi

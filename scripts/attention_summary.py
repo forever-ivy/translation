@@ -55,7 +55,7 @@ def _flag_message(flag: str, *, review_dir: str) -> str | None:
         return f"{msg} Check: {base}" if base else msg
     if f == "format_qa_error":
         base = _system_path(review_dir, "format_qa")
-        msg = "Format QA error (vision QA crashed)."
+        msg = "Format QA error (Vision QA)."
         return f"{msg} Check: {base}" if base else msg
     if f == "docx_qa_failed":
         base = _system_path(review_dir, "docx_qa")
@@ -63,7 +63,7 @@ def _flag_message(flag: str, *, review_dir: str) -> str | None:
         return f"{msg} Check: {base}" if base else msg
     if f == "docx_qa_error":
         base = _system_path(review_dir, "docx_qa")
-        msg = "DOCX QA error (vision QA crashed)."
+        msg = "DOCX QA error (Vision QA)."
         return f"{msg} Check: {base}" if base else msg
     if f == "docx_layout_ugly":
         base = _system_path(review_dir, "docx_qa")
@@ -146,6 +146,22 @@ def attention_summary(
 
     # 2) Use last-round "hard_findings" / "unresolved" if available.
     report = _load_quality_report(artifacts=artifacts or {}, review_dir=review_dir_norm) or {}
+    # If Vision QA crashed for a known external reason, surface the real cause.
+    if "format_qa_error" in flags:
+        err = report.get("format_qa_error")
+        if isinstance(err, str) and err.strip():
+            reasons = [r for r in reasons if not r.startswith("Format QA error")]
+            base = _system_path(review_dir_norm, "format_qa")
+            msg = f"Format QA error: {err.strip()}"
+            reasons.append(f"{msg} Check: {base}" if base else msg)
+    if "docx_qa_error" in flags:
+        err = report.get("docx_qa_error")
+        if isinstance(err, str) and err.strip():
+            reasons = [r for r in reasons if not r.startswith("DOCX QA error")]
+            base = _system_path(review_dir_norm, "docx_qa")
+            msg = f"DOCX QA error: {err.strip()}"
+            reasons.append(f"{msg} Check: {base}" if base else msg)
+
     rounds = report.get("rounds")
     last_round: dict[str, Any] = {}
     if isinstance(rounds, list) and rounds:
@@ -169,6 +185,14 @@ def attention_summary(
     # 3) Fallback to errors (avoid the generic noise token when other signals exist).
     if reasons:
         errs = [e for e in errs if e not in _NOISE_ERRORS]
+        # When we have a hard fail, include the most actionable error even if flags already exist.
+        if any("Hard failure occurred" in r for r in reasons):
+            prioritized = [e for e in errs if e.startswith("no_generator_candidates") or e.startswith("agent_call_failed")]
+            for e in prioritized:
+                if len(reasons) >= max_items:
+                    break
+                if e not in reasons:
+                    reasons.append(e)
     if not reasons and errs:
         for e in errs:
             if len(reasons) >= max_items:

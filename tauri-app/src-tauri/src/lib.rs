@@ -72,6 +72,32 @@ pub struct QualityReport {
 }
 
 // ============================================================================
+// API Provider Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiProvider {
+    pub id: String,
+    pub name: String,
+    pub auth_type: String, // "oauth" | "api_key" | "none"
+    pub status: String,    // "configured" | "missing" | "expired"
+    pub has_key: bool,
+    pub email: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiUsage {
+    pub provider: String,
+    pub used: u64,
+    pub limit: u64,
+    pub remaining: u64,
+    pub unit: String,
+    pub reset_at: Option<i64>,
+    pub fetched_at: i64,
+}
+
+// ============================================================================
 // Application State
 // ============================================================================
 
@@ -857,6 +883,261 @@ fn read_log_file(state: State<'_, AppState>, service: String, lines: u32) -> Res
 }
 
 // ============================================================================
+// API Provider Commands
+// ============================================================================
+
+/// Get the path to auth-profiles.json
+fn get_auth_profiles_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+    PathBuf::from(format!("{}/.openclaw/agents/main/agent/auth-profiles.json", home))
+}
+
+/// Read auth profiles from JSON file
+fn read_auth_profiles() -> Result<serde_json::Value, String> {
+    let path = get_auth_profiles_path();
+    if !path.exists() {
+        return Ok(serde_json::json!({"profiles": {}}));
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read auth profiles: {}", e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse auth profiles: {}", e))
+}
+
+/// Write auth profiles to JSON file
+fn write_auth_profiles(profiles: &serde_json::Value) -> Result<(), String> {
+    let path = get_auth_profiles_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+    let content = serde_json::to_string_pretty(profiles)
+        .map_err(|e| format!("Failed to serialize auth profiles: {}", e))?;
+    fs::write(&path, content)
+        .map_err(|e| format!("Failed to write auth profiles: {}", e))
+}
+
+/// Known provider definitions
+fn get_known_providers() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("openai-codex", "OpenAI Codex", "oauth"),
+        ("google-antigravity", "Google (Antigravity Proxy)", "oauth"),
+        ("openrouter", "OpenRouter", "api_key"),
+        ("zai", "Zai (GLM)", "api_key"),
+    ]
+}
+
+#[tauri::command]
+fn get_api_providers() -> Result<Vec<ApiProvider>, String> {
+    let profiles = read_auth_profiles()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    // Helper to find the active profile for a provider
+    fn find_active_profile<'a>(
+        profiles: &'a serde_json::Value,
+        provider_id: &str,
+    ) -> Option<(&'a str, &'a serde_json::Value)> {
+        // First check lastGood for the active profile key
+        if let Some(last_good) = profiles.get("lastGood").and_then(|lg| lg.get(provider_id)) {
+            if let Some(key) = last_good.as_str() {
+                if let Some(profile) = profiles.get("profiles").and_then(|p| p.get(key)) {
+                    return Some((key, profile));
+                }
+            }
+        }
+
+        // Fallback: search for any profile matching this provider
+        if let Some(profiles_obj) = profiles.get("profiles").and_then(|p| p.as_object()) {
+            for (key, profile) in profiles_obj {
+                if key.starts_with(&format!("{}:", provider_id)) {
+                    return Some((key, profile));
+                }
+            }
+        }
+
+        None
+    }
+
+    let providers: Vec<ApiProvider> = get_known_providers()
+        .into_iter()
+        .map(|(id, name, auth_type)| {
+            let profile_data = find_active_profile(&profiles, id);
+            let (_profile_key, profile) = match profile_data {
+                Some((key, p)) => (Some(key), Some(p)),
+                None => (None, None),
+            };
+
+            let (has_key, email, expires_at, status) = match auth_type {
+                "oauth" => {
+                    // For OAuth providers, check for access token presence
+                    match profile {
+                        Some(p) => {
+                            let access_token = p.get("access").and_then(|a| a.as_str());
+                            let refresh_token = p.get("refresh").and_then(|r| r.as_str());
+                            let email_val = p.get("email").and_then(|e| e.as_str().map(|s| s.to_string()));
+                            let expires = p.get("expires").and_then(|e| e.as_i64());
+                            let provider_type = p.get("type").and_then(|t| t.as_str());
+
+                            // Validate OAuth profile structure
+                            let is_valid_oauth = provider_type == Some("oauth")
+                                && access_token.is_some()
+                                && refresh_token.is_some();
+
+                            if !is_valid_oauth {
+                                (false, email_val, expires, "missing".to_string())
+                            } else if let Some(exp) = expires {
+                                if exp < now {
+                                    (true, email_val, Some(exp), "expired".to_string())
+                                } else {
+                                    (true, email_val, Some(exp), "configured".to_string())
+                                }
+                            } else {
+                                (true, email_val, None, "configured".to_string())
+                            }
+                        }
+                        None => (false, None, None, "missing".to_string()),
+                    }
+                }
+                "api_key" => {
+                    // For API key providers, check for key presence
+                    match profile {
+                        Some(p) => {
+                            let key = p.get("key").and_then(|k| k.as_str());
+                            let provider_type = p.get("type").and_then(|t| t.as_str());
+                            let is_valid = provider_type == Some("api_key") && key.is_some();
+                            (is_valid, None, None, if is_valid { "configured" } else { "missing" }.to_string())
+                        }
+                        None => (false, None, None, "missing".to_string()),
+                    }
+                }
+                _ => (false, None, None, "missing".to_string()),
+            };
+
+            ApiProvider {
+                id: id.to_string(),
+                name: name.to_string(),
+                auth_type: auth_type.to_string(),
+                status,
+                has_key,
+                email,
+                expires_at,
+            }
+        })
+        .collect();
+
+    Ok(providers)
+}
+
+#[tauri::command]
+async fn get_api_usage(provider: String) -> Result<Option<ApiUsage>, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let profiles = read_auth_profiles()?;
+
+    match provider.as_str() {
+        "openrouter" => {
+            let profile_key = "openrouter:default";
+            let api_key = profiles
+                .get("profiles")
+                .and_then(|p| p.get(profile_key))
+                .and_then(|p| p.get("key").and_then(|k| k.as_str()));
+
+            if let Some(key) = api_key {
+                let client = reqwest::Client::new();
+                let response = client
+                    .get("https://openrouter.ai/api/v1/auth/key")
+                    .header("Authorization", format!("Bearer {}", key))
+                    .send()
+                    .await
+                    .map_err(|e| format!("Failed to fetch usage: {}", e))?;
+
+                if response.status().is_success() {
+                    let json: serde_json::Value = response.json().await
+                        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+                    let data = json.get("data").unwrap_or(&serde_json::Value::Null);
+                    let limit_remaining = data.get("limit_remaining").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let usage = data.get("usage").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let limit = limit_remaining + usage;
+
+                    return Ok(Some(ApiUsage {
+                        provider: provider.clone(),
+                        used: usage,
+                        limit,
+                        remaining: limit_remaining,
+                        unit: "credits".to_string(),
+                        reset_at: None,
+                        fetched_at: now,
+                    }));
+                }
+            }
+            Ok(None)
+        }
+        "zai" => {
+            // Zai API usage - check if we have the key
+            let profile_key = "zai:default";
+            let has_key = profiles
+                .get("profiles")
+                .and_then(|p| p.get(profile_key))
+                .is_some();
+
+            if has_key {
+                // Return placeholder - actual API would need to be implemented
+                Ok(Some(ApiUsage {
+                    provider: provider.clone(),
+                    used: 0,
+                    limit: 0,
+                    remaining: 0,
+                    unit: "tokens".to_string(),
+                    reset_at: None,
+                    fetched_at: now,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn set_api_key(provider: String, key: String) -> Result<(), String> {
+    let mut profiles = read_auth_profiles()?;
+
+    let profile_key = format!("{}:default", provider);
+    let profiles_obj = profiles.get_mut("profiles")
+        .ok_or("Invalid profiles structure")?
+        .as_object_mut()
+        .ok_or("Profiles is not an object")?;
+
+    profiles_obj.insert(profile_key, serde_json::json!({
+        "type": "api_key",
+        "provider": provider,
+        "key": key
+    }));
+
+    write_auth_profiles(&profiles)
+}
+
+#[tauri::command]
+fn delete_api_key(provider: String) -> Result<(), String> {
+    let mut profiles = read_auth_profiles()?;
+
+    let profile_key = format!("{}:default", provider);
+    if let Some(profiles_obj) = profiles.get_mut("profiles").and_then(|p| p.as_object_mut()) {
+        profiles_obj.remove(&profile_key);
+    }
+
+    write_auth_profiles(&profiles)
+}
+
+// ============================================================================
 // Entry Point
 // ============================================================================
 
@@ -885,6 +1166,10 @@ pub fn run() {
             stop_docker_services,
             open_in_finder,
             read_log_file,
+            get_api_providers,
+            get_api_usage,
+            set_api_key,
+            delete_api_key,
         ])
         .setup(|app| {
             // Create system tray

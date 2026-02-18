@@ -5,7 +5,7 @@ import { useAppStore, type ServiceStatusType } from "@/stores/appStore";
 import * as tauri from "@/lib/tauri";
 import { useEffect } from "react";
 import { motion } from "framer-motion";
-import { GlassMotionCard, StatusPulse, CountUp, staggerContainer, staggerItem } from "@/components/ui/motion";
+import { StatusPulse, CountUp, staggerContainer, staggerItem } from "@/components/ui/motion";
 import {
   Play,
   Square,
@@ -108,29 +108,34 @@ export function Dashboard() {
         animate="show"
       >
         {services.map((service) => (
-          <motion.div key={service.name} variants={staggerItem}>
-            <GlassMotionCard glowColor={service.status === "running" ? "teal" : undefined}>
-              <Card variant="glass" className="h-full gradient-border">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm font-medium flex items-center justify-between">
-                    {service.name}
-                    {statusIcons[service.status]}
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <StatusPulse color={statusColors[service.status]} glow={service.status === "running"} />
-                    {service.status === "running" ? (
-                      <span>
-                        Running • PID: <CountUp value={service.pid || "-"} /> • Uptime: {service.uptime || "0m"}
-                      </span>
-                    ) : (
-                      <span className="capitalize">{service.status}</span>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            </GlassMotionCard>
+          <motion.div
+            key={service.name}
+            variants={staggerItem}
+            className={`
+              service-card-glow rounded-2xl
+              ${service.status !== "running" ? "service-card-glow-gray" : ""}
+            `}
+          >
+            <Card variant="glass" className="h-full border-0">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium flex items-center justify-between">
+                  {service.name}
+                  {statusIcons[service.status]}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <StatusPulse color={statusColors[service.status]} glow={service.status === "running"} />
+                  {service.status === "running" ? (
+                    <span>
+                      Running • PID: <CountUp value={service.pid || "-"} /> • Uptime: {service.uptime || "0m"}
+                    </span>
+                  ) : (
+                    <span className="capitalize">{service.status}</span>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
           </motion.div>
         ))}
       </motion.div>
