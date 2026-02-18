@@ -88,7 +88,22 @@ class FormatQaVisionTest(unittest.TestCase):
                 self.assertEqual(out["status"], "failed")
                 self.assertTrue(out["sheet_count_mismatch"])
 
+    def test_soffice_missing_skips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            review_dir = Path(tmp) / "qa"
+            with patch(
+                "scripts.format_qa_vision.render_xlsx_to_images",
+                side_effect=RuntimeError("LibreOffice (soffice) not found"),
+            ):
+                out = run_format_qa_loop(
+                    original_xlsx=Path("orig.xlsx"),
+                    translated_xlsx=Path("trans.xlsx"),
+                    review_dir=review_dir,
+                    max_retries=0,
+                )
+                self.assertEqual(out["status"], "skipped")
+                self.assertIn(out.get("reason"), {"soffice_missing", "render_failed"})
+
 
 if __name__ == "__main__":
     unittest.main()
-

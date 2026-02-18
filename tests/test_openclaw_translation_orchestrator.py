@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import json
 import subprocess
 import tempfile
@@ -150,6 +151,17 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
                         "reasoning_summary": "Pass.",
                     }
                 ),
+                # GLM advisory review (after rounds)
+                _agent_ok(
+                    {
+                        "findings": [],
+                        "pass": True,
+                        "terminology_score": 0.95,
+                        "completeness_score": 0.95,
+                        "naturalness_score": 0.95,
+                        "reasoning_summary": "Pass.",
+                    }
+                ),
             ]
 
             meta = {
@@ -181,7 +193,8 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
                 ],
             }
 
-            out = run(meta)
+            with patch.dict(os.environ, {"OPENCLAW_GLM_ENABLED": "1"}, clear=False):
+                out = run(meta)
             self.assertEqual(out["status"], "review_ready")
             self.assertTrue(out["double_pass"])
             self.assertGreaterEqual(out["iteration_count"], 1)

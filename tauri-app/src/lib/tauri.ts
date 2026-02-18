@@ -12,6 +12,37 @@ export interface ServiceStatus {
   restarts: number;
 }
 
+export interface KbSyncReport {
+  ok: boolean;
+  kb_root: string;
+  scanned_count: number;
+  created: number;
+  updated: number;
+  metadata_only: number;
+  metadata_only_paths: string[];
+  unscoped_skipped: number;
+  unscoped_skipped_paths: string[];
+  removed: number;
+  removed_paths: string[];
+  skipped: number;
+  errors: unknown[];
+  files: unknown[];
+  indexed_at: string;
+}
+
+export interface KbSourceGroupStat {
+  source_group: string;
+  count: number;
+  chunk_count: number;
+}
+
+export interface KbStats {
+  total_files: number;
+  total_chunks: number;
+  last_indexed_at: string | null;
+  by_source_group: KbSourceGroupStat[];
+}
+
 export interface PreflightCheck {
   name: string;
   key: string;
@@ -78,6 +109,15 @@ export const stopAllServices = (): Promise<void> =>
 export const restartAllServices = (): Promise<ServiceStatus[]> =>
   invoke<ServiceStatus[]>("restart_all_services");
 
+export const startService = (serviceId: string): Promise<ServiceStatus[]> =>
+  invoke<ServiceStatus[]>("start_service", { serviceId });
+
+export const stopService = (serviceId: string): Promise<ServiceStatus[]> =>
+  invoke<ServiceStatus[]>("stop_service", { serviceId });
+
+export const restartService = (serviceId: string): Promise<ServiceStatus[]> =>
+  invoke<ServiceStatus[]>("restart_service", { serviceId });
+
 // ============================================================================
 // Preflight Commands
 // ============================================================================
@@ -137,6 +177,19 @@ export const openInFinder = (path: string): Promise<void> =>
 
 export const getVerifyFolderPath = (): Promise<string> =>
   invoke<string>("get_verify_folder_path");
+
+// ============================================================================
+// KB Health Commands
+// ============================================================================
+
+export const getKbSyncReport = (): Promise<KbSyncReport | null> =>
+  invoke<KbSyncReport | null>("get_kb_sync_report");
+
+export const getKbStats = (): Promise<KbStats> =>
+  invoke<KbStats>("get_kb_stats");
+
+export const kbSyncNow = (): Promise<KbSyncReport> =>
+  invoke<KbSyncReport>("kb_sync_now");
 
 // ============================================================================
 // Docker / ClawRAG Commands

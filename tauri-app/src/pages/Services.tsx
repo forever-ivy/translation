@@ -2,7 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useAppStore, type ServiceStatusType } from "@/stores/appStore";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import {
   Play,
@@ -57,13 +57,27 @@ export function Services() {
     startServices,
     stopServices,
     restartServices,
+    startService,
+    stopService,
     setActiveTab,
   } = useAppStore();
+
+  const [isPreflightRunning, setIsPreflightRunning] = useState(false);
 
   useEffect(() => {
     fetchServices();
     fetchPreflightChecks();
   }, [fetchServices, fetchPreflightChecks]);
+
+  const handleRunPreflight = async () => {
+    if (isPreflightRunning) return;
+    setIsPreflightRunning(true);
+    try {
+      await fetchPreflightChecks();
+    } finally {
+      setIsPreflightRunning(false);
+    }
+  };
 
   const getPreflightStatus = (key: string, optional?: boolean) => {
     const check = preflightChecks.find((c) => c.key === key);
@@ -131,8 +145,13 @@ export function Services() {
             </div>
             <div className="flex gap-2">
               <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-                <Button variant="outline" size="sm" onClick={fetchPreflightChecks} disabled={isRefreshing}>
-                  <RotateCcw className={`h-4 w-4 mr-2 ${isRefreshing ? "animate-spin" : ""}`} />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleRunPreflight}
+                  disabled={isPreflightRunning || isLoading}
+                >
+                  <RotateCcw className={`h-4 w-4 mr-2 ${isPreflightRunning ? "animate-spin" : ""}`} />
                   Run Pre-flight Check
                 </Button>
               </motion.div>
@@ -166,71 +185,88 @@ export function Services() {
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
-            {services.map((service, index) => (
-              <motion.div
-                key={service.name}
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: index * 0.1 }}
-                whileHover={{ backgroundColor: "var(--surface-hover, rgba(0,0,0,0.02))" }}
-                className="flex items-center justify-between p-4 rounded-xl border"
-              >
-                <div className="flex items-center gap-4">
-                  <motion.div
-                    animate={service.status === "running" ? { scale: [1, 1.1, 1] } : {}}
-                    transition={{ duration: 2, repeat: Infinity }}
-                  >
-                    {statusIcons[service.status]}
-                  </motion.div>
-                  <div>
-                    <p className="font-medium">{service.name}</p>
-                    <p className="text-sm text-muted-foreground">
-                      {service.status === "running" ? (
-                        <>
-                          Running • PID: {service.pid} • Uptime: {service.uptime || "0m"}
-                        </>
-                      ) : (
-                        <span className="capitalize">{service.status}</span>
-                      )}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-4">
-                  <span className="text-sm text-muted-foreground">Restarts: {service.restarts}</span>
-                  <div className="flex gap-2">
-                    {service.status === "running" ? (
-                      <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-                        <Button variant="outline" size="sm" onClick={stopServices} disabled={isLoading}>
-                          <Square className="h-4 w-4 mr-1" />
-                          Stop
-                        </Button>
-                      </motion.div>
-                    ) : (
-                      <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-                        <Button size="sm" onClick={startServices} disabled={isLoading}>
-                          <Play className="h-4 w-4 mr-1" />
-                          Start
-                        </Button>
-                      </motion.div>
-                    )}
-                    <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => {
-                          useAppStore.getState().setSelectedLogService(
-                            service.name === "Telegram Bot" ? "telegram" : "worker"
-                          );
-                          setActiveTab("logs");
-                        }}
-                      >
-                        <FileText className="h-4 w-4" />
-                      </Button>
+            {services.map((service, index) => {
+              const serviceId =
+                service.name === "Telegram Bot"
+                  ? "telegram"
+                  : service.name === "Run Worker"
+                    ? "worker"
+                    : null;
+
+              return (
+                <motion.div
+                  key={service.name}
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: index * 0.1 }}
+                  whileHover={{ backgroundColor: "var(--surface-hover, rgba(0,0,0,0.02))" }}
+                  className="flex items-center justify-between p-4 rounded-xl border"
+                >
+                  <div className="flex items-center gap-4">
+                    <motion.div
+                      animate={service.status === "running" ? { scale: [1, 1.1, 1] } : {}}
+                      transition={{ duration: 2, repeat: Infinity }}
+                    >
+                      {statusIcons[service.status]}
                     </motion.div>
+                    <div>
+                      <p className="font-medium">{service.name}</p>
+                      <p className="text-sm text-muted-foreground">
+                        {service.status === "running" ? (
+                          <>
+                            Running • PID: {service.pid} • Uptime: {service.uptime || "0m"}
+                          </>
+                        ) : (
+                          <span className="capitalize">{service.status}</span>
+                        )}
+                      </p>
+                    </div>
                   </div>
-                </div>
-              </motion.div>
-            ))}
+                  <div className="flex items-center gap-4">
+                    <span className="text-sm text-muted-foreground">Restarts: {service.restarts}</span>
+                    <div className="flex gap-2">
+                      {service.status === "running" ? (
+                        <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => serviceId && stopService(serviceId)}
+                            disabled={isLoading || !serviceId}
+                          >
+                            <Square className="h-4 w-4 mr-1" />
+                            Stop
+                          </Button>
+                        </motion.div>
+                      ) : (
+                        <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+                          <Button
+                            size="sm"
+                            onClick={() => serviceId && startService(serviceId)}
+                            disabled={isLoading || !serviceId}
+                          >
+                            <Play className="h-4 w-4 mr-1" />
+                            Start
+                          </Button>
+                        </motion.div>
+                      )}
+                      <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => {
+                            useAppStore.getState().setSelectedLogService(serviceId || "worker");
+                            setActiveTab("logs");
+                          }}
+                          disabled={!serviceId}
+                        >
+                          <FileText className="h-4 w-4" />
+                        </Button>
+                      </motion.div>
+                    </div>
+                  </div>
+                </motion.div>
+              );
+            })}
           </CardContent>
         </Card>
       </motion.div>

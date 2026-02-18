@@ -61,6 +61,36 @@ export interface DockerContainer {
   image: string;
 }
 
+export interface KbSyncReport {
+  ok: boolean;
+  kbRoot: string;
+  scannedCount: number;
+  created: number;
+  updated: number;
+  metadataOnly: number;
+  metadataOnlyPaths: string[];
+  unscopedSkipped: number;
+  unscopedSkippedPaths: string[];
+  removed: number;
+  removedPaths: string[];
+  skipped: number;
+  errors: unknown[];
+  indexedAt: string;
+}
+
+export interface KbSourceGroupStat {
+  sourceGroup: string;
+  count: number;
+  chunkCount: number;
+}
+
+export interface KbStats {
+  totalFiles: number;
+  totalChunks: number;
+  lastIndexedAt: string | null;
+  bySourceGroup: KbSourceGroupStat[];
+}
+
 export interface ApiProvider {
   id: string;
   name: string;
@@ -115,6 +145,10 @@ interface AppState {
   selectedLogService: string;
   setSelectedLogService: (service: string) => void;
 
+  // KB Health
+  kbSyncReport: KbSyncReport | null;
+  kbStats: KbStats | null;
+
   // UI State
   isLoading: boolean;
   setIsLoading: (loading: boolean) => void;
@@ -150,8 +184,16 @@ interface AppState {
   startServices: () => Promise<void>;
   stopServices: () => Promise<void>;
   restartServices: () => Promise<void>;
+  startService: (serviceId: "telegram" | "worker") => Promise<void>;
+  stopService: (serviceId: "telegram" | "worker") => Promise<void>;
+  restartService: (serviceId: "telegram" | "worker") => Promise<void>;
   saveConfig: (config: AppConfig) => Promise<void>;
   fetchLogs: (service: string, lines?: number) => Promise<void>;
+
+  // KB Health Actions
+  fetchKbSyncReport: () => Promise<void>;
+  fetchKbStats: () => Promise<void>;
+  syncKbNow: () => Promise<void>;
 
   // API Providers
   apiProviders: ApiProvider[];
@@ -236,7 +278,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   jobs: [],
   setJobs: (jobs) => set({ jobs }),
   selectedJobId: null,
-  setSelectedJobId: (id) => set({ selectedJobId: id }),
+  setSelectedJobId: (id) => set({ selectedJobId: id, selectedJobArtifacts: [], selectedJobQuality: null }),
   selectedJobMilestones: [],
   selectedJobArtifacts: [],
   selectedJobQuality: null,
@@ -253,6 +295,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   logs: [],
   selectedLogService: "telegram",
   setSelectedLogService: (service) => set({ selectedLogService: service }),
+
+  // KB Health
+  kbSyncReport: null,
+  kbStats: null,
 
   // UI State
   isLoading: false,
@@ -288,6 +334,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         ]);
       } else if (activeTab === "jobs") {
         await get().fetchJobs();
+      } else if (activeTab === "kb-health") {
+        await Promise.all([
+          get().fetchKbSyncReport(),
+          get().fetchKbStats(),
+        ]);
       }
     } finally {
       set({ isRefreshing: false });
@@ -521,6 +572,69 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  startService: async (serviceId: "telegram" | "worker") => {
+    set({ isLoading: true, error: null });
+    try {
+      const services = await tauri.startService(serviceId);
+      set({
+        services: services.map((s) => ({
+          name: s.name,
+          status: s.status as ServiceStatusType,
+          pid: s.pid,
+          uptime: s.uptime,
+          restarts: s.restarts,
+        })),
+      });
+      get().addToast("success", `Started ${serviceId}`);
+    } catch (err) {
+      get().addToast("error", `Failed to start ${serviceId}: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  stopService: async (serviceId: "telegram" | "worker") => {
+    set({ isLoading: true, error: null });
+    try {
+      const services = await tauri.stopService(serviceId);
+      set({
+        services: services.map((s) => ({
+          name: s.name,
+          status: s.status as ServiceStatusType,
+          pid: s.pid,
+          uptime: s.uptime,
+          restarts: s.restarts,
+        })),
+      });
+      get().addToast("success", `Stopped ${serviceId}`);
+    } catch (err) {
+      get().addToast("error", `Failed to stop ${serviceId}: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  restartService: async (serviceId: "telegram" | "worker") => {
+    set({ isLoading: true, error: null });
+    try {
+      const services = await tauri.restartService(serviceId);
+      set({
+        services: services.map((s) => ({
+          name: s.name,
+          status: s.status as ServiceStatusType,
+          pid: s.pid,
+          uptime: s.uptime,
+          restarts: s.restarts,
+        })),
+      });
+      get().addToast("success", `Restarted ${serviceId}`);
+    } catch (err) {
+      get().addToast("error", `Failed to restart ${serviceId}: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
   saveConfig: async (config: AppConfig) => {
     set({ isLoading: true, error: null });
     try {
@@ -587,6 +701,86 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ logs, selectedLogService: service });
     } catch (err) {
       get().addToast("error", `Failed to fetch logs: ${err}`);
+    }
+  },
+
+  // KB Health Actions
+  fetchKbSyncReport: async () => {
+    try {
+      const report = await tauri.getKbSyncReport();
+      set({
+        kbSyncReport: report
+          ? {
+              ok: report.ok,
+              kbRoot: report.kb_root,
+              scannedCount: report.scanned_count,
+              created: report.created,
+              updated: report.updated,
+              metadataOnly: report.metadata_only,
+              metadataOnlyPaths: report.metadata_only_paths || [],
+              unscopedSkipped: report.unscoped_skipped,
+              unscopedSkippedPaths: report.unscoped_skipped_paths || [],
+              removed: report.removed,
+              removedPaths: report.removed_paths || [],
+              skipped: report.skipped,
+              errors: report.errors || [],
+              indexedAt: report.indexed_at,
+            }
+          : null,
+      });
+    } catch (err) {
+      get().addToast("error", `Failed to fetch KB sync report: ${err}`);
+    }
+  },
+
+  fetchKbStats: async () => {
+    try {
+      const stats = await tauri.getKbStats();
+      set({
+        kbStats: {
+          totalFiles: stats.total_files,
+          totalChunks: stats.total_chunks,
+          lastIndexedAt: stats.last_indexed_at ?? null,
+          bySourceGroup: (stats.by_source_group || []).map((g) => ({
+            sourceGroup: g.source_group,
+            count: g.count,
+            chunkCount: g.chunk_count,
+          })),
+        },
+      });
+    } catch (err) {
+      get().addToast("error", `Failed to fetch KB stats: ${err}`);
+    }
+  },
+
+  syncKbNow: async () => {
+    set({ isLoading: true, error: null });
+    try {
+      const report = await tauri.kbSyncNow();
+      set({
+        kbSyncReport: {
+          ok: report.ok,
+          kbRoot: report.kb_root,
+          scannedCount: report.scanned_count,
+          created: report.created,
+          updated: report.updated,
+          metadataOnly: report.metadata_only,
+          metadataOnlyPaths: report.metadata_only_paths || [],
+          unscopedSkipped: report.unscoped_skipped,
+          unscopedSkippedPaths: report.unscoped_skipped_paths || [],
+          removed: report.removed,
+          removedPaths: report.removed_paths || [],
+          skipped: report.skipped,
+          errors: report.errors || [],
+          indexedAt: report.indexed_at,
+        },
+      });
+      await get().fetchKbStats();
+      get().addToast(report.ok ? "success" : "warning", "KB sync completed");
+    } catch (err) {
+      get().addToast("error", `KB sync failed: ${err}`);
+    } finally {
+      set({ isLoading: false });
     }
   },
 

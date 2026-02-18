@@ -49,6 +49,87 @@ _DEFAULT_PID_FILE = Path("~/.openclaw/runtime/translation/run_worker.pid").expan
 _pid_lock_handle: Any | None = None
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _dotenv_path() -> Path:
+    return _repo_root() / ".env.v4.local"
+
+
+_DOTENV_ALLOWED_KEYS = {
+    "V4_WORK_ROOT",
+    "V4_KB_ROOT",
+    "V4_PYTHON_BIN",
+    "GLM_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+}
+
+
+def _dotenv_allow_key(key: str) -> bool:
+    k = (key or "").strip()
+    if not k:
+        return False
+    if k.startswith("OPENCLAW_"):
+        return True
+    return k in _DOTENV_ALLOWED_KEYS
+
+
+def _strip_quotes(val: str) -> str:
+    raw = (val or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        inner = raw[1:-1]
+        if raw[0] == '"':
+            inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+        return inner
+    return raw
+
+
+def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    raw = (line or "").strip()
+    if not raw or raw.startswith("#"):
+        return None
+    if raw.startswith("export "):
+        raw = raw[len("export ") :].lstrip()
+    if "=" not in raw:
+        return None
+    key, val = raw.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    # Trim trailing comment for unquoted values: KEY=foo # comment
+    v = val.strip()
+    if v and v[0] not in {'"', "'"} and " #" in v:
+        v = v.split(" #", 1)[0].rstrip()
+    return key, _strip_quotes(v)
+
+
+def _reload_dotenv_env() -> int:
+    """Best-effort overlay from repo-root .env.v4.local onto os.environ.
+
+    This makes toggles like OPENCLAW_GLM_ENABLED take effect without restarting the worker.
+    """
+    path = _dotenv_path()
+    if not path.exists():
+        return 0
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    changed = 0
+    for line in text.splitlines():
+        parsed = _parse_dotenv_line(line)
+        if not parsed:
+            continue
+        key, val = parsed
+        if not _dotenv_allow_key(key):
+            continue
+        os.environ[key] = val
+        changed += 1
+    return changed
+
+
 def _pid_file() -> Path:
     raw = str(os.getenv("OPENCLAW_RUN_WORKER_PID_FILE", "")).strip()
     return (Path(raw).expanduser() if raw else _DEFAULT_PID_FILE)
@@ -301,15 +382,23 @@ def main() -> int:
             state = "failed"
             last_error = ""
             try:
+                _reload_dotenv_env()
+                child_env = os.environ.copy()
+                # Ensure the pipeline subprocess uses the same queue DB regardless of work_root.
+                child_env["OPENCLAW_STATE_DB_PATH"] = str(paths.db_path)
+
+                effective_work_root = Path(os.getenv("V4_WORK_ROOT") or str(work_root)).expanduser()
+                effective_kb_root = Path(os.getenv("V4_KB_ROOT") or str(kb_root)).expanduser()
+
                 cmd = _run_job_cmd(
                     job_id=job_id,
-                    work_root=work_root,
-                    kb_root=kb_root,
+                    work_root=effective_work_root,
+                    kb_root=effective_kb_root,
                     notify_target=notify_target,
                     dry_run=bool(args.dry_run_notify),
                 )
                 log.info("Starting pipeline subprocess: %s", " ".join(cmd))
-                proc = subprocess.Popen(cmd, start_new_session=True)
+                proc = subprocess.Popen(cmd, start_new_session=True, env=child_env)
                 pid = int(proc.pid or 0)
                 try:
                     pgid = int(os.getpgid(pid)) if pid else 0

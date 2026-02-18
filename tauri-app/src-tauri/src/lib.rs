@@ -445,8 +445,6 @@ async fn restart_service(service_id: String, state: State<'_, AppState>) -> Resu
 
 #[tauri::command]
 fn auto_fix_preflight(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>, String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
-
     // Try to create venv if missing
     let venv_path = format!("{}/.venv", state.config_path);
     if !PathBuf::from(&venv_path).exists() {

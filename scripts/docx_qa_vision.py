@@ -160,8 +160,22 @@ def run_docx_qa(
     review_dir.mkdir(parents=True, exist_ok=True)
     orig_dir = review_dir / "original"
     trans_dir = review_dir / "translated"
-    orig_images = render_docx_to_images(original_docx, orig_dir)
-    trans_images = render_docx_to_images(translated_docx, trans_dir)
+    try:
+        orig_images = render_docx_to_images(original_docx, orig_dir)
+        trans_images = render_docx_to_images(translated_docx, trans_dir)
+    except Exception as exc:
+        msg = str(exc)
+        reason = "soffice_missing" if ("soffice" in msg.lower() or "libreoffice" in msg.lower()) else "render_failed"
+        return {
+            "status": "skipped",
+            "reason": reason,
+            "error": msg,
+            "pages_compared": 0,
+            "pages_total_original": 0,
+            "pages_total_translated": 0,
+            "original_dir": str(orig_dir),
+            "translated_dir": str(trans_dir),
+        }
 
     page_count_mismatch = len(orig_images) != len(trans_images)
     paired_count = min(len(orig_images), len(trans_images))
@@ -180,7 +194,21 @@ def run_docx_qa(
     for idx, (orig_png, trans_png) in enumerate(paired, start=1):
         orig_b64 = base64.b64encode(orig_png.read_bytes()).decode("ascii")
         trans_b64 = base64.b64encode(trans_png.read_bytes()).decode("ascii")
-        result = compare_doc_visual(orig_b64, trans_b64)
+        try:
+            result = compare_doc_visual(orig_b64, trans_b64)
+        except Exception as exc:
+            return {
+                "status": "skipped",
+                "reason": "vision_unavailable",
+                "error": str(exc),
+                "pages_compared": max(0, idx - 1),
+                "pages_total_original": len(orig_images),
+                "pages_total_translated": len(trans_images),
+                "truncated": truncated,
+                "page_count_mismatch": page_count_mismatch,
+                "original_dir": str(orig_dir),
+                "translated_dir": str(trans_dir),
+            }
         f = float(result.get("format_fidelity_score", 0.0) or 0.0)
         a = float(result.get("aesthetics_score", 0.0) or 0.0)
         fidelities.append(f)

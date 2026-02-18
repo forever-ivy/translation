@@ -20,6 +20,7 @@ export function Verify() {
   const { jobs, selectedJobArtifacts, selectedJobQuality, fetchJobs, fetchJobArtifacts, isLoading, addToast } =
     useAppStore();
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+  const [artifactsLoadingJobId, setArtifactsLoadingJobId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchJobs("review_ready");
@@ -31,7 +32,12 @@ export function Verify() {
     } else {
       setExpandedJob(jobId);
       useAppStore.getState().setSelectedJobId(jobId);
-      await fetchJobArtifacts(jobId);
+      setArtifactsLoadingJobId(jobId);
+      try {
+        await fetchJobArtifacts(jobId);
+      } finally {
+        setArtifactsLoadingJobId((cur) => (cur === jobId ? null : cur));
+      }
     }
   };
 
@@ -163,8 +169,10 @@ export function Verify() {
                             {/* Artifacts */}
                             <div>
                               <h4 className="text-sm font-medium mb-2">Artifacts</h4>
-                              {selectedJobArtifacts.length === 0 ? (
+                              {artifactsLoadingJobId === job.jobId ? (
                                 <p className="text-sm text-muted-foreground">Loading artifacts...</p>
+                              ) : selectedJobArtifacts.length === 0 ? (
+                                <p className="text-sm text-muted-foreground">No artifacts found.</p>
                               ) : (
                                 <motion.div
                                   className="grid grid-cols-2 gap-2"
@@ -212,7 +220,7 @@ export function Verify() {
 
                             {/* Quality Report */}
                             <AnimatePresence>
-                              {selectedJobQuality && (
+                              {selectedJobQuality ? (
                                 <motion.div
                                   initial={{ opacity: 0, y: 10 }}
                                   animate={{ opacity: 1, y: 0 }}
@@ -278,6 +286,26 @@ export function Verify() {
                                       <p className="text-xs text-muted-foreground">Purity Score</p>
                                     </motion.div>
                                   </div>
+                                </motion.div>
+                              ) : artifactsLoadingJobId === job.jobId ? (
+                                <motion.div
+                                  initial={{ opacity: 0, y: 10 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={{ opacity: 0, y: 10 }}
+                                >
+                                  <h4 className="text-sm font-medium mb-2">Quality Report</h4>
+                                  <p className="text-sm text-muted-foreground">Loading quality report...</p>
+                                </motion.div>
+                              ) : (
+                                <motion.div
+                                  initial={{ opacity: 0, y: 10 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  exit={{ opacity: 0, y: 10 }}
+                                >
+                                  <h4 className="text-sm font-medium mb-2">Quality Report</h4>
+                                  <p className="text-sm text-muted-foreground">
+                                    Quality report unavailable or skipped.
+                                  </p>
                                 </motion.div>
                               )}
                             </AnimatePresence>

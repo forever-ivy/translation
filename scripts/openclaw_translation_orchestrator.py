@@ -192,10 +192,13 @@ if OPENCLAW_TRANSLATION_THINKING not in VALID_THINKING_LEVELS:
 
 GLM_AGENT = os.getenv("OPENCLAW_GLM_AGENT", "glm-reviewer")
 GLM_GENERATOR_AGENT = os.getenv("OPENCLAW_GLM_GENERATOR_AGENT", GLM_AGENT)
-GLM_ENABLED = os.getenv("OPENCLAW_GLM_ENABLED", "0").strip() == "1"
 GLM_API_KEY = os.getenv("GLM_API_KEY", "")
 GLM_API_BASE_URL = os.getenv("GLM_API_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 GLM_MODEL = os.getenv("OPENCLAW_GLM_MODEL", "zai/glm-5")
+
+
+def _glm_enabled() -> bool:
+    return os.getenv("OPENCLAW_GLM_ENABLED", "0").strip() == "1"
 
 
 def _normalize_text(text: str) -> str:
@@ -1148,7 +1151,65 @@ Rules:
 def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
     """Fallback: call Zhipu GLM API directly when OpenClaw agent unavailable."""
     import urllib.request
-    if not GLM_API_KEY:
+
+    def _read_key_from_auth_profiles() -> str:
+        try:
+            path = Path("~/.openclaw/agents/main/agent/auth-profiles.json").expanduser()
+        except Exception:
+            return ""
+        if not path.exists():
+            return ""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+
+        profiles = data.get("profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+
+        def _profile_key(profile_id: str) -> str:
+            p = profiles.get(profile_id)
+            if not isinstance(p, dict):
+                return ""
+            for k in ("key", "api_key", "apiKey", "token"):
+                val = p.get(k)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            return ""
+
+        # Prefer the default zai profile.
+        for pid in ("zai:default",):
+            k = _profile_key(pid)
+            if k:
+                return k
+
+        # Or the most recently-good zai profile.
+        last_good = data.get("lastGood")
+        if isinstance(last_good, dict):
+            pid = last_good.get("zai")
+            if isinstance(pid, str) and pid.strip():
+                k = _profile_key(pid.strip())
+                if k:
+                    return k
+
+        # Final fallback: any zai profile with a key.
+        for pid in profiles.keys():
+            if not isinstance(pid, str):
+                continue
+            if not pid.startswith("zai"):
+                continue
+            k = _profile_key(pid)
+            if k:
+                return k
+        return ""
+
+    api_key = str(os.getenv("GLM_API_KEY") or GLM_API_KEY or "").strip()
+    if not api_key:
+        api_key = _read_key_from_auth_profiles()
+    if not api_key:
         return {"ok": False, "error": "glm_api_key_not_set"}
     url = f"{GLM_API_BASE_URL}/chat/completions"
     body = json.dumps({
@@ -1161,7 +1222,7 @@ def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
         data=body,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {GLM_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
         },
     )
     try:
@@ -1908,6 +1969,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         current_draft: dict[str, Any] | None = None
         errors: list[str] = []
         gemini_enabled = bool(meta.get("gemini_available", True))
+        glm_enabled = _glm_enabled()
         system_round_root = Path(review_dir) / ".system" / "rounds"
         system_round_root.mkdir(parents=True, exist_ok=True)
         disallow_markdown = _env_flag("OPENCLAW_DISALLOW_MARKDOWN", "1")
@@ -1944,18 +2006,23 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             round_dir.mkdir(parents=True, exist_ok=True)
 
             codex_gen = _codex_generate(execution_context, current_draft, previous_findings, round_idx)
-            glm_gen = _glm_generate(execution_context, current_draft, previous_findings, round_idx)
+            glm_gen = (
+                _glm_generate(execution_context, current_draft, previous_findings, round_idx)
+                if glm_enabled
+                else {"ok": False, "error": "glm_disabled"}
+            )
 
             codex_data: dict[str, Any] | None = codex_gen.get("data") if codex_gen.get("ok") else None
-            glm_data: dict[str, Any] | None = glm_gen.get("data") if glm_gen.get("ok") else None
+            glm_data: dict[str, Any] | None = glm_gen.get("data") if (glm_enabled and glm_gen.get("ok")) else None
 
             _write_raw_error_artifacts(round_dir, "codex_generate", codex_gen)
-            _write_raw_error_artifacts(round_dir, "glm_generate", glm_gen)
+            if glm_enabled:
+                _write_raw_error_artifacts(round_dir, "glm_generate", glm_gen)
 
             generation_errors: dict[str, str] = {}
             if not codex_data:
                 generation_errors["codex"] = str(codex_gen.get("error", "codex_generation_failed"))
-            if not glm_data:
+            if glm_enabled and not glm_data:
                 generation_errors["glm"] = str(glm_gen.get("error", "glm_generation_failed"))
             if not codex_data and not glm_data:
                 errors.append(f"no_generator_candidates:{generation_errors}")
@@ -2237,7 +2304,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 break
 
         # --- GLM-5 advisory review (after rounds loop) ---
-        if GLM_ENABLED and rounds and current_draft:
+        if glm_enabled and rounds and current_draft:
             glm_result = _glm_review(execution_context, current_draft, len(rounds))
             if glm_result.get("ok"):
                 glm_data = glm_result["data"]
@@ -2478,7 +2545,10 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                         quality_report["docx_vision_qa"] = {translated_docx_path.name: docx_qa}
                         if docx_qa.get("aesthetics_warning"):
                             status_flags.append("docx_layout_ugly")
-                        if docx_qa.get("status") != "passed":
+                        status_value = str(docx_qa.get("status") or "").strip().lower()
+                        if status_value == "skipped":
+                            status_flags.append("docx_qa_skipped")
+                        elif status_value != "passed":
                             status_flags.append("docx_qa_failed")
                             if status == "review_ready":
                                 status = "needs_attention"

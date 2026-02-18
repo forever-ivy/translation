@@ -5,6 +5,8 @@
 #   ./scripts/start.sh              # Interactive mode
 #   ./scripts/start.sh --all        # Start all services
 #   ./scripts/start.sh --telegram   # Start Telegram bot only
+#   ./scripts/start.sh --stop-telegram    # Stop Telegram bot only
+#   ./scripts/start.sh --restart-telegram # Restart Telegram bot only
 #   ./scripts/start.sh --email      # Start email poll (one-shot)
 #   ./scripts/start.sh --reminder   # Start pending reminder (one-shot)
 #   ./scripts/start.sh --status     # Show service status
@@ -25,7 +27,7 @@ export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
 # Paths
 PID_DIR="$HOME/.openclaw/runtime/translation/pids"
 LOG_DIR="$HOME/.openclaw/runtime/translation/logs"
-PYTHON_BIN="${V4_PYTHON_BIN:-/Users/Code/workflow/translation/.venv/bin/python}"
+PYTHON_BIN="/Users/Code/workflow/translation/.venv/bin/python"
 
 # =============================================================================
 # Helper Functions
@@ -53,6 +55,7 @@ load_env() {
         source ".env.v4.local"
         set +a
     fi
+    PYTHON_BIN="${V4_PYTHON_BIN:-$PYTHON_BIN}"
 }
 
 is_truthy() {
@@ -414,6 +417,24 @@ case "${1:-}" in
     --worker|-w)
         start_worker
         ;;
+    --stop-telegram)
+        stop_service "telegram"
+        show_status
+        ;;
+    --stop-worker)
+        stop_service "worker"
+        show_status
+        ;;
+    --restart-telegram)
+        stop_service "telegram"
+        start_telegram
+        show_status
+        ;;
+    --restart-worker)
+        stop_service "worker"
+        start_worker
+        show_status
+        ;;
     --email|-e)
         start_email
         ;;
@@ -441,6 +462,10 @@ case "${1:-}" in
         echo "  --all, -a       Start all services (Telegram + Worker)"
         echo "  --telegram, -t  Start Telegram bot only"
         echo "  --worker, -w    Start worker only"
+        echo "  --stop-telegram Stop Telegram bot only"
+        echo "  --stop-worker   Stop worker only"
+        echo "  --restart-telegram Restart Telegram bot only"
+        echo "  --restart-worker   Restart worker only"
         echo "  --email, -e     Run email poll (one-shot)"
         echo "  --reminder, -r  Run pending reminder (one-shot)"
         echo "  --status, -s    Show service status"

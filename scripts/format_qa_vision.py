@@ -213,14 +213,44 @@ def run_format_qa_loop(
     original_dir = review_dir / "original"
     translated_dir = review_dir / "translated"
 
-    original_images = render_xlsx_to_images(original_xlsx, original_dir)
+    try:
+        original_images = render_xlsx_to_images(original_xlsx, original_dir)
+    except Exception as exc:
+        msg = str(exc)
+        reason = "soffice_missing" if ("soffice" in msg.lower() or "libreoffice" in msg.lower()) else "render_failed"
+        return {
+            "status": "skipped",
+            "attempts": 0,
+            "reason": reason,
+            "error": msg,
+            "sheets_compared": 0,
+            "sheets_total_original": 0,
+            "sheets_total_translated": 0,
+            "original_dir": str(original_dir),
+            "translated_dir": str(translated_dir),
+        }
     attempts = 0
     sheets_max = int(os.environ.get("OPENCLAW_FORMAT_QA_SHEETS_MAX", "6"))
     threshold = float(os.environ.get("OPENCLAW_FORMAT_QA_THRESHOLD", "0.85"))
     aesthetics_warn_threshold = float(os.environ.get("OPENCLAW_VISION_AESTHETICS_WARN_THRESHOLD", "0.7"))
 
     while True:
-        translated_images = render_xlsx_to_images(translated_xlsx, translated_dir)
+        try:
+            translated_images = render_xlsx_to_images(translated_xlsx, translated_dir)
+        except Exception as exc:
+            msg = str(exc)
+            reason = "soffice_missing" if ("soffice" in msg.lower() or "libreoffice" in msg.lower()) else "render_failed"
+            return {
+                "status": "skipped",
+                "attempts": attempts,
+                "reason": reason,
+                "error": msg,
+                "sheets_compared": 0,
+                "sheets_total_original": len(original_images),
+                "sheets_total_translated": 0,
+                "original_dir": str(original_dir),
+                "translated_dir": str(translated_dir),
+            }
         attempts += 1
 
         truncated = False
