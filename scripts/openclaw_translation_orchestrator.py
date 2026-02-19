@@ -334,15 +334,93 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
     return findings, meta
 
 
+def _merge_docx_translation_map(prev_val: Any, new_val: Any) -> Any:
+    """Merge docx translation maps by unit id, preferring new entries on conflict."""
+    if not prev_val:
+        return new_val
+    if not new_val:
+        return prev_val
+    if isinstance(prev_val, list) and not isinstance(new_val, list):
+        # Avoid wiping a valid map with an unexpected shape.
+        return prev_val
+    if not isinstance(prev_val, list) and isinstance(new_val, list):
+        return new_val
+    if not isinstance(prev_val, list) or not isinstance(new_val, list):
+        return new_val
+
+    merged: dict[str, dict[str, Any]] = {}
+    for item in prev_val:
+        if not isinstance(item, dict):
+            continue
+        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
+        if unit_id:
+            merged[unit_id] = item
+    for item in new_val:
+        if not isinstance(item, dict):
+            continue
+        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
+        if unit_id:
+            merged[unit_id] = item
+    return list(merged.values())
+
+
+def _merge_xlsx_translation_map(prev_val: Any, new_val: Any) -> Any:
+    """Merge xlsx translation maps by (file,sheet,cell), preferring new entries on conflict."""
+    if not prev_val:
+        return new_val
+    if not new_val:
+        return prev_val
+
+    if isinstance(prev_val, list) and not isinstance(new_val, list):
+        # Avoid wiping a valid map with an unexpected shape.
+        return prev_val
+    if not isinstance(prev_val, list) and isinstance(new_val, list):
+        return new_val
+    if not isinstance(prev_val, list) or not isinstance(new_val, list):
+        return new_val
+
+    def _norm_key(item: dict[str, Any]) -> tuple[str, str, str] | None:
+        file_name = str(item.get("file") or "").strip()
+        sheet = str(item.get("sheet") or "").strip()
+        cell = str(item.get("cell") or "").strip().upper()
+        if not (file_name and sheet and cell):
+            return None
+        return (file_name, sheet, cell)
+
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in prev_val:
+        if not isinstance(item, dict):
+            continue
+        key = _norm_key(item)
+        if key is None:
+            continue
+        merged[key] = item
+    for item in new_val:
+        if not isinstance(item, dict):
+            continue
+        key = _norm_key(item)
+        if key is None:
+            continue
+        merged[key] = item
+    return list(merged.values())
+
+
 def _preserve_nonempty_translation_maps(previous: dict[str, Any], updated: dict[str, Any]) -> dict[str, Any]:
-    """Avoid wiping preserve maps when applying a fix that doesn't return them."""
+    """Avoid wiping preserve maps when applying a fix or an incremental draft.
+
+    For spreadsheet jobs, models sometimes emit *partial* translation maps (e.g. "remaining 4 files"),
+    expecting the orchestrator to carry forward earlier file maps. Treat missing entries as "unchanged",
+    not as deletions.
+    """
     if not isinstance(previous, dict) or not isinstance(updated, dict):
         return updated
-    for field in ["docx_translation_map", "xlsx_translation_map"]:
-        prev_val = previous.get(field)
-        new_val = updated.get(field)
-        if prev_val and not new_val:
-            updated[field] = prev_val
+    prev_docx = previous.get("docx_translation_map")
+    new_docx = updated.get("docx_translation_map")
+    updated["docx_translation_map"] = _merge_docx_translation_map(prev_docx, new_docx)
+
+    prev_xlsx = previous.get("xlsx_translation_map")
+    new_xlsx = updated.get("xlsx_translation_map")
+    updated["xlsx_translation_map"] = _merge_xlsx_translation_map(prev_xlsx, new_xlsx)
     return updated
 
 
@@ -1131,21 +1209,39 @@ Rules:
             return fallback
         return max(0.0, min(1.0, val))
 
-    return {
-        "ok": True,
-        "data": {
-            "findings": [str(x) for x in (parsed.get("findings") or [])],
-            "resolved": [str(x) for x in (parsed.get("resolved") or [])],
-            "unresolved": [str(x) for x in (parsed.get("unresolved") or [])],
-            "pass": bool(parsed.get("pass")),
-            "terminology_rate": _clamp(parsed.get("terminology_rate"), 0.0),
-            "structure_complete_rate": _clamp(parsed.get("structure_complete_rate"), 0.0),
-            "target_language_purity": _clamp(parsed.get("target_language_purity"), 0.0),
-            "numbering_consistency": _clamp(parsed.get("numbering_consistency"), 0.0),
-            "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
-        },
-        "raw": parsed,
+    data = {
+        "findings": [str(x) for x in (parsed.get("findings") or [])],
+        "resolved": [str(x) for x in (parsed.get("resolved") or [])],
+        "unresolved": [str(x) for x in (parsed.get("unresolved") or [])],
+        "pass": bool(parsed.get("pass")),
+        "terminology_rate": _clamp(parsed.get("terminology_rate"), 0.0),
+        "structure_complete_rate": _clamp(parsed.get("structure_complete_rate"), 0.0),
+        "target_language_purity": _clamp(parsed.get("target_language_purity"), 0.0),
+        "numbering_consistency": _clamp(parsed.get("numbering_consistency"), 0.0),
+        "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
     }
+
+    # Treat "empty but successful" reviews as unavailable. This happens when upstream
+    # providers return placeholder zeros without any findings or explanation.
+    if (
+        (not data["pass"])
+        and (not data["findings"])
+        and (not data["unresolved"])
+        and (not data["resolved"])
+        and (not data["reasoning_summary"].strip())
+        and float(data["terminology_rate"]) == 0.0
+        and float(data["structure_complete_rate"]) == 0.0
+        and float(data["target_language_purity"]) == 0.0
+        and float(data["numbering_consistency"]) == 0.0
+    ):
+        return {
+            "ok": False,
+            "error": "gemini_review_empty",
+            "detail": call,
+            "raw_text": call.get("text", ""),
+        }
+
+    return {"ok": True, "data": data, "raw": parsed}
 
 
 def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
@@ -1491,6 +1587,13 @@ def _vision_findings_from_xlsx_qa(qa_result: dict[str, Any], *, file_name: str) 
     findings: list[str] = []
     warnings: list[str] = []
     status = str(qa_result.get("status") or "")
+    if status == "skipped":
+        reason = str(qa_result.get("reason") or qa_result.get("error") or "").strip()
+        msg = f"xlsx_qa_skipped:{file_name}"
+        if reason:
+            msg = f"{msg}:{reason[:180]}"
+        warnings.append(msg)
+        return findings, warnings
     fidelity = float(qa_result.get("format_fidelity_min", qa_result.get("format_fidelity_score", 0.0)) or 0.0)
     threshold = float(qa_result.get("threshold", 0.85) or 0.85)
     if status != "passed":
@@ -1514,6 +1617,13 @@ def _vision_findings_from_docx_qa(qa_result: dict[str, Any], *, file_name: str) 
     findings: list[str] = []
     warnings: list[str] = []
     status = str(qa_result.get("status") or "")
+    if status == "skipped":
+        reason = str(qa_result.get("reason") or qa_result.get("error") or "").strip()
+        msg = f"docx_qa_skipped:{file_name}"
+        if reason:
+            msg = f"{msg}:{reason[:180]}"
+        warnings.append(msg)
+        return findings, warnings
     fidelity = float(qa_result.get("format_fidelity_min", qa_result.get("format_fidelity_score", 0.0)) or 0.0)
     threshold = float(qa_result.get("fidelity_threshold", 0.85) or 0.85)
     if status != "passed":
@@ -1975,7 +2085,6 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         disallow_markdown = _env_flag("OPENCLAW_DISALLOW_MARKDOWN", "1")
         vision_in_round = _env_flag("OPENCLAW_VISION_QA_IN_ROUND", "1")
         vision_fix_limit = max(0, int(os.getenv("OPENCLAW_VISION_QA_MAX_RETRIES", "2")))
-        vision_fix_used = 0
         markdown_sanity_by_round: dict[str, Any] = {}
         preserve_coverage_by_round: dict[str, Any] = {}
         vision_trials_by_round: dict[str, Any] = {}
@@ -2004,6 +2113,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         for round_idx in range(1, thresholds.max_rounds + 1):
             round_dir = system_round_root / f"round_{round_idx}"
             round_dir.mkdir(parents=True, exist_ok=True)
+            # Hard-gate retries are per round; otherwise a noisy first round can
+            # consume the entire budget and prevent convergence in later rounds.
+            vision_fix_used = 0
 
             codex_gen = _codex_generate(execution_context, current_draft, previous_findings, round_idx)
             glm_gen = (
@@ -2014,6 +2126,13 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
             codex_data: dict[str, Any] | None = codex_gen.get("data") if codex_gen.get("ok") else None
             glm_data: dict[str, Any] | None = glm_gen.get("data") if (glm_enabled and glm_gen.get("ok")) else None
+            if current_draft:
+                # Some generators emit incremental preserve maps across rounds. Treat missing entries
+                # as "unchanged" and merge them forward.
+                if codex_data:
+                    codex_data = _preserve_nonempty_translation_maps(current_draft, codex_data)
+                if glm_data:
+                    glm_data = _preserve_nonempty_translation_maps(current_draft, glm_data)
 
             _write_raw_error_artifacts(round_dir, "codex_generate", codex_gen)
             if glm_enabled:

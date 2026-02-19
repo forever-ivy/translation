@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docx import Document
+from openpyxl import Workbook
 
 from scripts.openclaw_translation_orchestrator import _agent_call, _available_slots, run
 
@@ -18,6 +19,16 @@ def _make_docx(path: Path, text: str) -> None:
     doc.add_paragraph(text)
     path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(path)
+
+
+def _make_xlsx(path: Path, *, sheet: str, cells: dict[str, str]) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet
+    for addr, value in cells.items():
+        ws[addr] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
 
 
 def _agent_ok(text: dict) -> dict:
@@ -203,6 +214,233 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
             self.assertEqual((out.get("quality_report") or {}).get("thinking_level"), "high")
             self.assertIn("final_docx", out["artifacts"])
             self.assertTrue(Path(out["artifacts"]["final_docx"]).exists())
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_empty_gemini_review_degrades_to_single_model(self, mocked_call):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Translation Task"
+            review = root / "Translated -EN" / "_VERIFY" / "job_gemini_empty"
+            ar_dir = root / "Arabic Source"
+            prev_dir = root / "Previously Translated"
+            _make_docx(ar_dir / "v1 استبانة.docx", "نص عربي إصدار 1")
+            _make_docx(ar_dir / "v2 استبانة.docx", "نص عربي إصدار 2 مع تعديلات")
+            _make_docx(prev_dir / "V1 AI Readiness Survey.docx", "English baseline v1")
+
+            mocked_call.side_effect = [
+                _agent_ok(
+                    {
+                        "task_type": "REVISION_UPDATE",
+                        "source_language": "ar",
+                        "target_language": "en",
+                        "required_inputs": ["source_old", "source_new", "target_baseline"],
+                        "missing_inputs": [],
+                        "confidence": 0.97,
+                        "reasoning_summary": "Detected AR v1+v2 and EN baseline.",
+                        "estimated_minutes": 14,
+                        "complexity_score": 34,
+                    }
+                ),
+                # Codex candidate
+                _agent_ok(
+                    {
+                        "final_text": "Final content",
+                        "final_reflow_text": "Final reflow",
+                        "docx_translation_map": [{"id": "p:1", "text": "Final content"}],
+                        "review_brief_points": [],
+                        "change_log_points": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "codex_pass": True,
+                        "reasoning_summary": "Initial draft done.",
+                    }
+                ),
+                # GLM candidate
+                _agent_ok(
+                    {
+                        "final_text": "Final content (GLM)",
+                        "final_reflow_text": "Final reflow (GLM)",
+                        "docx_translation_map": [{"id": "p:1", "text": "Final content (GLM)"}],
+                        "review_brief_points": [],
+                        "change_log_points": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "codex_pass": True,
+                        "reasoning_summary": "GLM candidate done.",
+                    }
+                ),
+                # Gemini review (Codex) - empty placeholder (treated as unavailable)
+                _agent_ok(
+                    {
+                        "findings": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "pass": False,
+                        "terminology_rate": 0.0,
+                        "structure_complete_rate": 0.0,
+                        "target_language_purity": 0.0,
+                        "numbering_consistency": 0.0,
+                        "reasoning_summary": "",
+                    }
+                ),
+                # Gemini review (GLM) - empty placeholder (treated as unavailable)
+                _agent_ok(
+                    {
+                        "findings": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "pass": False,
+                        "terminology_rate": 0.0,
+                        "structure_complete_rate": 0.0,
+                        "target_language_purity": 0.0,
+                        "numbering_consistency": 0.0,
+                        "reasoning_summary": "",
+                    }
+                ),
+                # GLM advisory review (after rounds)
+                _agent_ok(
+                    {
+                        "findings": [],
+                        "pass": True,
+                        "terminology_score": 0.95,
+                        "completeness_score": 0.95,
+                        "naturalness_score": 0.95,
+                        "reasoning_summary": "Pass.",
+                    }
+                ),
+            ]
+
+            meta = {
+                "job_id": "job_gemini_empty",
+                "root_path": str(root),
+                "review_dir": str(review),
+                "candidate_files": [
+                    {
+                        "path": str(ar_dir / "v1 استبانة.docx"),
+                        "name": "v1 استبانة.docx",
+                        "language": "ar",
+                        "version": "v1",
+                        "role": "source",
+                    },
+                    {
+                        "path": str(ar_dir / "v2 استبانة.docx"),
+                        "name": "v2 استبانة.docx",
+                        "language": "ar",
+                        "version": "v2",
+                        "role": "source",
+                    },
+                    {
+                        "path": str(prev_dir / "V1 AI Readiness Survey.docx"),
+                        "name": "V1 AI Readiness Survey.docx",
+                        "language": "en",
+                        "version": "v1",
+                        "role": "reference_translation",
+                    },
+                ],
+            }
+
+            with patch.dict(os.environ, {"OPENCLAW_GLM_ENABLED": "1"}, clear=False):
+                out = run(meta)
+            self.assertEqual(out["status"], "review_ready")
+            self.assertTrue(out["double_pass"])
+            self.assertIn("degraded_single_model", out.get("status_flags") or [])
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_spreadsheet_rounds_merge_xlsx_translation_map(self, mocked_call):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Translation Task"
+            review = root / "Translated -EN" / "_VERIFY" / "job_xlsx_merge"
+            src_dir = root / "Arabic Source"
+
+            file_a = src_dir / "FileA.xlsx"
+            file_b = src_dir / "FileB.xlsx"
+            _make_xlsx(file_a, sheet="Interview_FDs", cells={"B2": "مرحبا", "B3": "كيف حالك"})
+            _make_xlsx(file_b, sheet="Interview_FDs", cells={"B2": "مرحبا", "B3": "كيف حالك"})
+
+            mocked_call.side_effect = [
+                _agent_ok(
+                    {
+                        "task_type": "SPREADSHEET_TRANSLATION",
+                        "source_language": "ar",
+                        "target_language": "en",
+                        "required_inputs": ["source_document"],
+                        "missing_inputs": [],
+                        "confidence": 0.97,
+                        "reasoning_summary": "Detected XLSX spreadsheet translation.",
+                        "estimated_minutes": 12,
+                        "complexity_score": 30,
+                    }
+                ),
+                # Round 1: only FileA translations
+                _agent_ok(
+                    {
+                        "final_text": "",
+                        "final_reflow_text": "",
+                        "docx_translation_map": [],
+                        "xlsx_translation_map": [
+                            {"file": "FileA.xlsx", "sheet": "Interview_FDs", "cell": "B2", "text": "Hello"},
+                            {"file": "FileA.xlsx", "sheet": "Interview_FDs", "cell": "B3", "text": "How are you?"},
+                        ],
+                        "review_brief_points": [],
+                        "change_log_points": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "codex_pass": True,
+                        "reasoning_summary": "Translated FileA only (incremental).",
+                    }
+                ),
+                # Round 2: only FileB translations, orchestrator should merge with FileA
+                _agent_ok(
+                    {
+                        "final_text": "",
+                        "final_reflow_text": "",
+                        "docx_translation_map": [],
+                        "xlsx_translation_map": [
+                            {"file": "FileB.xlsx", "sheet": "Interview_FDs", "cell": "B2", "text": "Hello"},
+                            {"file": "FileB.xlsx", "sheet": "Interview_FDs", "cell": "B3", "text": "How are you?"},
+                        ],
+                        "review_brief_points": [],
+                        "change_log_points": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "codex_pass": True,
+                        "reasoning_summary": "Translated FileB only (incremental).",
+                    }
+                ),
+            ]
+
+            meta = {
+                "job_id": "job_xlsx_merge",
+                "root_path": str(root),
+                "review_dir": str(review),
+                "gemini_available": False,
+                "candidate_files": [
+                    {"path": str(file_a), "name": "FileA.xlsx", "role": "source", "language": "ar", "version": "v1"},
+                    {"path": str(file_b), "name": "FileB.xlsx", "role": "source", "language": "ar", "version": "v1"},
+                ],
+            }
+
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENCLAW_GLM_ENABLED": "0",
+                    "OPENCLAW_VISION_QA_IN_ROUND": "0",
+                    "OPENCLAW_VISION_QA_MAX_RETRIES": "0",
+                },
+                clear=False,
+            ):
+                out = run(meta)
+
+            self.assertEqual(out["status"], "review_ready")
+            self.assertTrue(out["double_pass"])
+            qr = out.get("quality_report") or {}
+            meta2 = ((qr.get("preserve_coverage_by_round") or {}).get("2") or {}).get("meta") or {}
+            self.assertEqual(meta2.get("xlsx_expected"), 4)
+            self.assertEqual(meta2.get("xlsx_got"), 4)
+
+            merged_selected = review / ".system" / "rounds" / "round_2" / "selected_output.json"
+            self.assertTrue(merged_selected.exists())
+            merged = json.loads(merged_selected.read_text(encoding="utf-8"))
+            self.assertEqual(len(merged.get("xlsx_translation_map") or []), 4)
 
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_missing_inputs_status(self, mocked_call):
