@@ -15,7 +15,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Configure logging
 log = logging.getLogger(__name__)
@@ -2055,7 +2055,12 @@ def _compute_hard_gates(
     return findings, warnings, meta
 
 
-def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
+def run(
+    meta: dict[str, Any],
+    *,
+    plan_only: bool = False,
+    on_round_complete: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     started = time.time()
     thresholds = QualityThresholds(max_rounds=3)
 
@@ -2573,22 +2578,26 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             selected_review = codex_review if selected_source == "codex" else glm_review
             selection_reason = "fallback"
 
-	            if gemini_enabled:
-	                scored = [x for x in [codex_info, glm_info] if x.get("ok")]
-	                passing = [x for x in scored if x.get("pass")]
-	                pool = passing or scored
-	                if pool:
-	                    best = max(
-	                        pool,
-	                        key=lambda x: (bool(x.get("pass")), float(x.get("score", -1.0)), 1 if x.get("source") == "codex" else 0),
-	                    )
-	                    selected_source = str(best.get("source"))
-	                    selected_draft = codex_data if selected_source == "codex" else (glm_data or {})
-	                    selected_review = codex_review if selected_source == "codex" else glm_review
-	                    selection_reason = "pass_and_score" if passing else "score_only"
+            if gemini_enabled:
+                scored = [x for x in [codex_info, glm_info] if x.get("ok")]
+                passing = [x for x in scored if x.get("pass")]
+                pool = passing or scored
+                if pool:
+                    best = max(
+                        pool,
+                        key=lambda x: (
+                            bool(x.get("pass")),
+                            float(x.get("score", -1.0)),
+                            1 if x.get("source") == "codex" else 0,
+                        ),
+                    )
+                    selected_source = str(best.get("source"))
+                    selected_draft = codex_data if selected_source == "codex" else (glm_data or {})
+                    selected_review = codex_review if selected_source == "codex" else glm_review
+                    selection_reason = "pass_and_score" if passing else "score_only"
 
-	            selected_generator_meta = codex_gen_meta if selected_source == "codex" else glm_gen_meta
-	            selected_review_meta = codex_review_meta if selected_source == "codex" else glm_review_meta
+            selected_generator_meta = codex_gen_meta if selected_source == "codex" else glm_gen_meta
+            selected_review_meta = codex_review_meta if selected_source == "codex" else glm_review_meta
 
             review_findings: list[str] = []
             if selected_review:
@@ -2598,26 +2607,28 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             if not review_findings:
                 review_findings = list(selected_draft.get("unresolved") or [])
 
-	            did_fix = False
-	            if review_findings:
-	                prev_selected = selected_draft
-	                codex_fix = _codex_generate(execution_context, selected_draft, review_findings, round_idx)
-	                if codex_fix.get("ok"):
-	                    selected_draft = _preserve_nonempty_translation_maps(prev_selected, codex_fix["data"])
-	                    selected_generator_meta = (
-	                        codex_fix.get("call_meta") if isinstance(codex_fix.get("call_meta"), dict) else selected_generator_meta
-	                    )
-	                    did_fix = True
+            did_fix = False
+            if review_findings:
+                prev_selected = selected_draft
+                codex_fix = _codex_generate(execution_context, selected_draft, review_findings, round_idx)
+                if codex_fix.get("ok"):
+                    selected_draft = _preserve_nonempty_translation_maps(prev_selected, codex_fix["data"])
+                    selected_generator_meta = (
+                        codex_fix.get("call_meta") if isinstance(codex_fix.get("call_meta"), dict) else selected_generator_meta
+                    )
+                    did_fix = True
 
-	            if gemini_enabled:
-	                if did_fix:
-	                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
-	                    if gemini_final.get("ok"):
-	                        gemini_data = gemini_final["data"]
-	                        selected_review_meta = (
-	                            gemini_final.get("call_meta") if isinstance(gemini_final.get("call_meta"), dict) else selected_review_meta
-	                        )
-	                    else:
+            if gemini_enabled:
+                if did_fix:
+                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
+                    if gemini_final.get("ok"):
+                        gemini_data = gemini_final["data"]
+                        selected_review_meta = (
+                            gemini_final.get("call_meta")
+                            if isinstance(gemini_final.get("call_meta"), dict)
+                            else selected_review_meta
+                        )
+                    else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
                         gemini_enabled = False
                         status_flags.append("degraded_single_model")
@@ -2696,28 +2707,28 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 vision_in_round=vision_in_round,
             )
 
-	            while hard_findings and vision_fix_used < vision_fix_limit:
-	                vision_fix_used += 1
-	                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings + _hard_gate_retry_hints(hard_meta)))
-	                retry_findings = [x for x in retry_findings if str(x).strip()][:40]
-	                hard_fix_attempts.append({"attempt": vision_fix_used, "findings": retry_findings})
+            while hard_findings and vision_fix_used < vision_fix_limit:
+                vision_fix_used += 1
+                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings + _hard_gate_retry_hints(hard_meta)))
+                retry_findings = [x for x in retry_findings if str(x).strip()][:40]
+                hard_fix_attempts.append({"attempt": vision_fix_used, "findings": retry_findings})
 
-	                codex_fix = _codex_generate(execution_context, selected_draft, retry_findings, round_idx)
-	                if not codex_fix.get("ok"):
-	                    errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
-	                    break
-	                selected_draft = _preserve_nonempty_translation_maps(selected_draft, codex_fix["data"])
-	                if isinstance(codex_fix.get("call_meta"), dict):
-	                    selected_generator_meta = codex_fix["call_meta"]
-	                did_fix = True
+                codex_fix = _codex_generate(execution_context, selected_draft, retry_findings, round_idx)
+                if not codex_fix.get("ok"):
+                    errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
+                    break
+                selected_draft = _preserve_nonempty_translation_maps(selected_draft, codex_fix["data"])
+                if isinstance(codex_fix.get("call_meta"), dict):
+                    selected_generator_meta = codex_fix["call_meta"]
+                did_fix = True
 
-	                if gemini_enabled:
-	                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
-	                    if gemini_final.get("ok"):
-	                        gemini_data = gemini_final["data"]
-	                        if isinstance(gemini_final.get("call_meta"), dict):
-	                            selected_review_meta = gemini_final["call_meta"]
-	                    else:
+                if gemini_enabled:
+                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
+                    if gemini_final.get("ok"):
+                        gemini_data = gemini_final["data"]
+                        if isinstance(gemini_final.get("call_meta"), dict):
+                            selected_review_meta = gemini_final["call_meta"]
+                    else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
                         gemini_enabled = False
                         status_flags.append("degraded_single_model")
@@ -2773,22 +2784,22 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
             selected_ref = _write_json(round_dir / "selected_output.json", selected_draft)
             gemini_ref = _write_json(round_dir / "gemini_review_selected.json", gemini_data)
-	            rec = _round_record(
-	                round_idx=round_idx,
-	                codex_path=selected_ref,
-	                gemini_path=gemini_ref,
-	                codex_data=selected_draft,
-	                gemini_data=gemini_data,
-	            )
-	            rec["generator"] = selected_generator_meta
-	            rec["reviewer"] = selected_review_meta
-	            rec["generator_model"] = str((selected_generator_meta.get("model") or "")).strip()
-	            rec["review_model"] = str((selected_review_meta.get("model") or "")).strip()
-	            rec["generator_agent_id"] = str((selected_generator_meta.get("agent_id") or "")).strip()
-	            rec["review_agent_id"] = str((selected_review_meta.get("agent_id") or "")).strip()
-	            rec["selected_candidate"] = selected_source
-	            rec["candidate_refs"] = candidate_refs
-	            rec["candidate_review_refs"] = review_refs
+            rec = _round_record(
+                round_idx=round_idx,
+                codex_path=selected_ref,
+                gemini_path=gemini_ref,
+                codex_data=selected_draft,
+                gemini_data=gemini_data,
+            )
+            rec["generator"] = selected_generator_meta
+            rec["reviewer"] = selected_review_meta
+            rec["generator_model"] = str((selected_generator_meta.get("model") or "")).strip()
+            rec["review_model"] = str((selected_review_meta.get("model") or "")).strip()
+            rec["generator_agent_id"] = str((selected_generator_meta.get("agent_id") or "")).strip()
+            rec["review_agent_id"] = str((selected_review_meta.get("agent_id") or "")).strip()
+            rec["selected_candidate"] = selected_source
+            rec["candidate_refs"] = candidate_refs
+            rec["candidate_review_refs"] = review_refs
             rec["selection"] = selection_meta
             rec["hard_findings"] = hard_findings
             rec["warnings"] = hard_warnings
@@ -2798,6 +2809,11 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 rec["unresolved"] = sorted(set([str(x) for x in (rec.get("unresolved") or [])] + [str(x) for x in hard_findings]))
                 rec["pass"] = False
             rounds.append(rec)
+            if on_round_complete is not None:
+                try:
+                    on_round_complete(rec)
+                except Exception as exc:
+                    log.warning("on_round_complete failed for job %s round %s: %s", job_id, rec.get("round"), exc)
 
             markdown_sanity_by_round[str(round_idx)] = hard_meta.get("markdown_sanity")
             preserve_coverage_by_round[str(round_idx)] = hard_meta.get("preserve_coverage")

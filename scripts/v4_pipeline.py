@@ -822,16 +822,58 @@ def run_job_pipeline(
         dry_run=dry_run_notify,
     )
 
+    sent_rounds: set[int] = set()
+
+    def _format_round_message(rd: dict[str, Any]) -> str:
+        rd_no = rd.get("round") or "?"
+        gen_model, rev_model = _extract_models(rd)
+        gen_ok = "\u2705" if rd.get("codex_pass") else "\u274c"
+        rev_ok = "\u2705" if rd.get("gemini_pass") else "\u274c"
+        return f"\U0001f504 Round {rd_no} done\nGen({gen_model}): {gen_ok} \u00b7 Review({rev_model}): {rev_ok}"
+
+    def _extract_models(rd: dict[str, Any]) -> tuple[str, str]:
+        gen_model = (
+            str(rd.get("generator_model") or "")
+            or str(((rd.get("generator") or {}) if isinstance(rd.get("generator"), dict) else {}).get("model") or "")
+        ).strip() or "unknown"
+        rev_model = (
+            str(rd.get("review_model") or "")
+            or str(((rd.get("reviewer") or {}) if isinstance(rd.get("reviewer"), dict) else {}).get("model") or "")
+        ).strip() or "unknown"
+        return gen_model, rev_model
+
+    def _format_models_summary(rd: dict[str, Any]) -> str:
+        gen_model, rev_model = _extract_models(rd)
+        return f"\U0001f9e0 Models: Gen({gen_model}) \u00b7 Review({rev_model})"
+
+    def _on_round_complete(rd: dict[str, Any]) -> None:
+        try:
+            rd_no_int = int(rd.get("round") or 0)
+        except (TypeError, ValueError):
+            return
+        if rd_no_int <= 0 or rd_no_int in sent_rounds:
+            return
+        sent_rounds.add(rd_no_int)
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone=f"round_{rd_no_int}_done",
+            message=_format_round_message(rd),
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+
     notify_milestone(
         paths=paths,
         conn=conn,
         job_id=job_id,
         milestone="running",
-        message=f"\U0001f680 Translating\n\U0001f4cb {_task_name}\n\u23f3 Codex+Gemini \u00b7 up to 3 rounds",
+        message=f"\U0001f680 Translating\n\U0001f4cb {_task_name}\n\u23f3 OpenClaw routing \u00b7 up to 3 rounds",
         target=notify_target,
         dry_run=dry_run_notify,
     )
-    result = run_translation(meta, plan_only=False)
+    result = run_translation(meta, plan_only=False, on_round_complete=_on_round_complete)
 
     # Run detail validation if enabled (after translation, before quality gate)
     detail_validation_enabled = str(
@@ -938,15 +980,22 @@ def run_job_pipeline(
             rd_no = rd.get("round")
             if not rd_no:
                 continue
+            try:
+                rd_no_int = int(rd_no)
+            except (TypeError, ValueError):
+                rd_no_int = 0
+            if rd_no_int in sent_rounds:
+                continue
             notify_milestone(
                 paths=paths,
                 conn=conn,
                 job_id=job_id,
                 milestone=f"round_{rd_no}_done",
-                message=f"\U0001f504 Round {rd_no} done\nCodex: {'\u2705' if rd.get('codex_pass') else '\u274c'} \u00b7 Gemini: {'\u2705' if rd.get('gemini_pass') else '\u274c'}",
+                message=_format_round_message(rd),
                 target=notify_target,
                 dry_run=dry_run_notify,
             )
+        models_line = f"{_format_models_summary(rounds[-1])}\n" if rounds else ""
         notify_milestone(
             paths=paths,
             conn=conn,
@@ -956,7 +1005,8 @@ def run_job_pipeline(
                 f"\u2705 Translation complete\n"
                 f"\U0001f4cb {_task_name}\n"
                 f"\U0001f4c1 {result.get('review_dir')}\n\n"
-                f"Send: ok \u00b7 no {{reason}} \u00b7 rerun"
+                + models_line
+                + f"Send: ok \u00b7 no {{reason}} \u00b7 rerun"
             ),
             target=notify_target,
             dry_run=dry_run_notify,
@@ -978,12 +1028,18 @@ def run_job_pipeline(
             rd_no = rd.get("round")
             if not rd_no:
                 continue
+            try:
+                rd_no_int = int(rd_no)
+            except (TypeError, ValueError):
+                rd_no_int = 0
+            if rd_no_int in sent_rounds:
+                continue
             notify_milestone(
                 paths=paths,
                 conn=conn,
                 job_id=job_id,
                 milestone=f"round_{rd_no}_done",
-                message=f"\U0001f504 Round {rd_no} done\nCodex: {'\u2705' if rd.get('codex_pass') else '\u274c'} \u00b7 Gemini: {'\u2705' if rd.get('gemini_pass') else '\u274c'}",
+                message=_format_round_message(rd),
                 target=notify_target,
                 dry_run=dry_run_notify,
             )
@@ -1000,6 +1056,7 @@ def run_job_pipeline(
             why_block = "\n\nWhy:\n" + "\n".join(f"- {x}" for x in why_lines[:3])
         folder = str(result.get("review_dir") or "").strip()
         folder_line = f"\U0001f4c1 {folder}\n" if folder else ""
+        models_line = f"{_format_models_summary(rounds[-1])}\n" if rounds else ""
         notify_milestone(
             paths=paths,
             conn=conn,
@@ -1009,6 +1066,7 @@ def run_job_pipeline(
                 f"\u26a0\ufe0f Needs attention\n"
                 f"\U0001f4cb {_task_name}\n"
                 + folder_line
+                + models_line
                 + why_block
                 + "\n\nSend: status \u00b7 rerun \u00b7 no {reason}"
             ),
@@ -1021,12 +1079,18 @@ def run_job_pipeline(
             rd_no = rd.get("round")
             if not rd_no:
                 continue
+            try:
+                rd_no_int = int(rd_no)
+            except (TypeError, ValueError):
+                rd_no_int = 0
+            if rd_no_int in sent_rounds:
+                continue
             notify_milestone(
                 paths=paths,
                 conn=conn,
                 job_id=job_id,
                 milestone=f"round_{rd_no}_done",
-                message=f"\U0001f504 Round {rd_no} done\nCodex: {'\u2705' if rd.get('codex_pass') else '\u274c'} \u00b7 Gemini: {'\u2705' if rd.get('gemini_pass') else '\u274c'}",
+                message=_format_round_message(rd),
                 target=notify_target,
                 dry_run=dry_run_notify,
             )
@@ -1043,6 +1107,7 @@ def run_job_pipeline(
             why_block = "\n\nWhy:\n" + "\n".join(f"- {x}" for x in why_lines[:3])
         folder = str(result.get("review_dir") or "").strip()
         folder_line = f"\U0001f4c1 {folder}\n" if folder else ""
+        models_line = f"{_format_models_summary(rounds[-1])}\n" if rounds else ""
         notify_milestone(
             paths=paths,
             conn=conn,
@@ -1052,6 +1117,7 @@ def run_job_pipeline(
                 f"\u274c Failed\n"
                 f"\U0001f4cb {_task_name}\n"
                 + folder_line
+                + models_line
                 + why_block
                 + "\n\nSend: status \u00b7 rerun \u00b7 no {reason}"
             ),

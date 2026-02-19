@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenClaw skill: execute translation with Codex+Gemini self-check."""
+"""OpenClaw skill: execute translation with OpenClaw routing self-check."""
 
 from __future__ import annotations
 

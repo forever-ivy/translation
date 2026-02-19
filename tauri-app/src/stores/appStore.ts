@@ -180,8 +180,8 @@ interface AppState {
   autoFixPreflight: () => Promise<void>;
   startOpenclaw: () => Promise<void>;
   fetchConfig: () => Promise<void>;
-  fetchJobs: (status?: string) => Promise<void>;
-  fetchJobMilestones: (jobId: string) => Promise<void>;
+  fetchJobs: (status?: string, opts?: { silent?: boolean }) => Promise<void>;
+  fetchJobMilestones: (jobId: string, opts?: { silent?: boolean }) => Promise<void>;
   fetchJobArtifacts: (jobId: string) => Promise<void>;
   startServices: () => Promise<void>;
   stopServices: () => Promise<void>;
@@ -475,7 +475,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  fetchJobs: async (status?: string) => {
+  fetchJobs: async (status?: string, opts?: { silent?: boolean }) => {
     try {
       const jobs = await tauri.getJobs(status);
       set({
@@ -489,11 +489,13 @@ export const useAppStore = create<AppState>((set, get) => ({
         })),
       });
     } catch (err) {
-      get().addToast("error", `Failed to fetch jobs: ${err}`);
+      if (!opts?.silent) {
+        get().addToast("error", `Failed to fetch jobs: ${err}`);
+      }
     }
   },
 
-  fetchJobMilestones: async (jobId: string) => {
+  fetchJobMilestones: async (jobId: string, opts?: { silent?: boolean }) => {
     try {
       const milestones = await tauri.getJobMilestones(jobId);
       set({
@@ -504,7 +506,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         })),
       });
     } catch (err) {
-      get().addToast("error", `Failed to fetch milestones: ${err}`);
+      if (!opts?.silent) {
+        get().addToast("error", `Failed to fetch milestones: ${err}`);
+      }
     }
   },
 
