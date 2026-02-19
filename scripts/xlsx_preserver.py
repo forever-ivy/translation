@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """XLSX format-preserving translation support.
 
-Goal: keep original workbook formatting/structure while replacing only translatable text.
+Goal: keep original workbook formatting/structure while replacing translatable text.
 
 Principles:
-- Never change formulas, numbers, dates, or references.
 - Preserve styles, merged cells, column widths, borders, fills, etc.
+- Avoid touching numbers/dates/references.
 - Optional non-structural beautify: wrap_text + row-height increase only.
 """
 
@@ -75,6 +75,7 @@ def extract_translatable_cells(
     interview_only_if_present: bool = False,
     sheet_include_regex: str | None = None,
     sheet_exclude_regex: str | None = None,
+    include_formula_display_text: bool = True,
 ) -> tuple[list[XlsxCellUnit], dict[str, Any]]:
     """Extract translatable cells (string values only) from workbook.
 
@@ -83,6 +84,10 @@ def extract_translatable_cells(
     _require_openpyxl()
     xlsx_path = Path(xlsx_path).expanduser().resolve()
     wb = openpyxl.load_workbook(str(xlsx_path), data_only=False)
+    wb_values = None
+    if include_formula_display_text:
+        # Read cached/display values so formula-backed text cells can be translated.
+        wb_values = openpyxl.load_workbook(str(xlsx_path), data_only=True)
     units: list[XlsxCellUnit] = []
     truncated = False
 
@@ -116,9 +121,15 @@ def extract_translatable_cells(
             continue
         for row in ws.iter_rows():
             for cell in row:
-                if _is_formula_cell(cell):
-                    continue
                 value = cell.value
+                if _is_formula_cell(cell):
+                    if not include_formula_display_text or wb_values is None:
+                        continue
+                    try:
+                        ws_values = wb_values[ws.title]
+                        value = ws_values[cell.coordinate].value
+                    except Exception:
+                        value = None
                 if not _is_translatable_text(value):
                     continue
                 if arabic_only and not _TEXT_HAS_ARABIC_RE.search(_normalize_text(str(value))):
@@ -139,6 +150,8 @@ def extract_translatable_cells(
         if truncated:
             break
     wb.close()
+    if wb_values is not None:
+        wb_values.close()
     return units, {
         "file": xlsx_path.name,
         "cell_count": len(units),
@@ -148,6 +161,7 @@ def extract_translatable_cells(
         "interview_only_if_present": bool(interview_only_if_present),
         "sheet_include_regex": str(sheet_include_regex or ""),
         "sheet_exclude_regex": str(sheet_exclude_regex or ""),
+        "include_formula_display_text": bool(include_formula_display_text),
         "included_sheets": included_sheets,
     }
 
@@ -250,6 +264,7 @@ def apply_translation_map(
     output_xlsx: Path,
     translation_map_entries: Any,
     beautify: bool = True,
+    overwrite_formula_cells: bool = True,
 ) -> dict[str, Any]:
     """Copy source workbook and apply translations by (sheet, cell)."""
     _require_openpyxl()
@@ -277,7 +292,12 @@ def apply_translation_map(
             missing_cells += 1
             continue
         if _is_formula_cell(cell):
-            skipped_formulas += 1
+            if not overwrite_formula_cells:
+                skipped_formulas += 1
+                continue
+            # Explicitly mapped formula-backed text cell: replace formula with translated static text.
+            cell.value = str(new_text)
+            changed.append((sheet, cell_addr))
             continue
         if not _is_translatable_text(cell.value) and cell.value is not None:
             # Avoid turning non-text cells into strings.

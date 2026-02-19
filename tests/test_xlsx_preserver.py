@@ -77,6 +77,7 @@ class XlsxPreserverTest(unittest.TestCase):
                     {"file": src.name, "sheet": "Sheet1", "cell": "B1", "text": "999"},
                 ],
                 beautify=False,
+                overwrite_formula_cells=False,
             )
             self.assertTrue(res.get("ok"))
             self.assertEqual(res.get("applied_count"), 1)
@@ -112,6 +113,28 @@ class XlsxPreserverTest(unittest.TestCase):
             self.assertTrue(ws["A1"].alignment.wrap_text)
             self.assertIsNotNone(ws.row_dimensions[1].height)
             self.assertGreaterEqual(float(ws.row_dimensions[1].height), 20.0)
+            wb.close()
+
+    def test_apply_translation_can_overwrite_formula_cells_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "source.xlsx"
+            out = Path(tmp) / "out.xlsx"
+            _make_xlsx(src)
+
+            res = apply_translation_map(
+                source_xlsx=src,
+                output_xlsx=out,
+                translation_map_entries=[{"file": src.name, "sheet": "Sheet1", "cell": "A2", "text": "Three"}],
+                beautify=False,
+                overwrite_formula_cells=True,
+            )
+            self.assertTrue(res.get("ok"))
+            self.assertEqual(res.get("applied_count"), 1)
+            self.assertEqual(res.get("skipped_formulas"), 0)
+
+            wb = load_workbook(str(out), data_only=False)
+            ws = wb["Sheet1"]
+            self.assertEqual(ws["A2"].value, "Three")
             wb.close()
 
     def test_extract_translatable_cells_arabic_only_interview_focus(self):
