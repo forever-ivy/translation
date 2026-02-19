@@ -736,6 +736,8 @@ def run_job_pipeline(
         "candidate_files": candidates,
         "knowledge_context": kb_hits,
         "knowledge_backend": knowledge_backend,
+        "kb_root": str(Path(kb_root).expanduser().resolve()),
+        "kb_company": kb_company,
         "max_rounds": 3,
         "codex_available": True,
         "gemini_available": True,

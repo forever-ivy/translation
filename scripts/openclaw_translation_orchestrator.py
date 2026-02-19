@@ -334,6 +334,186 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
     return findings, meta
 
 
+def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    """Return (findings, meta) for strict glossary enforcement.
+
+    Enforcer payload shape:
+      execution_context.glossary_enforcer = {
+        "enabled": true,
+        "terms": [{"ar": "...", "en": "..."}],
+        ...
+      }
+
+    We only validate when format_preserve payloads are available (DOCX units / XLSX cells),
+    so we can enforce per-unit/per-cell, not just "somewhere in the output".
+    """
+    findings: list[str] = []
+    meta: dict[str, Any] = {
+        "enabled": False,
+        "terms": 0,
+        "docx_checked_units": 0,
+        "xlsx_checked_cells": 0,
+        "violations": 0,
+        "skipped_reason": "",
+    }
+
+    enforcer = context.get("glossary_enforcer") if isinstance(context.get("glossary_enforcer"), dict) else {}
+    if not enforcer or not bool(enforcer.get("enabled", False)):
+        meta["skipped_reason"] = "disabled"
+        return findings, meta
+
+    terms_raw = enforcer.get("terms")
+    if not isinstance(terms_raw, list) or not terms_raw:
+        meta["enabled"] = True
+        meta["skipped_reason"] = "no_terms"
+        return findings, meta
+
+    preserve = (context.get("format_preserve") or {}) if isinstance(context.get("format_preserve"), dict) else {}
+    if not preserve:
+        meta["enabled"] = True
+        meta["skipped_reason"] = "no_format_preserve"
+        return findings, meta
+
+    try:
+        from scripts.kb_glossary_enforcer import normalize_arabic, normalize_english
+    except Exception as exc:  # pragma: no cover - optional in some minimal runtimes
+        meta["enabled"] = True
+        meta["skipped_reason"] = f"import_failed:{exc}"
+        return findings, meta
+
+    # Normalize and de-dupe terms by Arabic key.
+    terms: list[tuple[str, str, str, str]] = []  # (ar_norm, en_norm, ar_display, en_display)
+    seen_ar: set[str] = set()
+    for item in terms_raw:
+        ar = ""
+        en = ""
+        if isinstance(item, dict):
+            ar = str(item.get("ar") or item.get("arabic") or "").strip()
+            en = str(item.get("en") or item.get("english") or "").strip()
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            ar = str(item[0] or "").strip()
+            en = str(item[1] or "").strip()
+        if not ar or not en:
+            continue
+        ar_norm = normalize_arabic(ar)
+        en_norm = normalize_english(en)
+        if not ar_norm or not en_norm:
+            continue
+        if ar_norm in seen_ar:
+            continue
+        seen_ar.add(ar_norm)
+        terms.append((ar_norm, en_norm, ar, en))
+
+    meta["enabled"] = True
+    meta["terms"] = len(terms)
+    if not terms:
+        meta["skipped_reason"] = "no_valid_terms"
+        return findings, meta
+
+    # Normalize translation maps for lookup.
+    docx_map: dict[str, str] = {}
+    d_entries = draft.get("docx_translation_map")
+    if isinstance(d_entries, dict):
+        for k, v in d_entries.items():
+            key = str(k or "").strip()
+            if key:
+                docx_map[key] = str(v or "")
+    elif isinstance(d_entries, list):
+        for row in d_entries:
+            if not isinstance(row, dict):
+                continue
+            unit_id = str(row.get("id") or row.get("unit_id") or row.get("block_id") or row.get("cell_id") or "").strip()
+            if unit_id:
+                docx_map[unit_id] = str(row.get("text") or "")
+
+    xlsx_map: dict[tuple[str, str, str], str] = {}
+    x_entries = draft.get("xlsx_translation_map")
+    xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
+    xlsx_files = [
+        str(src.get("file") or "").strip()
+        for src in xlsx_sources
+        if isinstance(src, dict) and str(src.get("file") or "").strip()
+    ]
+    default_xlsx_file = xlsx_files[0] if len(xlsx_files) == 1 else ""
+    if isinstance(x_entries, dict) and default_xlsx_file:
+        for k, v in x_entries.items():
+            raw = str(k or "")
+            if "!" not in raw:
+                continue
+            sheet, cell = raw.split("!", 1)
+            sheet = sheet.strip()
+            cell = cell.strip().upper()
+            if sheet and cell:
+                xlsx_map[(default_xlsx_file, sheet, cell)] = str(v or "")
+    elif isinstance(x_entries, list):
+        for row in x_entries:
+            if not isinstance(row, dict):
+                continue
+            file_name = str(row.get("file") or "").strip()
+            sheet = str(row.get("sheet") or "").strip()
+            cell = str(row.get("cell") or "").strip().upper()
+            if file_name and sheet and cell:
+                xlsx_map[(file_name, sheet, cell)] = str(row.get("text") or "")
+
+    max_violations = max(1, int(os.getenv("OPENCLAW_GLOSSARY_ENFORCER_MAX_VIOLATIONS", "60")))
+
+    def _check_unit(*, where: str, unit_key: str, src_text: str, out_text: str) -> None:
+        nonlocal findings
+        if len(findings) >= max_violations:
+            return
+        src_norm = normalize_arabic(src_text)
+        out_norm = normalize_english(out_text)
+        if not src_norm:
+            return
+        for ar_norm, en_norm, ar_disp, en_disp in terms:
+            if not ar_norm or ar_norm not in src_norm:
+                continue
+            if en_norm and en_norm in out_norm:
+                continue
+            findings.append(f"glossary_enforcer_missing:{where}:{unit_key}:{ar_disp}=>{en_disp}")
+            if len(findings) >= max_violations:
+                return
+
+    # DOCX units
+    docx = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
+    if docx and isinstance(docx.get("units"), list) and docx_map:
+        for unit in docx.get("units") or []:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("id") or "").strip()
+            src_text = str(unit.get("text") or "")
+            if not unit_id or not src_text:
+                continue
+            meta["docx_checked_units"] += 1
+            out_text = docx_map.get(unit_id, "")
+            _check_unit(where="docx", unit_key=unit_id, src_text=src_text, out_text=out_text)
+
+    # XLSX cells
+    if xlsx_sources and xlsx_map:
+        for src in xlsx_sources:
+            if not isinstance(src, dict):
+                continue
+            file_name = str(src.get("file") or "").strip()
+            for unit in (src.get("cell_units") or []):
+                if not isinstance(unit, dict):
+                    continue
+                sheet = str(unit.get("sheet") or "").strip()
+                cell = str(unit.get("cell") or "").strip().upper()
+                src_text = str(unit.get("text") or "")
+                if not file_name or not sheet or not cell or not src_text:
+                    continue
+                meta["xlsx_checked_cells"] += 1
+                out_text = xlsx_map.get((file_name, sheet, cell), "")
+                _check_unit(where="xlsx", unit_key=f"{file_name}:{sheet}!{cell}", src_text=src_text, out_text=out_text)
+
+    meta["violations"] = len(findings)
+    if not findings:
+        meta["skipped_reason"] = ""
+    elif len(findings) >= max_violations:
+        meta["skipped_reason"] = "violations_truncated"
+    return findings, meta
+
+
 def _merge_docx_translation_map(prev_val: Any, new_val: Any) -> Any:
     """Merge docx translation maps by unit id, preferring new entries on conflict."""
     if not prev_val:
@@ -761,6 +941,71 @@ def _extract_openclaw_payload_text(payload: Any) -> str:
     return ""
 
 
+def _extract_openclaw_payload_model(payload: Any) -> dict[str, str]:
+    """Best-effort extraction of the model used from OpenClaw agent output payload.
+
+    This is intentionally heuristic: OpenClaw gateway payload formats may vary across
+    versions and backends. We prefer returning OpenClaw-style model keys
+    (e.g. "moonshot/kimi-k2.5") when present, but will fall back to any model-like
+    string.
+    """
+    def _is_model_key(s: str) -> bool:
+        text = (s or "").strip()
+        if not text or "://" in text:
+            return False
+        if "/" not in text:
+            return False
+        provider, model = text.split("/", 1)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", provider):
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", model):
+            return False
+        return True
+
+    def _walk(obj: Any, path: tuple[str, ...]) -> list[tuple[int, str, tuple[str, ...]]]:
+        out: list[tuple[int, str, tuple[str, ...]]] = []
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key = str(k)
+                out.extend(_walk(v, path + (key,)))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                out.extend(_walk(v, path + (f"[{i}]",)))
+        elif isinstance(obj, str):
+            val = obj.strip()
+            if not val:
+                return out
+            key_hint = " ".join(path).lower()
+            score = 0
+            if "model" in key_hint:
+                score += 5
+            if "resolved" in key_hint or "selected" in key_hint or "route" in key_hint:
+                score += 3
+            if _is_model_key(val):
+                score += 10
+            elif "model" in key_hint and len(val) <= 80:
+                score += 2
+            if score > 0:
+                out.append((score, val, path))
+        return out
+
+    best: tuple[int, str, tuple[str, ...]] | None = None
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        for container in (result, payload):
+            candidates = _walk(container, tuple())
+            for cand in candidates:
+                if best is None or cand[0] > best[0]:
+                    best = cand
+
+    if best is None:
+        return {"model": "", "provider": ""}
+
+    model = best[1]
+    provider = model.split("/", 1)[0] if "/" in model else ""
+    return {"model": model, "provider": provider}
+
+
 def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD_TIMEOUT) -> dict[str, Any]:
     cmd = [
         OPENCLAW_BIN,
@@ -808,7 +1053,8 @@ def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD
                 break
 
     text = _extract_openclaw_payload_text(payload)
-    return {"ok": True, "agent_id": agent_id, "payload": payload, "text": text}
+    meta = _extract_openclaw_payload_model(payload)
+    return {"ok": True, "agent_id": agent_id, "payload": payload, "text": text, "meta": meta}
 
 
 LEGACY_REQUIRED_INPUTS_MAP = {
@@ -1125,6 +1371,8 @@ Rules:
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
+  For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
 - FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
 - Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
   Use plain text only. For lists use "• " or "1) " style, not Markdown.
@@ -1139,6 +1387,9 @@ Rules:
     except Exception as exc:
         return {"ok": False, "error": "codex_json_parse_failed", "detail": str(exc), "raw_text": call.get("text", "")}
 
+    call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
+    if isinstance(call, dict) and call.get("agent_id"):
+        call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
     return {
         "ok": True,
         "data": {
@@ -1160,6 +1411,7 @@ Rules:
             "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
         },
         "raw": parsed,
+        "call_meta": call_meta,
     }
 
 
@@ -1241,7 +1493,10 @@ Rules:
             "raw_text": call.get("text", ""),
         }
 
-    return {"ok": True, "data": data, "raw": parsed}
+    call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
+    if isinstance(call, dict) and call.get("agent_id"):
+        call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
+    return {"ok": True, "data": data, "raw": parsed, "call_meta": call_meta}
 
 
 def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
@@ -1379,6 +1634,8 @@ Rules:
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
+  For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
 - FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
 - Do NOT output Markdown anywhere (no ``` fenced blocks, no **bold**, no headings like #/##, no "- " markdown bullets, no [text](url)).
   Use plain text only. For lists use "• " or "1) " style, not Markdown.
@@ -1392,6 +1649,17 @@ Rules:
     if not call.get("ok"):
         return {"ok": False, "error": call.get("error"), "detail": call}
 
+    call_meta: dict[str, Any] = {}
+    if isinstance(call, dict):
+        call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
+        if call.get("agent_id"):
+            call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
+        if not call_meta.get("model") and call.get("source") == "direct_api":
+            call_meta = {
+                "agent_id": "direct_api",
+                "model": str(GLM_MODEL or "").strip(),
+                "provider": str(GLM_MODEL or "").split("/", 1)[0] if "/" in str(GLM_MODEL or "") else "",
+            }
     try:
         parsed = _extract_json_from_text(str(call.get("text", "")))
     except Exception as exc:
@@ -1418,6 +1686,7 @@ Rules:
             "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
         },
         "raw": parsed,
+        "call_meta": call_meta,
     }
 
 
@@ -1750,10 +2019,17 @@ def _compute_hard_gates(
             markdown_findings = _markdown_findings_from_sanity(markdown_sanity)
 
     preserve_findings, preserve_meta = _validate_format_preserve_coverage(context, draft)
+    glossary_findings: list[str] = []
+    glossary_meta: dict[str, Any] | None = None
+    # Only validate glossary enforcement once preserve coverage is complete, otherwise we'd
+    # flood findings due to missing translation map entries.
+    if not preserve_findings:
+        glossary_findings, glossary_meta = _validate_glossary_enforcer(context, draft)
 
     findings: list[str] = []
     findings.extend(markdown_findings)
     findings.extend(preserve_findings)
+    findings.extend(glossary_findings)
     warnings: list[str] = []
 
     vision_results: dict[str, Any] = {}
@@ -1773,6 +2049,7 @@ def _compute_hard_gates(
     meta = {
         "markdown_sanity": markdown_sanity,
         "preserve_coverage": {"findings": preserve_findings, "meta": preserve_meta},
+        "glossary_enforcer": {"findings": glossary_findings, "meta": glossary_meta},
         "vision_trial": vision_results,
     }
     return findings, warnings, meta
@@ -2074,6 +2351,89 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
         if format_preserve:
             execution_context["format_preserve"] = format_preserve
 
+        # --- KB Glossary Enforcer (company-scoped) ---
+        try:
+            glossary_enabled = _env_flag("OPENCLAW_GLOSSARY_ENFORCER_ENABLED", "1")
+            src_lang = str(intent.get("source_language") or "").strip().lower()
+            tgt_lang = str(intent.get("target_language") or "").strip().lower()
+            kb_root = str(meta.get("kb_root") or "").strip()
+            kb_company = str(meta.get("kb_company") or "").strip()
+
+            if (
+                glossary_enabled
+                and format_preserve
+                and kb_root
+                and kb_company
+            ):
+                from scripts.kb_glossary_enforcer import (
+                    build_glossary_map,
+                    load_company_glossary_pairs,
+                    looks_arabic,
+                    select_terms_for_sources,
+                )
+
+                source_texts: list[str] = []
+                docx_template = format_preserve.get("docx_template") if isinstance(format_preserve.get("docx_template"), dict) else None
+                if docx_template and isinstance(docx_template.get("units"), list):
+                    for u in docx_template.get("units") or []:
+                        if not isinstance(u, dict):
+                            continue
+                        t = u.get("text")
+                        if isinstance(t, str) and t.strip():
+                            source_texts.append(t)
+
+                for src in (format_preserve.get("xlsx_sources") or []):
+                    if not isinstance(src, dict):
+                        continue
+                    for u in (src.get("cell_units") or []):
+                        if not isinstance(u, dict):
+                            continue
+                        t = u.get("text")
+                        if isinstance(t, str) and t.strip():
+                            source_texts.append(t)
+
+                has_arabic_source = any(looks_arabic(t) for t in source_texts[:400])
+                src_ok = (not src_lang) or src_lang in {"ar", "arabic", "unknown", "multi"}
+                tgt_ok = (not tgt_lang) or tgt_lang in {"en", "english", "unknown", "multi"}
+
+                if has_arabic_source and src_ok and tgt_ok:
+                    max_files = int(os.getenv("OPENCLAW_GLOSSARY_ENFORCER_MAX_FILES", "80"))
+                    max_terms = int(os.getenv("OPENCLAW_GLOSSARY_ENFORCER_MAX_TERMS", "80"))
+                    min_ar_len = int(os.getenv("OPENCLAW_GLOSSARY_ENFORCER_MIN_AR_LEN", "2"))
+
+                    pairs, pairs_meta = load_company_glossary_pairs(
+                        kb_root=Path(kb_root),
+                        company=kb_company,
+                        max_files=max_files,
+                    )
+                    glossary_map, conflicts = build_glossary_map(pairs, min_arabic_len=min_ar_len)
+                    selected, select_meta = select_terms_for_sources(
+                        glossary_map=glossary_map,
+                        source_texts=source_texts,
+                        max_terms=max_terms,
+                    )
+
+                    if selected:
+                        execution_context["glossary_enforcer"] = {
+                            "enabled": True,
+                            "company": kb_company,
+                            "terms": [{"ar": p.arabic, "en": p.english} for p in selected],
+                            "meta": {
+                                "files_scanned": int(pairs_meta.get("files_scanned", 0) or 0),
+                                "pairs_extracted": int(pairs_meta.get("pairs_extracted", 0) or 0),
+                                "errors": len(pairs_meta.get("errors") or []),
+                                "unique_terms": len(glossary_map),
+                                "conflicts": len(conflicts),
+                                "matched_terms": int(select_meta.get("matched_terms", 0) or 0),
+                                "truncated": bool(select_meta.get("truncated", False)),
+                            },
+                        }
+                        (execution_context.get("rules") or {})["glossary_enforcer_strict"] = True
+                        status_flags.append("glossary_enforcer_active")
+        except Exception as exc:
+            status_flags.append("glossary_enforcer_error")
+            execution_context["glossary_enforcer"] = {"enabled": False, "error": str(exc)}
+
         rounds: list[dict[str, Any]] = []
         previous_findings: list[str] = []
         current_draft: dict[str, Any] | None = None
@@ -2138,6 +2498,9 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             if glm_enabled:
                 _write_raw_error_artifacts(round_dir, "glm_generate", glm_gen)
 
+            codex_gen_meta = codex_gen.get("call_meta") if isinstance(codex_gen.get("call_meta"), dict) else {}
+            glm_gen_meta = glm_gen.get("call_meta") if isinstance(glm_gen.get("call_meta"), dict) else {}
+
             generation_errors: dict[str, str] = {}
             if not codex_data:
                 generation_errors["codex"] = str(codex_gen.get("error", "codex_generation_failed"))
@@ -2150,6 +2513,8 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
             codex_review: dict[str, Any] | None = None
             glm_review: dict[str, Any] | None = None
+            codex_review_meta: dict[str, Any] = {}
+            glm_review_meta: dict[str, Any] = {}
             gemini_review_errors: list[str] = []
 
             if gemini_enabled:
@@ -2157,6 +2522,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     rev = _gemini_review(execution_context, codex_data, round_idx)
                     if rev.get("ok"):
                         codex_review = rev["data"]
+                        codex_review_meta = rev.get("call_meta") if isinstance(rev.get("call_meta"), dict) else {}
                     else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_codex", rev)
                         gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:codex")))
@@ -2164,6 +2530,7 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                     rev = _gemini_review(execution_context, glm_data, round_idx)
                     if rev.get("ok"):
                         glm_review = rev["data"]
+                        glm_review_meta = rev.get("call_meta") if isinstance(rev.get("call_meta"), dict) else {}
                     else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_glm", rev)
                         gemini_review_errors.append(str(rev.get("error", "gemini_review_failed:glm")))
@@ -2206,19 +2573,22 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             selected_review = codex_review if selected_source == "codex" else glm_review
             selection_reason = "fallback"
 
-            if gemini_enabled:
-                scored = [x for x in [codex_info, glm_info] if x.get("ok")]
-                passing = [x for x in scored if x.get("pass")]
-                pool = passing or scored
-                if pool:
-                    best = max(
-                        pool,
-                        key=lambda x: (bool(x.get("pass")), float(x.get("score", -1.0)), 1 if x.get("source") == "codex" else 0),
-                    )
-                    selected_source = str(best.get("source"))
-                    selected_draft = codex_data if selected_source == "codex" else (glm_data or {})
-                    selected_review = codex_review if selected_source == "codex" else glm_review
-                    selection_reason = "pass_and_score" if passing else "score_only"
+	            if gemini_enabled:
+	                scored = [x for x in [codex_info, glm_info] if x.get("ok")]
+	                passing = [x for x in scored if x.get("pass")]
+	                pool = passing or scored
+	                if pool:
+	                    best = max(
+	                        pool,
+	                        key=lambda x: (bool(x.get("pass")), float(x.get("score", -1.0)), 1 if x.get("source") == "codex" else 0),
+	                    )
+	                    selected_source = str(best.get("source"))
+	                    selected_draft = codex_data if selected_source == "codex" else (glm_data or {})
+	                    selected_review = codex_review if selected_source == "codex" else glm_review
+	                    selection_reason = "pass_and_score" if passing else "score_only"
+
+	            selected_generator_meta = codex_gen_meta if selected_source == "codex" else glm_gen_meta
+	            selected_review_meta = codex_review_meta if selected_source == "codex" else glm_review_meta
 
             review_findings: list[str] = []
             if selected_review:
@@ -2228,20 +2598,26 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
             if not review_findings:
                 review_findings = list(selected_draft.get("unresolved") or [])
 
-            did_fix = False
-            if review_findings:
-                prev_selected = selected_draft
-                codex_fix = _codex_generate(execution_context, selected_draft, review_findings, round_idx)
-                if codex_fix.get("ok"):
-                    selected_draft = _preserve_nonempty_translation_maps(prev_selected, codex_fix["data"])
-                    did_fix = True
+	            did_fix = False
+	            if review_findings:
+	                prev_selected = selected_draft
+	                codex_fix = _codex_generate(execution_context, selected_draft, review_findings, round_idx)
+	                if codex_fix.get("ok"):
+	                    selected_draft = _preserve_nonempty_translation_maps(prev_selected, codex_fix["data"])
+	                    selected_generator_meta = (
+	                        codex_fix.get("call_meta") if isinstance(codex_fix.get("call_meta"), dict) else selected_generator_meta
+	                    )
+	                    did_fix = True
 
-            if gemini_enabled:
-                if did_fix:
-                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
-                    if gemini_final.get("ok"):
-                        gemini_data = gemini_final["data"]
-                    else:
+	            if gemini_enabled:
+	                if did_fix:
+	                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
+	                    if gemini_final.get("ok"):
+	                        gemini_data = gemini_final["data"]
+	                        selected_review_meta = (
+	                            gemini_final.get("call_meta") if isinstance(gemini_final.get("call_meta"), dict) else selected_review_meta
+	                        )
+	                    else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
                         gemini_enabled = False
                         status_flags.append("degraded_single_model")
@@ -2320,24 +2696,28 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
                 vision_in_round=vision_in_round,
             )
 
-            while hard_findings and vision_fix_used < vision_fix_limit:
-                vision_fix_used += 1
-                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings + _hard_gate_retry_hints(hard_meta)))
-                retry_findings = [x for x in retry_findings if str(x).strip()][:40]
-                hard_fix_attempts.append({"attempt": vision_fix_used, "findings": retry_findings})
+	            while hard_findings and vision_fix_used < vision_fix_limit:
+	                vision_fix_used += 1
+	                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings + _hard_gate_retry_hints(hard_meta)))
+	                retry_findings = [x for x in retry_findings if str(x).strip()][:40]
+	                hard_fix_attempts.append({"attempt": vision_fix_used, "findings": retry_findings})
 
-                codex_fix = _codex_generate(execution_context, selected_draft, retry_findings, round_idx)
-                if not codex_fix.get("ok"):
-                    errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
-                    break
-                selected_draft = _preserve_nonempty_translation_maps(selected_draft, codex_fix["data"])
-                did_fix = True
+	                codex_fix = _codex_generate(execution_context, selected_draft, retry_findings, round_idx)
+	                if not codex_fix.get("ok"):
+	                    errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
+	                    break
+	                selected_draft = _preserve_nonempty_translation_maps(selected_draft, codex_fix["data"])
+	                if isinstance(codex_fix.get("call_meta"), dict):
+	                    selected_generator_meta = codex_fix["call_meta"]
+	                did_fix = True
 
-                if gemini_enabled:
-                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
-                    if gemini_final.get("ok"):
-                        gemini_data = gemini_final["data"]
-                    else:
+	                if gemini_enabled:
+	                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
+	                    if gemini_final.get("ok"):
+	                        gemini_data = gemini_final["data"]
+	                        if isinstance(gemini_final.get("call_meta"), dict):
+	                            selected_review_meta = gemini_final["call_meta"]
+	                    else:
                         _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
                         gemini_enabled = False
                         status_flags.append("degraded_single_model")
@@ -2393,16 +2773,22 @@ def run(meta: dict[str, Any], *, plan_only: bool = False) -> dict[str, Any]:
 
             selected_ref = _write_json(round_dir / "selected_output.json", selected_draft)
             gemini_ref = _write_json(round_dir / "gemini_review_selected.json", gemini_data)
-            rec = _round_record(
-                round_idx=round_idx,
-                codex_path=selected_ref,
-                gemini_path=gemini_ref,
-                codex_data=selected_draft,
-                gemini_data=gemini_data,
-            )
-            rec["selected_candidate"] = selected_source
-            rec["candidate_refs"] = candidate_refs
-            rec["candidate_review_refs"] = review_refs
+	            rec = _round_record(
+	                round_idx=round_idx,
+	                codex_path=selected_ref,
+	                gemini_path=gemini_ref,
+	                codex_data=selected_draft,
+	                gemini_data=gemini_data,
+	            )
+	            rec["generator"] = selected_generator_meta
+	            rec["reviewer"] = selected_review_meta
+	            rec["generator_model"] = str((selected_generator_meta.get("model") or "")).strip()
+	            rec["review_model"] = str((selected_review_meta.get("model") or "")).strip()
+	            rec["generator_agent_id"] = str((selected_generator_meta.get("agent_id") or "")).strip()
+	            rec["review_agent_id"] = str((selected_review_meta.get("agent_id") or "")).strip()
+	            rec["selected_candidate"] = selected_source
+	            rec["candidate_refs"] = candidate_refs
+	            rec["candidate_review_refs"] = review_refs
             rec["selection"] = selection_meta
             rec["hard_findings"] = hard_findings
             rec["warnings"] = hard_warnings
