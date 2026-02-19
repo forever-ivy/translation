@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gemini Vision or Kimi (Moonshot) QA for DOCX layout: format fidelity + aesthetics.
+"""Gemini, Kimi (Moonshot), or OpenAI vision QA for DOCX layout: format fidelity + aesthetics.
 
 This compares rendered page screenshots of the original/template DOCX and the translated DOCX.
 
@@ -277,22 +277,86 @@ def _compare_doc_visual_moonshot(original_png_b64: str, translated_png_b64: str)
     return result
 
 
+def _openai_chat_completions(*, api_key: str, model: str, prompt: str, images_b64: list[str]) -> str:
+    base_url = os.environ.get("OPENCLAW_OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+    url = f"{base_url}/chat/completions"
+    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for b64 in images_b64:
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}})
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": parts}],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "stream": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    if not isinstance(content, str):
+        content = str(content)
+    return content
+
+
+def _compare_doc_visual_openai(original_png_b64: str, translated_png_b64: str) -> dict[str, Any]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip() or _read_openclaw_api_key("openai-codex")
+    if not api_key:
+        raise RuntimeError("Missing OpenAI API key (OPENAI_API_KEY or OpenClaw openai-codex api_key profile).")
+    model = os.environ.get("OPENCLAW_OPENAI_VISION_MODEL", "").strip() or "openai-codex/gpt-5.2"
+    if "/" in model:
+        model = model.rsplit("/", 1)[-1]
+    raw = _openai_chat_completions(
+        api_key=api_key,
+        model=model,
+        prompt=_build_docx_qa_prompt(),
+        images_b64=[original_png_b64, translated_png_b64],
+    )
+    result = _extract_first_json_object(raw)
+
+    def _clamp(val: Any) -> float:
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, f))
+
+    result["format_fidelity_score"] = _clamp(result.get("format_fidelity_score", 0.0))
+    result["aesthetics_score"] = _clamp(result.get("aesthetics_score", 0.0))
+    return result
+
+
 def compare_doc_visual(original_png_b64: str, translated_png_b64: str) -> dict[str, Any]:
-    """Compare two document screenshots with Gemini Vision or Kimi (Moonshot).
+    """Compare two document screenshots with Gemini, Kimi (Moonshot), or OpenAI vision.
 
     Select provider via OPENCLAW_VISION_BACKEND:
       - gemini: require GOOGLE_API_KEY/GEMINI_API_KEY
       - moonshot/kimi: require MOONSHOT_API_KEY or OpenClaw moonshot auth profile
-      - auto (default): try Gemini then fallback to Moonshot if available
+      - openai: require OPENAI_API_KEY or OpenClaw openai-codex api_key profile
+      - auto (default): try Gemini then fallback to Moonshot/OpenAI if available
     """
     backend = os.environ.get("OPENCLAW_VISION_BACKEND", "auto").strip().lower()
     if backend in ("kimi", "moonshot"):
         return _compare_doc_visual_moonshot(original_png_b64, translated_png_b64)
     if backend in ("gemini", "google"):
         return _compare_doc_visual_gemini(original_png_b64, translated_png_b64)
+    if backend in ("openai", "openai-codex"):
+        return _compare_doc_visual_openai(original_png_b64, translated_png_b64)
 
     gemini_key_present = bool((os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip())
     moonshot_key_present = bool((os.environ.get("MOONSHOT_API_KEY") or "").strip() or _read_openclaw_api_key("moonshot"))
+    openai_key_present = bool((os.environ.get("OPENAI_API_KEY") or "").strip() or _read_openclaw_api_key("openai-codex"))
 
     if gemini_key_present:
         try:
@@ -300,14 +364,19 @@ def compare_doc_visual(original_png_b64: str, translated_png_b64: str) -> dict[s
         except Exception:
             if moonshot_key_present:
                 return _compare_doc_visual_moonshot(original_png_b64, translated_png_b64)
+            if openai_key_present:
+                return _compare_doc_visual_openai(original_png_b64, translated_png_b64)
             raise
 
     if moonshot_key_present:
         return _compare_doc_visual_moonshot(original_png_b64, translated_png_b64)
+    if openai_key_present:
+        return _compare_doc_visual_openai(original_png_b64, translated_png_b64)
 
     raise RuntimeError(
         "No vision credentials found. Set GOOGLE_API_KEY/GEMINI_API_KEY (Gemini) "
-        "or configure Moonshot (MOONSHOT_API_KEY or OpenClaw moonshot profile)."
+        "or configure Moonshot/OpenAI "
+        "(MOONSHOT_API_KEY/OPENAI_API_KEY or OpenClaw moonshot/openai-codex api_key profile)."
     )
 
 

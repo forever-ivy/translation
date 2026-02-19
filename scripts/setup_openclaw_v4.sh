@@ -3,11 +3,14 @@ set -euo pipefail
 
 ROOT_DIR="/Users/Code/workflow/translation"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$ROOT_DIR}"
-PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.2-codex}"
-FALLBACK_MODEL="${OPENCLAW_FALLBACK_MODEL:-google/gemini-2.5-pro}"
 KIMI_MODEL="${OPENCLAW_KIMI_MODEL:-moonshot/kimi-k2.5}"
+KIMI_ALT_MODEL="${OPENCLAW_KIMI_ALT_MODEL:-kimi-coding/k2p5}"
+PRIMARY_MODEL="${OPENCLAW_PRIMARY_MODEL:-openai-codex/gpt-5.2}"
+FALLBACK_MODEL="${OPENCLAW_FALLBACK_MODEL:-$KIMI_ALT_MODEL}"
+IMAGE_MODEL="${OPENCLAW_IMAGE_MODEL:-$PRIMARY_MODEL}"
 OPENCLAW_WORKSPACE_SKILL_ROOT="${OPENCLAW_WORKSPACE_SKILL_ROOT:-$HOME/.openclaw/workspace}"
 SKILL_LOCK_FILE="${SKILL_LOCK_FILE:-$ROOT_DIR/config/skill-lock.v6.json}"
+OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-$HOME/.openclaw/openclaw.json}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "ERROR: jq is required" >&2
@@ -19,14 +22,45 @@ ensure_agent() {
   local model_id="$2"
   if openclaw agents list --json 2>/dev/null | jq -e --arg id "$agent_id" '.[] | select(.id == $id)' >/dev/null; then
     echo "Agent exists: $agent_id"
-    return 0
+  else
+    openclaw agents add "$agent_id" \
+      --non-interactive \
+      --workspace "$WORKSPACE_DIR" \
+      --model "$model_id" \
+      --json >/dev/null
+    echo "Agent created: $agent_id"
   fi
-  openclaw agents add "$agent_id" \
-    --non-interactive \
-    --workspace "$WORKSPACE_DIR" \
-    --model "$model_id" \
-    --json >/dev/null
-  echo "Agent created: $agent_id"
+
+  if openclaw models --agent "$agent_id" set "$model_id" >/dev/null 2>&1; then
+    echo "Agent model set: $agent_id -> $model_id"
+  else
+    echo "WARN: failed to set model for $agent_id -> $model_id"
+  fi
+
+  force_agent_model_in_config "$agent_id" "$model_id"
+}
+
+force_agent_model_in_config() {
+  local agent_id="$1"
+  local model_id="$2"
+  [[ -z "$agent_id" || -z "$model_id" ]] && return 0
+  [[ ! -f "$OPENCLAW_CONFIG_PATH" ]] && return 0
+
+  local tmp
+  tmp="$(mktemp)"
+  if jq --arg id "$agent_id" --arg model "$model_id" '
+    if (.agents.list // [] | any(.id == $id)) then
+      .agents.list = ((.agents.list // []) | map(if .id == $id then .model = $model else . end))
+    else
+      .
+    end
+  ' "$OPENCLAW_CONFIG_PATH" > "$tmp"; then
+    mv "$tmp" "$OPENCLAW_CONFIG_PATH"
+    echo "Agent model forced in config: $agent_id -> $model_id"
+  else
+    rm -f "$tmp"
+    echo "WARN: failed to update $OPENCLAW_CONFIG_PATH for agent $agent_id"
+  fi
 }
 
 upsert_cron_job() {
@@ -77,27 +111,22 @@ install_community_skills_from_lock() {
 echo "Ensuring V4 agents..."
 ensure_agent "task-router" "$PRIMARY_MODEL"
 ensure_agent "translator-core" "$PRIMARY_MODEL"
-ensure_agent "review-core" "$FALLBACK_MODEL"
+ensure_agent "review-core" "$PRIMARY_MODEL"
 ensure_agent "qa-gate" "$PRIMARY_MODEL"
 
 GLM_MODEL="${OPENCLAW_GLM_MODEL:-zai/glm-5}"
 if [[ "${OPENCLAW_GLM_ENABLED:-0}" == "1" ]]; then
-  ensure_agent "glm-reviewer" "$GLM_MODEL"
+  ensure_agent "glm-reviewer" "$PRIMARY_MODEL"
 fi
 
 echo "Configuring model routing..."
 openclaw models set "$PRIMARY_MODEL"
 
-# Ensure the primary fallback is present without clobbering the whole list.
-if ! openclaw models fallbacks list --json 2>/dev/null | jq -e --arg m "$FALLBACK_MODEL" '(.fallbacks // []) | index($m) != null' >/dev/null; then
-  openclaw models fallbacks add "$FALLBACK_MODEL" || true
-fi
-
-# Insert/move Kimi fallback before any GLM fallbacks (zai/glm-*) while preserving order.
-if [[ -n "$KIMI_MODEL" ]]; then
+# Enforce Kimi-first fallback order (Kimi + Kimi alt first, GLM last) while preserving all other entries.
+if [[ -n "$KIMI_MODEL" || -n "$KIMI_ALT_MODEL" ]]; then
   FALLBACKS_JSON="$(openclaw models fallbacks list --json 2>/dev/null || echo '{"fallbacks": []}')"
   CURRENT_LIST="$(jq -c '(.fallbacks // [])' <<<"$FALLBACKS_JSON")"
-  DESIRED_LIST="$(jq -c --arg kimi "$KIMI_MODEL" '
+  DESIRED_LIST="$(jq -c --arg kimi "$KIMI_MODEL" --arg kimi_alt "$KIMI_ALT_MODEL" --arg fallback "$FALLBACK_MODEL" '
     def norm: map(tostring | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0));
     def dedupe:
       reduce .[] as $x ({"seen": {}, "out": []};
@@ -108,14 +137,16 @@ if [[ -n "$KIMI_MODEL" ]]; then
 
     (.fallbacks // [])
     | norm
-    | map(select(. != $kimi))
     | dedupe as $base
-    | ($base | map(startswith("zai/glm-")) | index(true)) as $i
-    | if $i == null then ($base + [$kimi]) else ($base[0:$i] + [$kimi] + $base[$i:]) end
+    | ($base | map(select(. != $kimi and . != $kimi_alt and . != $fallback))) as $rest
+    | ($rest | map(select(startswith("zai/glm-") | not))) as $non_glm
+    | ($rest | map(select(startswith("zai/glm-")))) as $glm
+    | ([ $kimi, $kimi_alt, $fallback ] | norm | dedupe) as $kimi_head
+    | ($kimi_head + $non_glm + $glm) | dedupe
   ' <<<"$FALLBACKS_JSON")"
 
   if [[ "$DESIRED_LIST" != "$CURRENT_LIST" ]]; then
-    echo "Updating OpenClaw fallbacks (Kimi before GLM)..."
+    echo "Updating OpenClaw fallbacks (Kimi defaults)..."
     openclaw models fallbacks clear || true
     while IFS= read -r model; do
       [[ -z "$model" ]] && continue
@@ -125,8 +156,11 @@ if [[ -n "$KIMI_MODEL" ]]; then
 fi
 
 # Configure image model for vision workflows (best-effort).
-if [[ -n "$KIMI_MODEL" ]]; then
-  openclaw models set-image "$KIMI_MODEL" || true
+if [[ -n "$IMAGE_MODEL" ]]; then
+  openclaw models set-image "$IMAGE_MODEL" || true
+  for agent in task-router translator-core review-core qa-gate glm-reviewer; do
+    openclaw models --agent "$agent" set-image "$IMAGE_MODEL" >/dev/null 2>&1 || true
+  done
 fi
 
 install_community_skills_from_lock

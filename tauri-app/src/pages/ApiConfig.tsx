@@ -446,14 +446,16 @@ export function ApiConfig() {
                     variant={
                       modelAvailabilityReport?.vision?.has_google_api_key ||
                       modelAvailabilityReport?.vision?.has_gemini_api_key ||
-                      modelAvailabilityReport?.vision?.has_moonshot_api_key
+                      modelAvailabilityReport?.vision?.has_moonshot_api_key ||
+                      modelAvailabilityReport?.vision?.has_openai_api_key
                         ? "success"
                         : "warning"
                     }
                   >
                     {modelAvailabilityReport?.vision?.has_google_api_key ||
                     modelAvailabilityReport?.vision?.has_gemini_api_key ||
-                    modelAvailabilityReport?.vision?.has_moonshot_api_key
+                    modelAvailabilityReport?.vision?.has_moonshot_api_key ||
+                    modelAvailabilityReport?.vision?.has_openai_api_key
                       ? "Configured"
                       : "Missing"}
                   </Badge>
@@ -462,7 +464,8 @@ export function ApiConfig() {
                   GOOGLE_API_KEY:{" "}
                   {modelAvailabilityReport?.vision?.has_google_api_key ? "set" : "missing"} • GEMINI_API_KEY:{" "}
                   {modelAvailabilityReport?.vision?.has_gemini_api_key ? "set" : "missing"} • Moonshot:{" "}
-                  {modelAvailabilityReport?.vision?.has_moonshot_api_key ? "set" : "missing"}
+                  {modelAvailabilityReport?.vision?.has_moonshot_api_key ? "set" : "missing"} • OPENAI_API_KEY:{" "}
+                  {modelAvailabilityReport?.vision?.has_openai_api_key ? "set" : "missing"}
                 </div>
                 {modelAvailabilityReport?.vision?.vision_backend && (
                   <div className="text-xs text-muted-foreground">

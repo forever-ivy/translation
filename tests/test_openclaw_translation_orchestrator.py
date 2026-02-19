@@ -15,6 +15,10 @@ from scripts.openclaw_translation_orchestrator import (
     _agent_call,
     _available_slots,
     _compact_knowledge_context,
+    _compact_xlsx_prompt_payload,
+    _count_xlsx_prompt_rows,
+    _cap_xlsx_prompt_rows,
+    _collect_translated_xlsx_keys,
     _codex_generate,
     _infer_language_pair_from_context,
     _trim_xlsx_prompt_text,
@@ -88,6 +92,18 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
         out = _agent_call("translator-core", "ping", timeout_seconds=90)
         self.assertTrue(out.get("ok"))
         self.assertEqual(out.get("text"), '{"hello": "world"}')
+
+    @patch("scripts.openclaw_translation_orchestrator.subprocess.run")
+    def test_agent_call_marks_model_request_too_large_as_error(self, mocked_run):
+        mocked_run.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"result":{"payloads":[{"text":"LLM request rejected: total message size 3400986 exceeds limit 2097152"}]}}',
+            stderr="",
+        )
+        out = _agent_call("translator-core", "ping", timeout_seconds=90)
+        self.assertFalse(out.get("ok"))
+        self.assertTrue(str(out.get("error") or "").startswith("agent_request_too_large:"))
 
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_revision_update_reaches_review_ready(self, mocked_call):
@@ -598,8 +614,119 @@ class PromptCompactionHelpersTest(unittest.TestCase):
         self.assertTrue(len(units[0]["text"]) <= 81)
         self.assertEqual(units[1]["text"], "short")
 
+    def test_trim_xlsx_prompt_text_rows_mode(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "a.xlsx",
+                        "rows": [
+                            ["S1", "A1", "B" * 260],
+                            ["S1", "A2", "short"],
+                        ],
+                    }
+                ]
+            }
+        }
+        trimmed = _trim_xlsx_prompt_text(context, max_chars_per_cell=80)
+        self.assertEqual(trimmed, 1)
+        rows = context["format_preserve"]["xlsx_sources"][0]["rows"]
+        self.assertTrue(len(rows[0][2]) <= 81)
+        self.assertEqual(rows[1][2], "short")
+
+    def test_compact_xlsx_prompt_payload_filters_translated_keys(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "a.xlsx",
+                        "path": "/tmp/a.xlsx",
+                        "meta": {"cell_count": 2},
+                        "cell_units": [
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "A1", "text": "first"},
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "A2", "text": "second"},
+                        ],
+                    }
+                ]
+            }
+        }
+        previous = {
+            "xlsx_translation_map": [
+                {"file": "a.xlsx", "sheet": "S1", "cell": "A1", "text": "FIRST"},
+            ]
+        }
+        translated = _collect_translated_xlsx_keys(previous)
+        self.assertIn(("a.xlsx", "S1", "A1"), translated)
+
+        stats = _compact_xlsx_prompt_payload(context, previous_payload=previous)
+        self.assertTrue(stats["changed"])
+        self.assertEqual(stats["total_rows"], 2)
+        self.assertEqual(stats["kept_rows"], 1)
+        self.assertEqual(stats["skipped_existing"], 1)
+        rows = context["format_preserve"]["xlsx_sources"][0]["rows"]
+        self.assertEqual(rows, [["S1", "A2", "second"]])
+
+    def test_cap_xlsx_prompt_rows(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {"file": "a.xlsx", "rows": [["S1", "A1", "x"], ["S1", "A2", "y"]]},
+                    {"file": "b.xlsx", "rows": [["S2", "B1", "z"]]},
+                ]
+            }
+        }
+        self.assertEqual(_count_xlsx_prompt_rows(context), 3)
+        kept = _cap_xlsx_prompt_rows(context, max_rows=2)
+        self.assertEqual(kept, 2)
+        self.assertEqual(_count_xlsx_prompt_rows(context), 2)
+
 
 class CodexGenerateFallbackTest(unittest.TestCase):
+    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_uses_fallback_agent_on_request_too_large(self, mocked_agent_call, mocked_kimi_call):
+        mocked_agent_call.side_effect = [
+            {
+                "ok": False,
+                "error": "agent_request_too_large:translator-core",
+                "detail": "LLM request rejected: total message size 3400986 exceeds limit 2097152",
+                "raw_text": "LLM request rejected: total message size 3400986 exceeds limit 2097152",
+            },
+            {
+                "ok": True,
+                "agent_id": "qa-gate",
+                "payload": {},
+                "text": json.dumps(
+                    {
+                        "final_text": "English output via fallback agent",
+                        "final_reflow_text": "English output via fallback agent",
+                        "docx_translation_map": [],
+                        "xlsx_translation_map": [],
+                        "review_brief_points": [],
+                        "change_log_points": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "codex_pass": True,
+                        "reasoning_summary": "ok",
+                    }
+                ),
+                "meta": {"provider": "moonshot", "model": "moonshot/kimi-k2.5"},
+            },
+        ]
+        mocked_kimi_call.return_value = {"ok": False, "error": "should_not_be_called"}
+
+        context = {
+            "task_intent": {"task_type": "SPREADSHEET_TRANSLATION"},
+            "subject": "Translate",
+            "message_text": "translate arabic to english",
+            "candidate_files": [],
+        }
+        out = _codex_generate(context, None, [], 1)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "moonshot")
+        self.assertEqual((out.get("call_meta") or {}).get("model"), "moonshot/kimi-k2.5")
+        mocked_kimi_call.assert_not_called()
+
     @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_codex_generate_uses_fallback_agent_before_direct_api(self, mocked_agent_call, mocked_kimi_call):
@@ -670,6 +797,49 @@ class CodexGenerateFallbackTest(unittest.TestCase):
                 {
                     "final_text": "English output",
                     "final_reflow_text": "English output",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "ok",
+                }
+            ),
+            "source": "direct_api_kimi",
+            "provider": "moonshot",
+            "model": "moonshot/kimi-k2.5",
+        }
+
+        context = {
+            "task_intent": {"task_type": "SPREADSHEET_TRANSLATION"},
+            "subject": "Translate",
+            "message_text": "translate arabic to english",
+            "candidate_files": [],
+        }
+        out = _codex_generate(context, None, [], 1)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "moonshot")
+        self.assertEqual((out.get("call_meta") or {}).get("model"), "moonshot/kimi-k2.5")
+        mocked_kimi_call.assert_called_once()
+
+    @patch("scripts.openclaw_translation_orchestrator._moonshot_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_falls_back_to_kimi_direct_api_on_json_parse_error(self, mocked_agent_call, mocked_kimi_call):
+        mocked_agent_call.return_value = {
+            "ok": True,
+            "agent_id": "translator-core",
+            "payload": {},
+            "text": "not a json payload",
+            "meta": {"provider": "kimi-coding", "model": "kimi-coding/k2p5"},
+        }
+        mocked_kimi_call.return_value = {
+            "ok": True,
+            "text": json.dumps(
+                {
+                    "final_text": "English output via direct kimi",
+                    "final_reflow_text": "English output via direct kimi",
                     "docx_translation_map": [],
                     "xlsx_translation_map": [],
                     "review_brief_points": [],

@@ -301,6 +301,7 @@ export interface VisionAvailability {
   has_google_api_key: boolean;
   has_gemini_api_key: boolean;
   has_moonshot_api_key: boolean;
+  has_openai_api_key: boolean;
   vision_backend?: string;
   vision_model?: string;
 }

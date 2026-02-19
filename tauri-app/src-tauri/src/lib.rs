@@ -207,6 +207,7 @@ pub struct VisionAvailability {
     pub has_google_api_key: bool,
     pub has_gemini_api_key: bool,
     pub has_moonshot_api_key: bool,
+    pub has_openai_api_key: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vision_backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -491,8 +492,15 @@ fn run_openclaw_json(args: &[&str]) -> Result<serde_json::Value, String> {
     serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse openclaw JSON output: {}", e))
 }
 
-fn compute_fallbacks_with_kimi_before_glm(current: Vec<String>, kimi_model: &str) -> Vec<String> {
+fn compute_fallbacks_with_kimi_defaults(
+    current: Vec<String>,
+    kimi_model: &str,
+    kimi_alt_model: &str,
+    fallback_model: &str,
+) -> Vec<String> {
     let kimi = kimi_model.trim();
+    let kimi_alt = kimi_alt_model.trim();
+    let fallback = fallback_model.trim();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
 
@@ -501,7 +509,10 @@ fn compute_fallbacks_with_kimi_before_glm(current: Vec<String>, kimi_model: &str
         if m.is_empty() {
             continue;
         }
-        if !kimi.is_empty() && m == kimi {
+        if (!kimi.is_empty() && m == kimi)
+            || (!kimi_alt.is_empty() && m == kimi_alt)
+            || (!fallback.is_empty() && m == fallback)
+        {
             continue;
         }
         if seen.insert(m.to_string()) {
@@ -509,19 +520,46 @@ fn compute_fallbacks_with_kimi_before_glm(current: Vec<String>, kimi_model: &str
         }
     }
 
-    if kimi.is_empty() {
+    let mut head: Vec<String> = Vec::new();
+    for model in [kimi, kimi_alt, fallback] {
+        if model.is_empty() {
+            continue;
+        }
+        if !head.iter().any(|m| m == model) {
+            head.push(model.to_string());
+        }
+    }
+
+    if head.is_empty() {
         return out;
     }
 
-    let glm_idx = out.iter().position(|m| m.starts_with("zai/glm-"));
-    match glm_idx {
-        Some(i) => out.insert(i, kimi.to_string()),
-        None => out.push(kimi.to_string()),
+    let mut non_glm: Vec<String> = Vec::new();
+    let mut glm: Vec<String> = Vec::new();
+    for model in out {
+        if model.starts_with("zai/glm-") {
+            glm.push(model);
+        } else {
+            non_glm.push(model);
+        }
     }
-    out
+
+    let mut desired: Vec<String> = Vec::new();
+    desired.extend(head);
+    desired.extend(non_glm);
+    desired.extend(glm);
+
+    let mut deduped: Vec<String> = Vec::new();
+    let mut dedup_seen: HashSet<String> = HashSet::new();
+    for model in desired {
+        if dedup_seen.insert(model.clone()) {
+            deduped.push(model);
+        }
+    }
+    deduped
 }
 
-fn apply_fallbacks(new_list: &[String]) -> Result<(), String> {
+fn run_openclaw_cmd(args: &[&str]) -> Result<(), String> {
     let bin = find_openclaw_bin().ok_or("OpenClaw not found in PATH or common locations")?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
     let path_env = format!(
@@ -530,35 +568,91 @@ fn apply_fallbacks(new_list: &[String]) -> Result<(), String> {
         home
     );
 
-    let run = |args: &[&str]| -> Result<(), String> {
-        let output = Command::new(&bin)
-            .args(args)
-            .env("HOME", &home)
-            .env("PATH", &path_env)
-            .output()
-            .map_err(|e| format!("Failed to run openclaw {:?}: {}", args, e))?;
+    let output = Command::new(&bin)
+        .args(args)
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .output()
+        .map_err(|e| format!("Failed to run openclaw {:?}: {}", args, e))?;
 
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
-            return Err(format!(
-                "openclaw {:?} exited with code {:?}: {}",
-                args,
-                output.status.code(),
-                detail
-            ));
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+        return Err(format!(
+            "openclaw {:?} exited with code {:?}: {}",
+            args,
+            output.status.code(),
+            detail
+        ));
+    }
+    Ok(())
+}
+
+fn set_agent_default_model(agent_id: &str, model: &str) -> Result<(), String> {
+    if agent_id.trim().is_empty() || model.trim().is_empty() {
+        return Ok(());
+    }
+    run_openclaw_cmd(&["models", "--agent", agent_id.trim(), "set", model.trim()])
+}
+
+fn set_agent_image_model(agent_id: &str, model: &str) -> Result<(), String> {
+    if agent_id.trim().is_empty() || model.trim().is_empty() {
+        return Ok(());
+    }
+    run_openclaw_cmd(&["models", "--agent", agent_id.trim(), "set-image", model.trim()])
+}
+
+fn force_agent_model_in_openclaw_config(agent_id: &str, model: &str) -> Result<(), String> {
+    if agent_id.trim().is_empty() || model.trim().is_empty() {
+        return Ok(());
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
+    let config_path = PathBuf::from(home).join(".openclaw").join("openclaw.json");
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read OpenClaw config {}: {}", config_path.display(), e))?;
+    let mut root: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse OpenClaw config JSON: {}", e))?;
+
+    let mut changed = false;
+    if let Some(list) = root
+        .get_mut("agents")
+        .and_then(|v| v.get_mut("list"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for item in list {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            if id == agent_id.trim() {
+                let cur = item.get("model").and_then(|v| v.as_str()).unwrap_or_default();
+                if cur != model.trim() {
+                    item["model"] = serde_json::Value::String(model.trim().to_string());
+                    changed = true;
+                }
+            }
         }
-        Ok(())
-    };
+    }
 
-    run(&["models", "fallbacks", "clear"])?;
+    if changed {
+        let text = serde_json::to_string_pretty(&root)
+            .map_err(|e| format!("Failed to serialize OpenClaw config JSON: {}", e))?;
+        fs::write(&config_path, text)
+            .map_err(|e| format!("Failed to write OpenClaw config {}: {}", config_path.display(), e))?;
+    }
+    Ok(())
+}
+
+fn apply_fallbacks(new_list: &[String]) -> Result<(), String> {
+    run_openclaw_cmd(&["models", "fallbacks", "clear"])?;
     for model in new_list {
         let m = model.trim();
         if m.is_empty() {
             continue;
         }
-        run(&["models", "fallbacks", "add", m])?;
+        run_openclaw_cmd(&["models", "fallbacks", "add", m])?;
     }
     Ok(())
 }
@@ -839,6 +933,11 @@ fn compute_model_availability_report_inner(state: &AppState) -> Result<ModelAvai
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
         || has_provider_profile(&translator_status, "moonshot", Some("api_key"));
+    let has_openai_api_key = env_map
+        .get("OPENAI_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || has_provider_profile(&translator_status, "openai-codex", Some("api_key"));
 
     let vision_backend = env_map
         .get("OPENCLAW_VISION_BACKEND")
@@ -857,6 +956,11 @@ fn compute_model_availability_report_inner(state: &AppState) -> Result<ModelAvai
             .or_else(|| env_map.get("OPENCLAW_KIMI_VISION_MODEL"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+    } else if backend_norm == "openai" || backend_norm == "openai-codex" {
+        env_map
+            .get("OPENCLAW_OPENAI_VISION_MODEL")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
     } else if backend_norm == "gemini" || backend_norm == "google" {
         env_map
             .get("OPENCLAW_GEMINI_VISION_MODEL")
@@ -873,6 +977,12 @@ fn compute_model_availability_report_inner(state: &AppState) -> Result<ModelAvai
             .or_else(|| env_map.get("OPENCLAW_KIMI_VISION_MODEL"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
+            .or_else(|| {
+                env_map
+                    .get("OPENCLAW_OPENAI_VISION_MODEL")
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
     };
 
     let glm_enabled = env_map
@@ -897,6 +1007,7 @@ fn compute_model_availability_report_inner(state: &AppState) -> Result<ModelAvai
             has_google_api_key,
             has_gemini_api_key,
             has_moonshot_api_key,
+            has_openai_api_key,
             vision_backend,
             vision_model,
         },
@@ -1051,11 +1162,17 @@ fn auto_fix_preflight(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>,
 	OPENCLAW_STRICT_ROUTER=0
 	OPENCLAW_REQUIRE_NEW=0
 	OPENCLAW_RAG_BACKEND=local
-	# Vision QA backend: auto | gemini | moonshot
-	OPENCLAW_VISION_BACKEND=auto
+	OPENCLAW_KIMI_MODEL=moonshot/kimi-k2.5
+	OPENCLAW_KIMI_ALT_MODEL=kimi-coding/k2p5
+	OPENCLAW_PRIMARY_MODEL=openai-codex/gpt-5.2
+	OPENCLAW_FALLBACK_MODEL=kimi-coding/k2p5
+	OPENCLAW_IMAGE_MODEL=openai-codex/gpt-5.2
+	# Vision QA backend: auto | gemini | moonshot | openai
+	OPENCLAW_VISION_BACKEND=openai
 	# Optional model overrides:
 	# OPENCLAW_GEMINI_VISION_MODEL=gemini-3-pro
 	# OPENCLAW_MOONSHOT_VISION_MODEL=moonshot/kimi-k2.5
+	# OPENCLAW_OPENAI_VISION_MODEL=openai-codex/gpt-5.2
 	"#;
 	        let _ = fs::write(&env_path, template);
 	    }
@@ -1086,6 +1203,33 @@ fn auto_fix_preflight(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>,
                 .cloned()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "moonshot/kimi-k2.5".to_string());
+            let kimi_alt_model = env_map
+                .get("OPENCLAW_KIMI_ALT_MODEL")
+                .cloned()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "kimi-coding/k2p5".to_string());
+            let primary_model = env_map
+                .get("OPENCLAW_PRIMARY_MODEL")
+                .cloned()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "openai-codex/gpt-5.2".to_string());
+            let image_model = env_map
+                .get("OPENCLAW_IMAGE_MODEL")
+                .cloned()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| primary_model.clone());
+            let fallback_model = env_map
+                .get("OPENCLAW_FALLBACK_MODEL")
+                .cloned()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| kimi_alt_model.clone());
+
+            // Enforce configured defaults for global model and core agents.
+            let _ = run_openclaw_cmd(&["models", "set", primary_model.as_str()]);
+            for agent in ["task-router", "translator-core", "review-core", "qa-gate", "glm-reviewer"] {
+                let _ = set_agent_default_model(agent, primary_model.as_str());
+                let _ = force_agent_model_in_openclaw_config(agent, primary_model.as_str());
+            }
 
 	            if let Ok(json) = run_openclaw_json(&["models", "fallbacks", "list", "--json"]) {
                 let current: Vec<String> = json
@@ -1098,25 +1242,22 @@ fn auto_fix_preflight(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>,
                     })
                     .unwrap_or_default();
 
-	                let desired = compute_fallbacks_with_kimi_before_glm(current.clone(), &kimi_model);
+	                let desired = compute_fallbacks_with_kimi_defaults(
+                        current.clone(),
+                        &kimi_model,
+                        &kimi_alt_model,
+                        &fallback_model,
+                    );
 	                if desired != current {
 	                    let _ = apply_fallbacks(&desired);
 	                }
 	            }
 
-	            // Best-effort: align the image model with Kimi for vision workflows.
-	            let _ = Command::new(&bin)
-	                .args(["models", "set-image", kimi_model.as_str()])
-	                .env("HOME", &home)
-	                .env(
-	                    "PATH",
-	                    format!(
-	                        "{}:{}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-	                        std::env::var("PATH").unwrap_or_default(),
-	                        home
-	                    ),
-	                )
-	                .status();
+	            // Best-effort: align image model defaults for vision workflows.
+	            let _ = run_openclaw_cmd(&["models", "set-image", image_model.as_str()]);
+            for agent in ["task-router", "translator-core", "review-core", "qa-gate", "glm-reviewer"] {
+                let _ = set_agent_image_model(agent, image_model.as_str());
+            }
 	        }
 	    }
 
@@ -1227,6 +1368,10 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
         .get("MOONSHOT_API_KEY")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
+    let vision_has_openai_env = env_map
+        .get("OPENAI_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
     let glm_enabled = env_map
         .get("OPENCLAW_GLM_ENABLED")
         .map(|v| v.trim() == "1")
@@ -1241,6 +1386,11 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
         || report
             .as_ref()
             .map(|r| r.vision.has_moonshot_api_key)
+            .unwrap_or(false);
+    let vision_has_openai = vision_has_openai_env
+        || report
+            .as_ref()
+            .map(|r| r.vision.has_openai_api_key)
             .unwrap_or(false);
 
     // translator-core model route (required)
@@ -1311,15 +1461,15 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
     checks.push(PreflightCheck {
         name: "Vision QA Keys".to_string(),
         key: "vision_keys".to_string(),
-        status: if vision_has_google || vision_has_gemini || vision_has_moonshot {
+        status: if vision_has_google || vision_has_gemini || vision_has_moonshot || vision_has_openai {
             "pass".to_string()
         } else {
             "warning".to_string()
         },
-        message: if vision_has_google || vision_has_gemini || vision_has_moonshot {
+        message: if vision_has_google || vision_has_gemini || vision_has_moonshot || vision_has_openai {
             "Vision QA credentials configured.".to_string()
         } else {
-            "Missing vision credentials (Gemini or Moonshot); Format QA will be skipped.".to_string()
+            "Missing vision credentials (Gemini, Moonshot, or OpenAI); Format QA will be skipped.".to_string()
         },
     });
 
@@ -2468,18 +2618,24 @@ mod tests {
     }
 
     #[test]
-    fn fallbacks_inserts_kimi_before_first_glm() {
+    fn fallbacks_place_kimi_models_first_and_glm_last() {
         let current = vec![
             "google-antigravity/gemini-3-pro-high".to_string(),
             "zai/glm-5".to_string(),
             "zai/glm-4.6v".to_string(),
         ];
-        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        let desired = compute_fallbacks_with_kimi_defaults(
+            current,
+            "moonshot/kimi-k2.5",
+            "kimi-coding/k2p5",
+            "kimi-coding/k2p5",
+        );
         assert_eq!(
             desired,
             vec![
-                "google-antigravity/gemini-3-pro-high".to_string(),
                 "moonshot/kimi-k2.5".to_string(),
+                "kimi-coding/k2p5".to_string(),
+                "google-antigravity/gemini-3-pro-high".to_string(),
                 "zai/glm-5".to_string(),
                 "zai/glm-4.6v".to_string(),
             ]
@@ -2487,35 +2643,48 @@ mod tests {
     }
 
     #[test]
-    fn fallbacks_appends_kimi_when_no_glm() {
+    fn fallbacks_keep_non_glm_order_after_kimi_defaults() {
         let current = vec!["openai-codex/gpt-5.2".to_string(), "google/gemini-2.5-pro".to_string()];
-        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        let desired = compute_fallbacks_with_kimi_defaults(
+            current,
+            "moonshot/kimi-k2.5",
+            "kimi-coding/k2p5",
+            "kimi-coding/k2p5",
+        );
         assert_eq!(
             desired,
             vec![
+                "moonshot/kimi-k2.5".to_string(),
+                "kimi-coding/k2p5".to_string(),
                 "openai-codex/gpt-5.2".to_string(),
                 "google/gemini-2.5-pro".to_string(),
-                "moonshot/kimi-k2.5".to_string(),
             ]
         );
     }
 
     #[test]
-    fn fallbacks_moves_existing_kimi_before_glm_without_duplication() {
+    fn fallbacks_moves_existing_kimi_models_without_duplication() {
         let current = vec![
             "openai-codex/gpt-5.2".to_string(),
             "zai/glm-5".to_string(),
             "moonshot/kimi-k2.5".to_string(),
+            "kimi-coding/k2p5".to_string(),
             "google/gemini-2.5-pro".to_string(),
         ];
-        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        let desired = compute_fallbacks_with_kimi_defaults(
+            current,
+            "moonshot/kimi-k2.5",
+            "kimi-coding/k2p5",
+            "kimi-coding/k2p5",
+        );
         assert_eq!(
             desired,
             vec![
-                "openai-codex/gpt-5.2".to_string(),
                 "moonshot/kimi-k2.5".to_string(),
-                "zai/glm-5".to_string(),
+                "kimi-coding/k2p5".to_string(),
+                "openai-codex/gpt-5.2".to_string(),
                 "google/gemini-2.5-pro".to_string(),
+                "zai/glm-5".to_string(),
             ]
         );
     }
@@ -2525,15 +2694,22 @@ mod tests {
         let current = vec![
             "openai-codex/gpt-5.2".to_string(),
             "openai-codex/gpt-5.2".to_string(),
+            "kimi-coding/k2p5".to_string(),
             "zai/glm-5".to_string(),
             "zai/glm-5".to_string(),
         ];
-        let desired = compute_fallbacks_with_kimi_before_glm(current, "moonshot/kimi-k2.5");
+        let desired = compute_fallbacks_with_kimi_defaults(
+            current,
+            "moonshot/kimi-k2.5",
+            "kimi-coding/k2p5",
+            "kimi-coding/k2p5",
+        );
         assert_eq!(
             desired,
             vec![
-                "openai-codex/gpt-5.2".to_string(),
                 "moonshot/kimi-k2.5".to_string(),
+                "kimi-coding/k2p5".to_string(),
+                "openai-codex/gpt-5.2".to_string(),
                 "zai/glm-5".to_string(),
             ]
         );

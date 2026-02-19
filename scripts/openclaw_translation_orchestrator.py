@@ -165,8 +165,10 @@ TASK_TOOL_INSTRUCTIONS: dict[str, str] = {
         "numbers, formulas, or cell references. Keep column/row alignment intact. "
         "Translate headers and text cells only. "
         "CRITICAL: If execution_context.format_preserve.xlsx_sources is present, you MUST translate "
-        "every cell listed in xlsx_sources[].cell_units (even if the sheet notes say a column "
-        "\"auto-populates\"). Do not omit any provided (file, sheet, cell)."
+        "every cell listed in xlsx_sources[].cell_units OR xlsx_sources[].rows "
+        "(even if the sheet notes say a column \"auto-populates\"). "
+        "In rows mode, each row is [sheet, cell, source_text]. "
+        "Do not omit any provided (file, sheet, cell)."
     ),
     "FORMAT_CRITICAL_TASK": (
         "Structural fidelity is the top priority. Preserve all headings, numbering, "
@@ -198,6 +200,15 @@ if OPENCLAW_TRANSLATION_THINKING not in VALID_THINKING_LEVELS:
     OPENCLAW_TRANSLATION_THINKING = "high"
 INTENT_CLASSIFIER_MODE = os.getenv("OPENCLAW_INTENT_CLASSIFIER_MODE", "hybrid").strip().lower() or "hybrid"
 OPENCLAW_AGENT_MESSAGE_MAX_BYTES = max(300000, int(os.getenv("OPENCLAW_AGENT_MESSAGE_MAX_BYTES", "1800000")))
+OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES = max(500000, int(os.getenv("OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES", "2097152")))
+OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES = max(0, int(os.getenv("OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES", "1300000")))
+OPENCLAW_AGENT_PROMPT_MAX_BYTES = max(
+    20000,
+    min(
+        OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
+        OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES - OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES,
+    ),
+)
 OPENCLAW_KB_CONTEXT_MAX_HITS = max(0, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_HITS", "6")))
 OPENCLAW_KB_CONTEXT_MAX_CHARS = max(120, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_CHARS", "1200")))
 OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS = max(40, int(os.getenv("OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS", "160")))
@@ -840,18 +851,181 @@ def _trim_xlsx_prompt_text(context_payload: dict[str, Any], *, max_chars_per_cel
         if not isinstance(src, dict):
             continue
         units = src.get("cell_units")
-        if not isinstance(units, list):
-            continue
-        for unit in units:
-            if not isinstance(unit, dict):
-                continue
-            text = unit.get("text")
-            if not isinstance(text, str):
-                continue
-            if len(text) > max_chars_per_cell:
-                unit["text"] = _truncate_text(text, max_chars=max_chars_per_cell)
-                trimmed += 1
+        if isinstance(units, list):
+            for unit in units:
+                if not isinstance(unit, dict):
+                    continue
+                text = unit.get("text")
+                if not isinstance(text, str):
+                    continue
+                if len(text) > max_chars_per_cell:
+                    unit["text"] = _truncate_text(text, max_chars=max_chars_per_cell)
+                    trimmed += 1
+        rows = src.get("rows")
+        if isinstance(rows, list):
+            for idx, row in enumerate(rows):
+                if isinstance(row, list) and len(row) >= 3 and isinstance(row[2], str):
+                    if len(row[2]) > max_chars_per_cell:
+                        rows[idx][2] = _truncate_text(row[2], max_chars=max_chars_per_cell)
+                        trimmed += 1
+                elif isinstance(row, dict) and isinstance(row.get("text"), str):
+                    text = str(row.get("text") or "")
+                    if len(text) > max_chars_per_cell:
+                        row["text"] = _truncate_text(text, max_chars=max_chars_per_cell)
+                        trimmed += 1
     return trimmed
+
+
+def _normalize_xlsx_key(file_name: str, sheet: str, cell: str) -> tuple[str, str, str]:
+    return (
+        str(file_name or "").strip(),
+        str(sheet or "").strip(),
+        str(cell or "").strip().upper(),
+    )
+
+
+def _collect_translated_xlsx_keys(previous_payload: dict[str, Any] | None) -> set[tuple[str, str, str]]:
+    keys: set[tuple[str, str, str]] = set()
+    if not isinstance(previous_payload, dict):
+        return keys
+    entries = previous_payload.get("xlsx_translation_map")
+    if not isinstance(entries, list):
+        return keys
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        file_name = str(item.get("file") or "").strip()
+        sheet = str(item.get("sheet") or "").strip()
+        cell = str(item.get("cell") or "").strip()
+        if not sheet or not cell:
+            continue
+        keys.add(_normalize_xlsx_key(file_name, sheet, cell))
+    return keys
+
+
+def _count_xlsx_prompt_rows(context_payload: dict[str, Any]) -> int:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return 0
+    sources = preserve.get("xlsx_sources")
+    if not isinstance(sources, list):
+        return 0
+    total = 0
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        rows = src.get("rows")
+        if isinstance(rows, list):
+            total += len(rows)
+            continue
+        units = src.get("cell_units")
+        if isinstance(units, list):
+            total += len(units)
+    return total
+
+
+def _cap_xlsx_prompt_rows(context_payload: dict[str, Any], *, max_rows: int) -> int:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return 0
+    sources = preserve.get("xlsx_sources")
+    if not isinstance(sources, list):
+        return 0
+
+    keep = max(1, int(max_rows))
+    kept = 0
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        rows = src.get("rows")
+        if isinstance(rows, list):
+            remaining = keep - kept
+            if remaining <= 0:
+                src["rows"] = []
+                continue
+            if len(rows) > remaining:
+                src["rows"] = rows[:remaining]
+            kept += min(len(src.get("rows") or []), remaining)
+    return kept
+
+
+def _compact_xlsx_prompt_payload(
+    context_payload: dict[str, Any],
+    *,
+    previous_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return {"changed": False, "total_rows": 0, "kept_rows": 0, "skipped_existing": 0}
+    sources = preserve.get("xlsx_sources")
+    if not isinstance(sources, list):
+        return {"changed": False, "total_rows": 0, "kept_rows": 0, "skipped_existing": 0}
+
+    translated_keys = _collect_translated_xlsx_keys(previous_payload)
+    compact_sources: list[dict[str, Any]] = []
+    total_rows = 0
+    kept_rows = 0
+    skipped_existing = 0
+    changed = False
+
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        file_name = str(src.get("file") or "").strip()
+        rows_out: list[list[str]] = []
+        pending_rows: list[list[str]] = []
+        existing_rows: list[list[str]] = []
+
+        rows = src.get("rows")
+        if isinstance(rows, list):
+            iter_rows = rows
+        else:
+            iter_rows = src.get("cell_units") if isinstance(src.get("cell_units"), list) else []
+
+        for item in iter_rows:
+            sheet = ""
+            cell = ""
+            text = ""
+            if isinstance(item, list) and len(item) >= 3:
+                sheet = str(item[0] or "").strip()
+                cell = str(item[1] or "").strip()
+                text = str(item[2] or "")
+            elif isinstance(item, dict):
+                sheet = str(item.get("sheet") or "").strip()
+                cell = str(item.get("cell") or "").strip()
+                text = str(item.get("text") or "")
+                if not file_name:
+                    file_name = str(item.get("file") or "").strip()
+            if not sheet or not cell:
+                continue
+            total_rows += 1
+            row = [sheet, cell.upper(), text]
+            key_with_file = _normalize_xlsx_key(file_name, row[0], row[1])
+            key_no_file = _normalize_xlsx_key("", row[0], row[1])
+            if translated_keys and (key_with_file in translated_keys or key_no_file in translated_keys):
+                existing_rows.append(row)
+                skipped_existing += 1
+            else:
+                pending_rows.append(row)
+
+        selected_rows = pending_rows if pending_rows else existing_rows
+        if selected_rows:
+            rows_out.extend(selected_rows)
+            kept_rows += len(selected_rows)
+
+        compact_source = {"file": file_name, "rows": rows_out}
+        if rows_out:
+            compact_sources.append(compact_source)
+        if "path" in src or "meta" in src or "cell_units" in src or "rows" in src:
+            changed = True
+
+    preserve["xlsx_sources"] = compact_sources
+    return {
+        "changed": changed,
+        "total_rows": total_rows,
+        "kept_rows": kept_rows,
+        "skipped_existing": skipped_existing,
+    }
 
 
 def _compact_previous_draft_for_prompt(previous_payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -1291,6 +1465,16 @@ def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD
 
     text = _extract_openclaw_payload_text(payload)
     meta = _extract_openclaw_payload_model(payload)
+    if _looks_like_model_request_too_large(text):
+        return {
+            "ok": False,
+            "error": f"agent_request_too_large:{agent_id}",
+            "detail": text[:2000],
+            "raw_text": text,
+            "agent_id": agent_id,
+            "payload": payload,
+            "meta": meta,
+        }
     return {"ok": True, "agent_id": agent_id, "payload": payload, "text": text, "meta": meta}
 
 
@@ -1626,7 +1810,7 @@ Rules:
 - Follow the tool instructions above for this specific task type.
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
-- If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
 - FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
@@ -1638,6 +1822,7 @@ Rules:
 
     context_for_prompt = copy.deepcopy(context)
     previous_for_prompt = copy.deepcopy(previous_draft or {})
+    prompt_max_bytes = OPENCLAW_AGENT_PROMPT_MAX_BYTES
     prompt = _render_prompt(
         context_payload=context_for_prompt,
         previous_payload=previous_for_prompt,
@@ -1646,7 +1831,7 @@ Rules:
     prompt_bytes = len(prompt.encode("utf-8"))
     compactions: list[str] = []
 
-    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES:
+    if prompt_bytes > prompt_max_bytes:
         context_for_prompt["knowledge_context"] = []
         context_for_prompt["cross_job_memories"] = []
         compactions.append("drop_knowledge_context")
@@ -1657,7 +1842,7 @@ Rules:
         )
         prompt_bytes = len(prompt.encode("utf-8"))
 
-    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES and task_type == "SPREADSHEET_TRANSLATION":
+    if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
         trimmed_cells = _trim_xlsx_prompt_text(
             context_for_prompt,
             max_chars_per_cell=OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS,
@@ -1671,7 +1856,40 @@ Rules:
             )
             prompt_bytes = len(prompt.encode("utf-8"))
 
-    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES and previous_for_prompt:
+    if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
+        compact_stats = _compact_xlsx_prompt_payload(
+            context_for_prompt,
+            previous_payload=previous_for_prompt,
+        )
+        if compact_stats.get("changed"):
+            compactions.append(
+                "compact_xlsx_rows:"
+                f"{int(compact_stats.get('kept_rows') or 0)}/{int(compact_stats.get('total_rows') or 0)}"
+            )
+            prompt = _render_prompt(
+                context_payload=context_for_prompt,
+                previous_payload=previous_for_prompt,
+                revision_section=revision_context_section,
+            )
+            prompt_bytes = len(prompt.encode("utf-8"))
+
+    if prompt_bytes > prompt_max_bytes and task_type == "SPREADSHEET_TRANSLATION":
+        total_rows = _count_xlsx_prompt_rows(context_for_prompt)
+        shrink_round = 0
+        while prompt_bytes > prompt_max_bytes and total_rows > 1 and shrink_round < 8:
+            target_rows = max(1, int(total_rows * 0.7))
+            kept = _cap_xlsx_prompt_rows(context_for_prompt, max_rows=target_rows)
+            compactions.append(f"cap_xlsx_rows:{kept}/{total_rows}")
+            prompt = _render_prompt(
+                context_payload=context_for_prompt,
+                previous_payload=previous_for_prompt,
+                revision_section=revision_context_section,
+            )
+            prompt_bytes = len(prompt.encode("utf-8"))
+            total_rows = _count_xlsx_prompt_rows(context_for_prompt)
+            shrink_round += 1
+
+    if prompt_bytes > prompt_max_bytes and previous_for_prompt:
         previous_for_prompt, changed = _compact_previous_draft_for_prompt(previous_for_prompt)
         if changed:
             compactions.append("compact_previous_draft")
@@ -1685,7 +1903,7 @@ Rules:
     if compactions:
         context_for_prompt["prompt_compaction"] = {
             "applied": compactions,
-            "max_bytes": OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
+            "max_bytes": prompt_max_bytes,
         }
         prompt = _render_prompt(
             context_payload=context_for_prompt,
@@ -1694,13 +1912,16 @@ Rules:
         )
         prompt_bytes = len(prompt.encode("utf-8"))
 
-    if prompt_bytes > OPENCLAW_AGENT_MESSAGE_MAX_BYTES:
+    if prompt_bytes > prompt_max_bytes:
         return {
             "ok": False,
             "error": "prompt_too_large",
             "detail": {
                 "bytes": prompt_bytes,
-                "max_bytes": OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
+                "max_bytes": prompt_max_bytes,
+                "configured_agent_message_max_bytes": OPENCLAW_AGENT_MESSAGE_MAX_BYTES,
+                "provider_total_limit_bytes": OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES,
+                "reserved_overhead_bytes": OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES,
                 "compactions": compactions,
             },
             "raw_text": "",
@@ -1756,10 +1977,34 @@ Rules:
                 detail["fallback_errors"] = fallback_errors
             return {"ok": False, "error": call.get("error"), "detail": detail, "raw_text": raw_text}
 
+    parse_error: str | None = None
     try:
         parsed = _extract_json_from_text(str(call.get("text", "")))
     except Exception as exc:
-        return {"ok": False, "error": "codex_json_parse_failed", "detail": str(exc), "raw_text": call.get("text", "")}
+        parse_error = str(exc)
+        parsed = None
+
+    if parsed is None and _env_flag("OPENCLAW_KIMI_DIRECT_FALLBACK_ENABLED", "1"):
+        # If the routed model produced non-JSON output, retry once via direct Kimi API
+        # (JSON-object mode) before declaring hard failure.
+        kimi_call = _moonshot_direct_api_call(prompt)
+        if kimi_call.get("ok"):
+            try:
+                parsed = _extract_json_from_text(str(kimi_call.get("text", "")))
+                call = kimi_call
+            except Exception as kimi_exc:
+                parse_error = f"{parse_error}; kimi_direct_parse_failed:{kimi_exc}" if parse_error else f"kimi_direct_parse_failed:{kimi_exc}"
+        else:
+            kimi_err = str(kimi_call.get("error") or "kimi_direct_failed")
+            parse_error = f"{parse_error}; kimi_direct_failed:{kimi_err}" if parse_error else f"kimi_direct_failed:{kimi_err}"
+
+    if parsed is None:
+        return {
+            "ok": False,
+            "error": "codex_json_parse_failed",
+            "detail": parse_error or "invalid_json_payload",
+            "raw_text": call.get("text", ""),
+        }
 
     call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
     if isinstance(call, dict) and call.get("agent_id"):
@@ -1958,6 +2203,15 @@ def _looks_like_provider_schema_error(text: str) -> bool:
     )
 
 
+def _looks_like_model_request_too_large(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return (
+        "llm request rejected" in lowered
+        and "total message size" in lowered
+        and "exceeds limit" in lowered
+    )
+
+
 def _moonshot_direct_api_call(prompt: str) -> dict[str, Any]:
     import urllib.request
 
@@ -2091,7 +2345,7 @@ Rules:
 - Follow the tool instructions above for this specific task type.
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
-- If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell).
+- If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
 - FOR REVISION_UPDATE: You MUST copy texts from PRESERVED_TEXT_MAP exactly for unchanged sections. Do not modify preserved texts.
