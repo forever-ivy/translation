@@ -3,7 +3,18 @@
     "allow": [
       "Bash(openclaw health:*)",
       "Bash(echo:*)",
-      "Bash(/Users/ivy/.local/bin/openclaw health:*)"
+      "Bash(/Users/ivy/.local/bin/openclaw health:*)",
+      "Bash(openclaw models status:*)",
+      "Bash(openclaw auth status:*)",
+      "Bash(openclaw run:*)",
+      "Bash(openclaw --help:*)",
+      "Bash(openclaw models --help:*)",
+      "Bash(openclaw models auth --help:*)",
+      "Bash(openclaw agent --help:*)",
+      "Bash(openclaw agent:*)",
+      "Bash(openclaw models auth login:*)",
+      "Bash(openclaw models auth:*)",
+      "Bash(openclaw:*)"
     ]
   }
 }
