@@ -999,6 +999,19 @@ def claim_next_queued(conn: sqlite3.Connection, *, worker_id: str) -> dict[str, 
         if updated != 1:
             conn.execute("ROLLBACK")
             return None
+
+        # Keep top-level job status in sync with queue execution state so UI/status
+        # does not show "planned" while queue is already running.
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status='running',
+                updated_at=?
+            WHERE job_id=?
+              AND status IN ('queued', 'planned')
+            """,
+            (now, str(row["job_id"] or "").strip()),
+        )
         conn.execute("COMMIT")
     except Exception:
         try:
@@ -1060,7 +1073,7 @@ def finish_queue_item(
         job_id = str(row["job_id"] or "").strip() if row else ""
         if job_id:
             job = get_job(conn, job_id)
-            if job and str(job.get("status") or "").strip().lower() in {"queued", "running"}:
+            if job and str(job.get("status") or "").strip().lower() in {"planned", "queued", "running"}:
                 token = (last_error or "").strip() or ("queue_failed" if state_norm == "failed" else "canceled")
                 errors = list(job.get("errors_json") or [])
                 tag = f"queue_{state_norm}:{token}"
@@ -1161,7 +1174,7 @@ def requeue_stuck_running(
             changed += 1
             if job_id:
                 job = get_job(conn, job_id)
-                if job and str(job.get("status") or "").strip().lower() in {"queued", "running"}:
+                if job and str(job.get("status") or "").strip().lower() in {"planned", "queued", "running"}:
                     errors = list(job.get("errors_json") or [])
                     tag = f"queue_canceled:stuck_canceled:{age:.0f}s"
                     if tag not in errors:
@@ -1184,7 +1197,7 @@ def requeue_stuck_running(
             changed += 1
             if job_id:
                 job = get_job(conn, job_id)
-                if job and str(job.get("status") or "").strip().lower() in {"queued", "running"}:
+                if job and str(job.get("status") or "").strip().lower() in {"planned", "queued", "running"}:
                     errors = list(job.get("errors_json") or [])
                     tag = f"queue_failed:stuck_timeout:{age:.0f}s"
                     if tag not in errors:

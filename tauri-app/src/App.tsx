@@ -68,7 +68,7 @@ function App() {
     <div className="flex h-screen bg-background overflow-hidden">
       <Sidebar />
       <main className="flex-1 overflow-y-auto overflow-x-hidden overscroll-none bg-gradient-to-br from-background via-background to-accent/5">
-        <AnimatePresence mode="wait">
+        <AnimatePresence mode="sync">
           <motion.div
             key={activeTab}
             variants={pageVariants}

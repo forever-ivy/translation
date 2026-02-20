@@ -212,6 +212,8 @@ interface AppState {
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+let servicesFetchInFlight = false;
+const logsFetchInFlight: Record<string, boolean> = {};
 
 export const useAppStore = create<AppState>((set, get) => ({
   // Services
@@ -376,6 +378,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   // Async Actions
   fetchServices: async () => {
+    if (servicesFetchInFlight) return;
+    servicesFetchInFlight = true;
     try {
       const services = await tauri.getServiceStatus();
       set({
@@ -388,7 +392,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         })),
       });
     } catch (err) {
-      get().addToast("error", `Failed to fetch services: ${err}`);
+      // Polling path: keep this silent to avoid toast storms when backend is slow.
+      console.warn("fetchServices failed:", err);
+    } finally {
+      servicesFetchInFlight = false;
     }
   },
 
@@ -672,6 +679,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   fetchLogs: async (service: string, lines = 100) => {
+    const key = `${service}:${lines}`;
+    if (logsFetchInFlight[key]) return;
+    logsFetchInFlight[key] = true;
     try {
       const logLines = await tauri.readLogFile(service, lines);
       const logs = logLines.map((line) => {
@@ -716,7 +726,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
       set({ logs, selectedLogService: service });
     } catch (err) {
-      get().addToast("error", `Failed to fetch logs: ${err}`);
+      // High-frequency refresh path: avoid user-facing toast spam.
+      console.warn(`fetchLogs failed for ${service}:`, err);
+    } finally {
+      logsFetchInFlight[key] = false;
     }
   },
 

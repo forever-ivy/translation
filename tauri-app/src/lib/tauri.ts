@@ -1,5 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
 
+const INVOKE_DEFAULT_TIMEOUT_MS = 15000;
+
+function tInvoke<T>(
+  command: string,
+  args?: Record<string, unknown>,
+  timeoutMs: number = INVOKE_DEFAULT_TIMEOUT_MS,
+): Promise<T> {
+  const invokePromise = invoke<T>(command, args);
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    const id = window.setTimeout(() => {
+      reject(new Error(`Command timeout: ${command} (${timeoutMs}ms)`));
+    }, Math.max(1000, timeoutMs));
+    invokePromise.finally(() => window.clearTimeout(id));
+  });
+  return Promise.race([invokePromise, timeoutPromise]);
+}
+
 // ============================================================================
 // Types matching Rust structs
 // ============================================================================
@@ -131,98 +148,98 @@ export interface DockerContainer {
 // ============================================================================
 
 export const getServiceStatus = (): Promise<ServiceStatus[]> =>
-  invoke<ServiceStatus[]>("get_service_status");
+  tInvoke<ServiceStatus[]>("get_service_status");
 
 export const startAllServices = (): Promise<ServiceStatus[]> =>
-  invoke<ServiceStatus[]>("start_all_services");
+  tInvoke<ServiceStatus[]>("start_all_services");
 
 export const stopAllServices = (): Promise<void> =>
-  invoke<void>("stop_all_services");
+  tInvoke<void>("stop_all_services");
 
 export const restartAllServices = (): Promise<ServiceStatus[]> =>
-  invoke<ServiceStatus[]>("restart_all_services");
+  tInvoke<ServiceStatus[]>("restart_all_services");
 
 export const startService = (serviceId: string): Promise<ServiceStatus[]> =>
-  invoke<ServiceStatus[]>("start_service", { serviceId });
+  tInvoke<ServiceStatus[]>("start_service", { serviceId });
 
 export const stopService = (serviceId: string): Promise<ServiceStatus[]> =>
-  invoke<ServiceStatus[]>("stop_service", { serviceId });
+  tInvoke<ServiceStatus[]>("stop_service", { serviceId });
 
 export const restartService = (serviceId: string): Promise<ServiceStatus[]> =>
-  invoke<ServiceStatus[]>("restart_service", { serviceId });
+  tInvoke<ServiceStatus[]>("restart_service", { serviceId });
 
 // ============================================================================
 // Preflight Commands
 // ============================================================================
 
 export const runPreflightCheck = (): Promise<PreflightCheck[]> =>
-  invoke<PreflightCheck[]>("run_preflight_check");
+  tInvoke<PreflightCheck[]>("run_preflight_check");
 
 export const autoFixPreflight = (): Promise<PreflightCheck[]> =>
-  invoke<PreflightCheck[]>("auto_fix_preflight");
+  tInvoke<PreflightCheck[]>("auto_fix_preflight");
 
 export const startOpenclaw = (): Promise<PreflightCheck[]> =>
-  invoke<PreflightCheck[]>("start_openclaw");
+  tInvoke<PreflightCheck[]>("start_openclaw");
 
 // ============================================================================
 // Config Commands
 // ============================================================================
 
 export const getConfig = (): Promise<AppConfig> =>
-  invoke<AppConfig>("get_config");
+  tInvoke<AppConfig>("get_config");
 
 export const saveConfig = (config: AppConfig): Promise<void> =>
-  invoke<void>("save_config", { config });
+  tInvoke<void>("save_config", { config });
 
 // ============================================================================
 // Job Commands
 // ============================================================================
 
 export const getJobs = (status?: string, limit?: number): Promise<Job[]> =>
-  invoke<Job[]>("get_jobs", { status, limit: limit ?? 50 });
+  tInvoke<Job[]>("get_jobs", { status, limit: limit ?? 50 });
 
 export const getJobMilestones = (jobId: string): Promise<Milestone[]> =>
-  invoke<Milestone[]>("get_job_milestones", { jobId });
+  tInvoke<Milestone[]>("get_job_milestones", { jobId });
 
 // ============================================================================
 // Artifact Commands
 // ============================================================================
 
 export const listVerifyArtifacts = (jobId: string): Promise<Artifact[]> =>
-  invoke<Artifact[]>("list_verify_artifacts", { jobId });
+  tInvoke<Artifact[]>("list_verify_artifacts", { jobId });
 
 export const getQualityReport = (jobId: string): Promise<QualityReport | null> =>
-  invoke<QualityReport | null>("get_quality_report", { jobId });
+  tInvoke<QualityReport | null>("get_quality_report", { jobId });
 
 // ============================================================================
 // Log Commands
 // ============================================================================
 
 export const readLogFile = (service: string, lines: number): Promise<string[]> =>
-  invoke<string[]>("read_log_file", { service, lines });
+  tInvoke<string[]>("read_log_file", { service, lines });
 
 // ============================================================================
 // Utility Commands
 // ============================================================================
 
 export const openInFinder = (path: string): Promise<void> =>
-  invoke<void>("open_in_finder", { path });
+  tInvoke<void>("open_in_finder", { path });
 
 export const getVerifyFolderPath = (): Promise<string> =>
-  invoke<string>("get_verify_folder_path");
+  tInvoke<string>("get_verify_folder_path");
 
 // ============================================================================
 // KB Health Commands
 // ============================================================================
 
 export const getKbSyncReport = (): Promise<KbSyncReport | null> =>
-  invoke<KbSyncReport | null>("get_kb_sync_report");
+  tInvoke<KbSyncReport | null>("get_kb_sync_report");
 
 export const getKbStats = (): Promise<KbStats> =>
-  invoke<KbStats>("get_kb_stats");
+  tInvoke<KbStats>("get_kb_stats");
 
 export const kbSyncNow = (): Promise<KbSyncReport> =>
-  invoke<KbSyncReport>("kb_sync_now");
+  tInvoke<KbSyncReport>("kb_sync_now");
 
 export const listKbFiles = (args?: {
   query?: string;
@@ -230,7 +247,7 @@ export const listKbFiles = (args?: {
   limit?: number;
   offset?: number;
 }): Promise<KbFileList> =>
-  invoke<KbFileList>("list_kb_files", {
+  tInvoke<KbFileList>("list_kb_files", {
     query: args?.query,
     sourceGroup: args?.sourceGroup,
     limit: args?.limit,
@@ -244,7 +261,7 @@ export const listGlossaryTerms = (args?: {
   limit?: number;
   offset?: number;
 }): Promise<GlossaryTermList> =>
-  invoke<GlossaryTermList>("list_glossary_terms", {
+  tInvoke<GlossaryTermList>("list_glossary_terms", {
     company: args?.company,
     languagePair: args?.languagePair,
     query: args?.query,
@@ -259,7 +276,7 @@ export const upsertGlossaryTerm = (args: {
   sourceText: string;
   targetText: string;
 }): Promise<GlossaryTerm> =>
-  invoke<GlossaryTerm>("upsert_glossary_term", {
+  tInvoke<GlossaryTerm>("upsert_glossary_term", {
     company: args.company,
     sourceLang: args.sourceLang,
     targetLang: args.targetLang,
@@ -273,7 +290,7 @@ export const deleteGlossaryTerm = (args: {
   targetLang: string;
   sourceText: string;
 }): Promise<boolean> =>
-  invoke<boolean>("delete_glossary_term", {
+  tInvoke<boolean>("delete_glossary_term", {
     company: args.company,
     sourceLang: args.sourceLang,
     targetLang: args.targetLang,
@@ -285,13 +302,13 @@ export const deleteGlossaryTerm = (args: {
 // ============================================================================
 
 export const getDockerStatus = (): Promise<DockerContainer[]> =>
-  invoke<DockerContainer[]>("get_docker_status");
+  tInvoke<DockerContainer[]>("get_docker_status");
 
 export const startDockerServices = (): Promise<DockerContainer[]> =>
-  invoke<DockerContainer[]>("start_docker_services");
+  tInvoke<DockerContainer[]>("start_docker_services");
 
 export const stopDockerServices = (): Promise<void> =>
-  invoke<void>("stop_docker_services");
+  tInvoke<void>("stop_docker_services");
 
 // ============================================================================
 // API Provider Types
@@ -322,16 +339,16 @@ export interface ApiUsage {
 // ============================================================================
 
 export const getApiProviders = (): Promise<ApiProvider[]> =>
-  invoke<ApiProvider[]>("get_api_providers");
+  tInvoke<ApiProvider[]>("get_api_providers");
 
 export const getApiUsage = (provider: string): Promise<ApiUsage | null> =>
-  invoke<ApiUsage | null>("get_api_usage", { provider });
+  tInvoke<ApiUsage | null>("get_api_usage", { provider });
 
 export const setApiKey = (provider: string, key: string): Promise<void> =>
-  invoke<void>("set_api_key", { provider, key });
+  tInvoke<void>("set_api_key", { provider, key });
 
 export const deleteApiKey = (provider: string): Promise<void> =>
-  invoke<void>("delete_api_key", { provider });
+  tInvoke<void>("delete_api_key", { provider });
 
 // ============================================================================
 // Model Availability Types
@@ -386,4 +403,4 @@ export interface ModelAvailabilityReport {
 // ============================================================================
 
 export const getModelAvailabilityReport = (): Promise<ModelAvailabilityReport> =>
-  invoke<ModelAvailabilityReport>("get_model_availability_report");
+  tInvoke<ModelAvailabilityReport>("get_model_availability_report");

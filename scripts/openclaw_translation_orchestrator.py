@@ -1418,6 +1418,7 @@ def _extract_openclaw_payload_model(payload: Any) -> dict[str, str]:
 
 
 def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD_TIMEOUT) -> dict[str, Any]:
+    timeout_s = max(30, int(timeout_seconds))
     cmd = [
         OPENCLAW_BIN,
         "agent",
@@ -1429,9 +1430,27 @@ def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD
         "--thinking",
         OPENCLAW_TRANSLATION_THINKING,
         "--timeout",
-        str(max(30, int(timeout_seconds))),
+        str(timeout_s),
     ]
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    # Apply a local hard timeout as a safety net in addition to OpenClaw's own
+    # --timeout argument; this prevents orphaned hangs from blocking the worker.
+    hard_timeout_s = timeout_s + 15
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=hard_timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": f"agent_call_timeout:{agent_id}",
+            "detail": f"subprocess_timeout:{hard_timeout_s}s",
+            "stdout": str(getattr(exc, "stdout", "") or "").strip()[:2000],
+            "stderr": str(getattr(exc, "stderr", "") or "").strip()[:2000],
+        }
     if proc.returncode != 0:
         return {
             "ok": False,

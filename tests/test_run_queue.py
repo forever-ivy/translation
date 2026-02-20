@@ -10,6 +10,7 @@ from scripts.v4_runtime import (
     db_connect,
     enqueue_run_job,
     ensure_runtime_paths,
+    finish_queue_item,
     get_active_queue_item,
     requeue_stuck_running,
     write_job,
@@ -70,6 +71,26 @@ class RunQueueTest(unittest.TestCase):
             conn2.close()
             self.assertIsNone(item2)
 
+    def test_claim_syncs_job_status_to_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_root = Path(td) / "Translation Task"
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            job_id = "job_queue_status_sync"
+            self._make_job(conn, work_root=work_root, job_id=job_id)
+            conn.execute(
+                "UPDATE jobs SET status='planned', updated_at=datetime('now') WHERE job_id=?",
+                (job_id,),
+            )
+            enqueue_run_job(conn, job_id=job_id, notify_target="+1", created_by_sender="+1")
+
+            claimed = claim_next_queued(conn, worker_id="w1")
+            self.assertIsNotNone(claimed)
+            row = conn.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["status"]), "running")
+            conn.close()
+
     def test_requeue_stuck_running(self):
         with tempfile.TemporaryDirectory() as td:
             work_root = Path(td) / "Translation Task"
@@ -92,7 +113,33 @@ class RunQueueTest(unittest.TestCase):
             self.assertEqual(str(active.get("state") or ""), "queued")
             conn.close()
 
+    def test_finish_queue_item_updates_planned_job_to_failed(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_root = Path(td) / "Translation Task"
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            job_id = "job_queue_finish_sync"
+            self._make_job(conn, work_root=work_root, job_id=job_id)
+            conn.execute(
+                "UPDATE jobs SET status='planned', updated_at=datetime('now') WHERE job_id=?",
+                (job_id,),
+            )
+            enqueue_run_job(conn, job_id=job_id, notify_target="+1", created_by_sender="+1")
+            claimed = claim_next_queued(conn, worker_id="w1")
+            self.assertIsNotNone(claimed)
+
+            finish_queue_item(
+                conn,
+                queue_id=int(claimed["id"]),
+                worker_id="w1",
+                state="failed",
+                last_error="unit_test_failure",
+            )
+            row = conn.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["status"]), "failed")
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -105,6 +105,13 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
         self.assertFalse(out.get("ok"))
         self.assertTrue(str(out.get("error") or "").startswith("agent_request_too_large:"))
 
+    @patch("scripts.openclaw_translation_orchestrator.subprocess.run")
+    def test_agent_call_timeout_returns_explicit_error(self, mocked_run):
+        mocked_run.side_effect = subprocess.TimeoutExpired(cmd=["openclaw"], timeout=45)
+        out = _agent_call("review-core", "ping", timeout_seconds=30)
+        self.assertFalse(out.get("ok"))
+        self.assertEqual(out.get("error"), "agent_call_timeout:review-core")
+
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_revision_update_reaches_review_ready(self, mocked_call):
         with tempfile.TemporaryDirectory() as tmp:
