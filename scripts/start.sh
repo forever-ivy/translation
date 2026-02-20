@@ -19,7 +19,8 @@ set -euo pipefail
 # Configuration
 # =============================================================================
 
-ROOT_DIR="/Users/Code/workflow/translation"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${OPENCLAW_PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 cd "$ROOT_DIR"
 
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
@@ -27,7 +28,7 @@ export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
 # Paths
 PID_DIR="$HOME/.openclaw/runtime/translation/pids"
 LOG_DIR="$HOME/.openclaw/runtime/translation/logs"
-PYTHON_BIN="/Users/Code/workflow/translation/.venv/bin/python"
+PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 
 # =============================================================================
 # Helper Functions
@@ -194,9 +195,9 @@ start_email() {
         return 1
     fi
 
-    local work_root="${V4_WORK_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task}"
-    local kb_root="${V4_KB_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository}"
-    local notify_target="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"
+    local work_root="${V4_WORK_ROOT:-$HOME/Translation Task}"
+    local kb_root="${V4_KB_ROOT:-$HOME/Knowledge Repository}"
+    local notify_target="${OPENCLAW_NOTIFY_TARGET:-}"
 
     local args=(
         -m scripts.openclaw_v4_dispatcher
@@ -225,9 +226,9 @@ start_reminder() {
     log_info "Running pending reminder (one-shot)..."
     load_env
 
-    local work_root="${V4_WORK_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task}"
-    local kb_root="${V4_KB_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository}"
-    local notify_target="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"
+    local work_root="${V4_WORK_ROOT:-$HOME/Translation Task}"
+    local kb_root="${V4_KB_ROOT:-$HOME/Knowledge Repository}"
+    local notify_target="${OPENCLAW_NOTIFY_TARGET:-}"
 
     "$PYTHON_BIN" -m scripts.openclaw_v4_dispatcher \
         --work-root "$work_root" \

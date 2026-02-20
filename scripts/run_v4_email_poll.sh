@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/Users/Code/workflow/translation"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${OPENCLAW_PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 cd "$ROOT_DIR"
 export PATH="$HOME/.npm-global/bin:$PATH"
 
@@ -20,15 +21,15 @@ if [[ "${V4_IMAP_PASSWORD}" == "REPLACE_WITH_163_IMAP_AUTH_CODE" ]]; then
   exit 2
 fi
 
-WORK_ROOT="${V4_WORK_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task}"
-KB_ROOT="${V4_KB_ROOT:-/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository}"
-NOTIFY_TARGET="${OPENCLAW_NOTIFY_TARGET:-+8615071054627}"
+WORK_ROOT="${V4_WORK_ROOT:-$HOME/Translation Task}"
+KB_ROOT="${V4_KB_ROOT:-$HOME/Knowledge Repository}"
+NOTIFY_TARGET="${OPENCLAW_NOTIFY_TARGET:-}"
 AUTO_RUN_ARGS=()
 if [[ "${V5_EMAIL_AUTO_RUN:-0}" == "1" ]]; then
   AUTO_RUN_ARGS+=(--auto-run)
 fi
 
-"${V4_PYTHON_BIN:-/Users/Code/workflow/translation/.venv/bin/python}" \
+"${V4_PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}" \
   -m scripts.openclaw_v4_dispatcher \
   --work-root "$WORK_ROOT" \
   --kb-root "$KB_ROOT" \

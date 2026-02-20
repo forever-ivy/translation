@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/Users/Code/workflow/translation"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${OPENCLAW_PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+cd "$ROOT_DIR"
 SRC_SKILL_DIR="$ROOT_DIR/skills/translation-router"
 DEST_SKILL_DIR="${OPENCLAW_WORKSPACE_SKILLS_DIR:-$HOME/.openclaw/workspace/skills}/translation-router"
 ENV_FILE="$ROOT_DIR/.env.v4.local"
@@ -33,7 +35,7 @@ if [[ -f "$WORKSPACE_AGENTS_MD" ]]; then
 
 - For Telegram direct inbound task messages, do not translate in chat.
 - Route immediately via:
-  `/Users/Code/workflow/translation/.venv/bin/python -m scripts.skill_message_router --work-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Translation Task" --kb-root "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository" --notify-target "<CHAT_ID>" --raw-text "<RAW_MESSAGE>"`
+  `"${V4_PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}" -m scripts.skill_message_router --work-root "<V4_WORK_ROOT>" --kb-root "<V4_KB_ROOT>" --notify-target "<CHAT_ID>" --raw-text "<RAW_MESSAGE>"`
 - Allowed chat commands: `new`, `run`, `status`, `ok`, `no {reason}`, `rerun`.
 - Mandatory flow: `new -> (send files/text) -> run`.
 - Never ask for files again if attachments were already present.
@@ -90,8 +92,8 @@ if [[ -f "$ENV_FILE" ]]; then
     echo "Added OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=1 to $ENV_FILE"
   fi
   if ! grep -q '^OPENCLAW_STATE_DB_PATH=' "$ENV_FILE"; then
-    echo 'OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite' >> "$ENV_FILE"
-    echo "Added OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite to $ENV_FILE"
+    echo "OPENCLAW_STATE_DB_PATH=$HOME/.openclaw/runtime/translation/state.sqlite" >> "$ENV_FILE"
+    echo "Added OPENCLAW_STATE_DB_PATH=$HOME/.openclaw/runtime/translation/state.sqlite to $ENV_FILE"
   fi
 else
   cat >"$ENV_FILE" <<'EOF'
@@ -104,7 +106,7 @@ OPENCLAW_RAG_COLLECTION=translation-kb
 OPENCLAW_RAG_COLLECTION_MODE=auto
 OPENCLAW_KB_ISOLATION_MODE=company_strict
 OPENCLAW_ARCHIVE_REQUIRE_FINAL_UPLOAD=1
-OPENCLAW_STATE_DB_PATH=/Users/ivy/.openclaw/runtime/translation/state.sqlite
+OPENCLAW_STATE_DB_PATH=$HOME/.openclaw/runtime/translation/state.sqlite
 EOF
   echo "Created $ENV_FILE with strict router + high reasoning defaults."
 fi

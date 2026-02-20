@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="/Users/Code/workflow/translation"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${OPENCLAW_PROJECT_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+cd "$ROOT_DIR"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$ROOT_DIR}"
 KIMI_MODEL="${OPENCLAW_KIMI_MODEL:-moonshot/kimi-k2.5}"
 KIMI_ALT_MODEL="${OPENCLAW_KIMI_ALT_MODEL:-kimi-coding/k2p5}"
@@ -91,10 +93,17 @@ install_community_skills_from_lock() {
   echo "Installing community skills from lock: $SKILL_LOCK_FILE"
   while IFS= read -r item; do
     local slug version required
+    local installed_dir
     slug="$(jq -r '.slug' <<<"$item")"
     version="$(jq -r '.version' <<<"$item")"
     required="$(jq -r '.required' <<<"$item")"
     [[ -z "$slug" || -z "$version" ]] && continue
+    installed_dir="$OPENCLAW_WORKSPACE_SKILL_ROOT/skills/$slug"
+    if [[ -d "$installed_dir" ]]; then
+      echo " - $slug@$version (required=$required)"
+      echo "   already installed: $installed_dir (skip)"
+      continue
+    fi
     echo " - $slug@$version (required=$required)"
     if npx -y clawhub@latest --workdir "$OPENCLAW_WORKSPACE_SKILL_ROOT" --dir "skills" install "$slug" --version "$version" --force >/dev/null; then
       echo "   installed: $slug@$version"
@@ -180,7 +189,7 @@ upsert_cron_job "v4-email-poll" \
 upsert_cron_job "v4-pending-reminder-am" \
   --agent "task-router" \
   --cron "0 9 * * *" \
-  --tz "${OPENCLAW_CRON_TZ:-Asia/Shanghai}" \
+  --tz "${OPENCLAW_CRON_TZ:-America/New_York}" \
   --message "$REMINDER_CMD" \
   --no-deliver \
   --wake "now" \
@@ -189,7 +198,7 @@ upsert_cron_job "v4-pending-reminder-am" \
 upsert_cron_job "v4-pending-reminder-pm" \
   --agent "task-router" \
   --cron "0 19 * * *" \
-  --tz "${OPENCLAW_CRON_TZ:-Asia/Shanghai}" \
+  --tz "${OPENCLAW_CRON_TZ:-America/New_York}" \
   --message "$REMINDER_CMD" \
   --no-deliver \
   --wake "now" \
