@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import datetime as dt
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -204,6 +206,20 @@ GEMINI_FALLBACK_AGENTS = [
     if a.strip()
 ]
 OPENCLAW_CMD_TIMEOUT = int(os.getenv("OPENCLAW_AGENT_CALL_TIMEOUT_SECONDS", "600"))
+OPENCLAW_AGENT_CALL_MAX_ATTEMPTS = max(1, int(os.getenv("OPENCLAW_AGENT_CALL_MAX_ATTEMPTS", "3")))
+OPENCLAW_AGENT_CALL_RETRY_BACKOFF_SECONDS = max(0.5, float(os.getenv("OPENCLAW_AGENT_CALL_RETRY_BACKOFF_SECONDS", "3")))
+OPENCLAW_AGENT_CALL_RETRY_MAX_BACKOFF_SECONDS = max(
+    OPENCLAW_AGENT_CALL_RETRY_BACKOFF_SECONDS,
+    float(os.getenv("OPENCLAW_AGENT_CALL_RETRY_MAX_BACKOFF_SECONDS", "20")),
+)
+OPENCLAW_LOCK_RECOVERY_ENABLED = _env_flag("OPENCLAW_LOCK_RECOVERY_ENABLED", "1")
+OPENCLAW_LOCK_STALE_SECONDS = max(30, int(os.getenv("OPENCLAW_LOCK_STALE_SECONDS", "150")))
+OPENCLAW_DIRECT_API_MAX_ATTEMPTS = max(1, int(os.getenv("OPENCLAW_DIRECT_API_MAX_ATTEMPTS", "4")))
+OPENCLAW_DIRECT_API_BACKOFF_SECONDS = max(0.5, float(os.getenv("OPENCLAW_DIRECT_API_BACKOFF_SECONDS", "2.5")))
+OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS = max(
+    OPENCLAW_DIRECT_API_BACKOFF_SECONDS,
+    float(os.getenv("OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS", "20")),
+)
 DOC_CONTEXT_CHARS = int(os.getenv("OPENCLAW_DOC_CONTEXT_CHARS", "45000"))
 VALID_THINKING_LEVELS = {"off", "minimal", "low", "medium", "high"}
 OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high").strip().lower()
@@ -1889,8 +1905,120 @@ def _extract_openclaw_payload_model(payload: Any) -> dict[str, str]:
     return {"model": model, "provider": provider}
 
 
+def _is_retryable_agent_failure(error: str, detail: str) -> bool:
+    text = f"{error}\n{detail}".lower()
+    hard_non_retry_markers = (
+        "agent_request_too_large:",
+        "prompt_too_large",
+        "invalid_api_key",
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "not found",
+    )
+    if any(m in text for m in hard_non_retry_markers):
+        return False
+    retry_markers = (
+        "rate limit",
+        "429",
+        "cooldown",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "overloaded",
+        "server error",
+        "5xx",
+        "connection reset",
+        "gateway",
+        "try again",
+    )
+    return any(m in text for m in retry_markers)
+
+
+def _recover_stale_agent_lock(agent_id: str) -> None:
+    if not OPENCLAW_LOCK_RECOVERY_ENABLED:
+        return
+    try:
+        lock_dir = Path.home() / ".openclaw" / "agents" / str(agent_id).strip() / "sessions"
+        if not lock_dir.exists():
+            return
+        now = dt.datetime.now(dt.timezone.utc)
+        for lock_path in lock_dir.glob("health-check*.lock"):
+            try:
+                payload = json.loads(lock_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            pid_raw = payload.get("pid")
+            created_raw = str(payload.get("createdAt") or "").strip()
+            try:
+                pid = int(pid_raw)
+            except Exception:
+                continue
+            if not created_raw:
+                continue
+            created_iso = created_raw.replace("Z", "+00:00")
+            try:
+                created = dt.datetime.fromisoformat(created_iso)
+            except Exception:
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=dt.timezone.utc)
+            age_seconds = (now - created).total_seconds()
+            if age_seconds < OPENCLAW_LOCK_STALE_SECONDS:
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                continue
+            except Exception:
+                continue
+            try:
+                os.kill(pid, 15)
+                time.sleep(1.2)
+            except Exception:
+                continue
+            alive = True
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+            except Exception:
+                alive = True
+            if alive:
+                try:
+                    os.kill(pid, 9)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+            try:
+                os.kill(pid, 0)
+                still_alive = True
+            except ProcessLookupError:
+                still_alive = False
+            except Exception:
+                still_alive = True
+            if not still_alive:
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+
 def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD_TIMEOUT) -> dict[str, Any]:
     timeout_s = max(30, int(timeout_seconds))
+    max_attempts = OPENCLAW_AGENT_CALL_MAX_ATTEMPTS
+    backoff_s = OPENCLAW_AGENT_CALL_RETRY_BACKOFF_SECONDS
+    _recover_stale_agent_lock(agent_id)
+    session_id = f"runtime-{agent_id}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
     cmd = [
         OPENCLAW_BIN,
         "agent",
@@ -1903,70 +2031,107 @@ def _agent_call(agent_id: str, message: str, timeout_seconds: int = OPENCLAW_CMD
         OPENCLAW_TRANSLATION_THINKING,
         "--timeout",
         str(timeout_s),
+        "--session-id",
+        session_id,
     ]
-    # Apply a local hard timeout as a safety net in addition to OpenClaw's own
-    # --timeout argument; this prevents orphaned hangs from blocking the worker.
-    hard_timeout_s = timeout_s + 15
-    try:
-        proc = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=hard_timeout_s,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "ok": False,
-            "error": f"agent_call_timeout:{agent_id}",
-            "detail": f"subprocess_timeout:{hard_timeout_s}s",
-            "stdout": str(getattr(exc, "stdout", "") or "").strip()[:2000],
-            "stderr": str(getattr(exc, "stderr", "") or "").strip()[:2000],
-        }
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "error": f"agent_call_failed:{agent_id}",
-            "stderr": proc.stderr.strip(),
-            "stdout": proc.stdout.strip(),
-            "returncode": proc.returncode,
-        }
+    last_error: dict[str, Any] | None = None
+    for attempt in range(1, max_attempts + 1):
+        # Apply a local hard timeout as a safety net in addition to OpenClaw's own
+        # --timeout argument; this prevents orphaned hangs from blocking the worker.
+        hard_timeout_s = timeout_s + 15
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=hard_timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            failure = {
+                "ok": False,
+                "error": f"agent_call_timeout:{agent_id}",
+                "detail": f"subprocess_timeout:{hard_timeout_s}s",
+                "stdout": str(getattr(exc, "stdout", "") or "").strip()[:2000],
+                "stderr": str(getattr(exc, "stderr", "") or "").strip()[:2000],
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            }
+            last_error = failure
+            if attempt < max_attempts and _is_retryable_agent_failure(str(failure.get("error")), str(failure.get("detail"))):
+                time.sleep(min(backoff_s * (2 ** (attempt - 1)), OPENCLAW_AGENT_CALL_RETRY_MAX_BACKOFF_SECONDS))
+                continue
+            return failure
+        if proc.returncode != 0:
+            failure = {
+                "ok": False,
+                "error": f"agent_call_failed:{agent_id}",
+                "stderr": proc.stderr.strip(),
+                "stdout": proc.stdout.strip(),
+                "returncode": proc.returncode,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            }
+            last_error = failure
+            detail = f"{failure.get('stderr', '')}\n{failure.get('stdout', '')}"
+            if attempt < max_attempts and _is_retryable_agent_failure(str(failure.get("error")), detail):
+                time.sleep(min(backoff_s * (2 ** (attempt - 1)), OPENCLAW_AGENT_CALL_RETRY_MAX_BACKOFF_SECONDS))
+                continue
+            return failure
 
-    payload: Any | None = None
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        # OpenClaw may emit non-JSON log lines before/after the actual JSON blob
-        # (e.g. "[agent/embedded] ..."). Extract the first decodable JSON value.
-        candidates = _iter_json_candidates(proc.stdout, limit=12)
-        if not candidates:
+        payload: Any | None = None
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            # OpenClaw may emit non-JSON log lines before/after the actual JSON blob
+            # (e.g. "[agent/embedded] ..."). Extract the first decodable JSON value.
+            candidates = _iter_json_candidates(proc.stdout, limit=12)
+            if not candidates:
+                failure = {
+                    "ok": False,
+                    "error": f"agent_json_invalid:{agent_id}",
+                    "detail": "no JSON value found in stdout",
+                    "stdout": proc.stdout[:2000],
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                }
+                last_error = failure
+                if attempt < max_attempts and _is_retryable_agent_failure(str(failure.get("error")), str(failure.get("stdout", ""))):
+                    time.sleep(min(backoff_s * (2 ** (attempt - 1)), OPENCLAW_AGENT_CALL_RETRY_MAX_BACKOFF_SECONDS))
+                    continue
+                return failure
+
+            # Prefer the candidate that actually contains payload text.
+            payload = candidates[0]
+            for cand in candidates:
+                if _extract_openclaw_payload_text(cand):
+                    payload = cand
+                    break
+
+        text = _extract_openclaw_payload_text(payload)
+        meta = _extract_openclaw_payload_model(payload)
+        if _looks_like_model_request_too_large(text):
             return {
                 "ok": False,
-                "error": f"agent_json_invalid:{agent_id}",
-                "detail": "no JSON value found in stdout",
-                "stdout": proc.stdout[:2000],
+                "error": f"agent_request_too_large:{agent_id}",
+                "detail": text[:2000],
+                "raw_text": text,
+                "agent_id": agent_id,
+                "payload": payload,
+                "meta": meta,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
             }
-
-        # Prefer the candidate that actually contains payload text.
-        payload = candidates[0]
-        for cand in candidates:
-            if _extract_openclaw_payload_text(cand):
-                payload = cand
-                break
-
-    text = _extract_openclaw_payload_text(payload)
-    meta = _extract_openclaw_payload_model(payload)
-    if _looks_like_model_request_too_large(text):
         return {
-            "ok": False,
-            "error": f"agent_request_too_large:{agent_id}",
-            "detail": text[:2000],
-            "raw_text": text,
+            "ok": True,
             "agent_id": agent_id,
             "payload": payload,
+            "text": text,
             "meta": meta,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
         }
-    return {"ok": True, "agent_id": agent_id, "payload": payload, "text": text, "meta": meta}
+    return last_error or {"ok": False, "error": f"agent_call_failed:{agent_id}", "detail": "unknown_failure"}
 
 
 LEGACY_REQUIRED_INPUTS_MAP = {
@@ -3093,6 +3258,7 @@ def _kimi_coding_direct_api_call(prompt: str) -> dict[str, Any]:
 
 def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
     """Fallback: call Zhipu GLM API directly when OpenClaw agent unavailable."""
+    import urllib.error
     import urllib.request
 
     api_key = str(os.getenv("GLM_API_KEY") or GLM_API_KEY or "").strip()
@@ -3114,13 +3280,33 @@ def _glm_direct_api_call(prompt: str) -> dict[str, Any]:
             "Authorization": f"Bearer {api_key}",
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        return {"ok": True, "text": text, "source": "direct_api"}
-    except Exception as exc:
-        return {"ok": False, "error": f"glm_direct_api_failed: {exc}"}
+    last_error = ""
+    for attempt in range(1, OPENCLAW_DIRECT_API_MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            return {
+                "ok": True,
+                "text": text,
+                "source": "direct_api",
+                "attempt": attempt,
+                "max_attempts": OPENCLAW_DIRECT_API_MAX_ATTEMPTS,
+            }
+        except urllib.error.HTTPError as exc:
+            last_error = f"glm_direct_api_failed: HTTP Error {exc.code}: {exc.reason}"
+            retryable = exc.code in {408, 409, 425, 429, 500, 502, 503, 504}
+            if attempt < OPENCLAW_DIRECT_API_MAX_ATTEMPTS and retryable:
+                time.sleep(min(OPENCLAW_DIRECT_API_BACKOFF_SECONDS * (2 ** (attempt - 1)), OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS))
+                continue
+            return {"ok": False, "error": last_error, "attempt": attempt, "max_attempts": OPENCLAW_DIRECT_API_MAX_ATTEMPTS}
+        except Exception as exc:
+            last_error = f"glm_direct_api_failed: {exc}"
+            if attempt < OPENCLAW_DIRECT_API_MAX_ATTEMPTS:
+                time.sleep(min(OPENCLAW_DIRECT_API_BACKOFF_SECONDS * (2 ** (attempt - 1)), OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS))
+                continue
+            return {"ok": False, "error": last_error, "attempt": attempt, "max_attempts": OPENCLAW_DIRECT_API_MAX_ATTEMPTS}
+    return {"ok": False, "error": last_error or "glm_direct_api_failed", "attempt": OPENCLAW_DIRECT_API_MAX_ATTEMPTS, "max_attempts": OPENCLAW_DIRECT_API_MAX_ATTEMPTS}
 
 
 def _glm_generate(context: dict[str, Any], previous_draft: dict[str, Any] | None, findings: list[str], round_index: int) -> dict[str, Any]:

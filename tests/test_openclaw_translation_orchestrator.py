@@ -68,6 +68,9 @@ class OpenClawTranslationOrchestratorTest(unittest.TestCase):
         called_cmd = mocked_run.call_args.args[0]
         self.assertIn("--thinking", called_cmd)
         self.assertIn("high", called_cmd)
+        self.assertIn("--session-id", called_cmd)
+        sid = called_cmd[called_cmd.index("--session-id") + 1]
+        self.assertTrue(str(sid).startswith("runtime-translator-core-"))
 
     @patch("scripts.openclaw_translation_orchestrator.subprocess.run")
     def test_agent_call_parses_embedded_stdout_with_log_prefix(self, mocked_run):
