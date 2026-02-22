@@ -21,7 +21,9 @@ from scripts.openclaw_translation_orchestrator import (
     _cap_xlsx_prompt_rows,
     _collect_translated_xlsx_keys,
     _codex_generate,
+    _estimate_spreadsheet_minutes_from_candidates,
     _infer_language_pair_from_context,
+    _llm_intent,
     _trim_xlsx_prompt_text,
     _validate_format_preserve_coverage,
     run,
@@ -590,6 +592,59 @@ class IntentFallbackLanguageInferenceTest(unittest.TestCase):
         src, tgt = _infer_language_pair_from_context("translate arabic to englsih", candidates)
         self.assertEqual(src, "ar")
         self.assertEqual(tgt, "en")
+
+
+class SpreadsheetEtaHeuristicsTest(unittest.TestCase):
+    def test_estimate_spreadsheet_minutes_scales_with_size(self):
+        small = [
+            {
+                "path": "/tmp/a.xlsx",
+                "structure": {"blocks": [{"text": "A1"}, {"text": "A2"}]},
+            }
+        ]
+        large = [
+            {
+                "path": "/tmp/b.xlsx",
+                "structure": {
+                    "blocks": [{"text": ("x" * 120)} for _ in range(220)],
+                },
+            }
+        ]
+        eta_small = _estimate_spreadsheet_minutes_from_candidates(small)
+        eta_large = _estimate_spreadsheet_minutes_from_candidates(large)
+        self.assertGreaterEqual(eta_small, 8)
+        self.assertGreater(eta_large, eta_small)
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_llm_intent_spreadsheet_eta_uses_dynamic_floor(self, mocked_agent_call):
+        mocked_agent_call.return_value = _agent_ok(
+            {
+                "task_type": "SPREADSHEET_TRANSLATION",
+                "task_label": "Translate Arabic Excel file to English",
+                "source_language": "ar",
+                "target_language": "en",
+                "required_inputs": ["source_document"],
+                "missing_inputs": [],
+                "confidence": 0.9,
+                "reasoning_summary": "Spreadsheet translation",
+                "estimated_minutes": 12,
+                "complexity_score": 20.0,
+            }
+        )
+        candidates = [
+            {
+                "path": "/tmp/large.xlsx",
+                "name": "large.xlsx",
+                "language": "ar",
+                "structure": {
+                    "blocks": [{"text": ("x" * 120)} for _ in range(220)],
+                },
+            }
+        ]
+        result = _llm_intent({"subject": "translate", "message_text": "translate arabic to english"}, candidates)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual((result.get("intent") or {}).get("task_type"), "SPREADSHEET_TRANSLATION")
+        self.assertGreaterEqual(int(result.get("estimated_minutes") or 0), 30)
 
 
 class GlossarySuffixCleanupTest(unittest.TestCase):

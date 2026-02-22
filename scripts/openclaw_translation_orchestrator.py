@@ -1616,6 +1616,47 @@ def _infer_language_pair_from_context(message_blob: str, candidates: list[dict[s
     return "unknown", "en"
 
 
+def _estimate_spreadsheet_minutes_from_candidates(candidates: list[dict[str, Any]]) -> int:
+    """Heuristic ETA for spreadsheet jobs based on parsed structure size."""
+    files = 0
+    units = 0
+    chars = 0
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        suffix = Path(str(item.get("path") or "")).suffix.lower()
+        if suffix not in {".xlsx", ".csv", ".tsv"}:
+            continue
+        files += 1
+        struct = item.get("structure") if isinstance(item.get("structure"), dict) else {}
+        blocks = struct.get("blocks") if isinstance(struct.get("blocks"), list) else []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            text = str(block.get("text") or "").strip()
+            if text:
+                units += 1
+                chars += len(text)
+            rows = block.get("rows")
+            if isinstance(rows, list):
+                for row in rows:
+                    row_text = str(row.get("text") or "").strip() if isinstance(row, dict) else str(row or "").strip()
+                    if row_text:
+                        units += 1
+                        chars += len(row_text)
+        if units <= 0:
+            block_count = int(struct.get("block_count") or 0)
+            para_count = int(struct.get("paragraph_count") or 0)
+            units += max(block_count, para_count)
+
+    if files <= 0:
+        return 0
+
+    # Small sheets stay near 10-20m; larger interview sheets rise to 35-60m.
+    estimate = 6.0 + (files * 2.0) + (units / 7.5) + (chars / 2400.0)
+    return int(max(8, min(180, round(estimate))))
+
+
 def _fallback_intent(meta: dict[str, Any], candidates: list[dict[str, Any]], *, reason: str, raw_text: str = "") -> dict[str, Any]:
     message_blob = " ".join(
         [
@@ -1646,6 +1687,13 @@ def _fallback_intent(meta: dict[str, Any], candidates: list[dict[str, Any]], *, 
     }.get(task_type, "Translation task")
 
     log.warning("Intent classifier fallback engaged: %s", reason)
+    estimated_minutes = 45 if task_type == "SPREADSHEET_TRANSLATION" else 20
+    complexity_score = 60.0 if task_type == "SPREADSHEET_TRANSLATION" else 30.0
+    if task_type == "SPREADSHEET_TRANSLATION":
+        dynamic_eta = _estimate_spreadsheet_minutes_from_candidates(candidates)
+        if dynamic_eta > 0:
+            estimated_minutes = max(estimated_minutes, dynamic_eta)
+            complexity_score = max(complexity_score, min(100.0, 20.0 + dynamic_eta * 1.2))
     return {
         "ok": True,
         "intent": {
@@ -1658,8 +1706,8 @@ def _fallback_intent(meta: dict[str, Any], candidates: list[dict[str, Any]], *, 
             "confidence": 0.35,
             "reasoning_summary": f"Fallback classification used because intent model was unavailable ({reason}).",
         },
-        "estimated_minutes": 45 if task_type == "SPREADSHEET_TRANSLATION" else 20,
-        "complexity_score": 60.0 if task_type == "SPREADSHEET_TRANSLATION" else 30.0,
+        "estimated_minutes": estimated_minutes,
+        "complexity_score": complexity_score,
         "raw": {
             "fallback": True,
             "reason": reason,
@@ -2311,6 +2359,11 @@ Rules:
     estimated_minutes = max(1, estimated_minutes)
     complexity_score = float(parsed.get("complexity_score", 30.0) or 30.0)
     complexity_score = max(1.0, min(100.0, complexity_score))
+    if task_type == "SPREADSHEET_TRANSLATION":
+        dynamic_eta = _estimate_spreadsheet_minutes_from_candidates(candidates)
+        if dynamic_eta > 0:
+            estimated_minutes = max(estimated_minutes, dynamic_eta)
+            complexity_score = max(complexity_score, min(100.0, 20.0 + dynamic_eta * 1.2))
     required = _normalize_required_inputs(list(parsed.get("required_inputs") or []))
     if not required:
         required = REQUIRED_INPUTS_BY_TASK.get(task_type, [])
