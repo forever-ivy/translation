@@ -875,7 +875,7 @@ class PromptCompactionHelpersTest(unittest.TestCase):
                     {
                         "file": "a.xlsx",
                         "cell_units": [
-                            {"file": "a.xlsx", "sheet": "S1", "cell": "D19", "text": "incomplete source sentence"},
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "D19", "text": "incomplete source sentence و"},
                         ],
                     }
                 ]
@@ -895,6 +895,33 @@ class PromptCompactionHelpersTest(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertEqual(meta.get("xlsx_source_truncated_count"), 1)
         self.assertEqual(meta.get("xlsx_source_truncated_marker_missing_count"), 0)
+
+    def test_validate_format_preserve_coverage_marker_is_hard_truncation_when_source_not_cutoff_like(self):
+        context = {
+            "format_preserve": {
+                "xlsx_sources": [
+                    {
+                        "file": "a.xlsx",
+                        "cell_units": [
+                            {"file": "a.xlsx", "sheet": "S1", "cell": "D18", "text": "complete source sentence."},
+                        ],
+                    }
+                ]
+            }
+        }
+        draft = {
+            "xlsx_translation_map": [
+                {
+                    "file": "a.xlsx",
+                    "sheet": "S1",
+                    "cell": "D18",
+                    "text": ("truncated output " * 12) + "[SOURCE TRUNCATED]",
+                },
+            ]
+        }
+        findings, meta = _validate_format_preserve_coverage(context, draft)
+        self.assertIn("xlsx_translation_truncated:cells=1", findings)
+        self.assertEqual(meta.get("xlsx_source_truncated_count"), None)
 
 
 class CodexGenerateFallbackTest(unittest.TestCase):

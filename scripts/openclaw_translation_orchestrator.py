@@ -329,6 +329,48 @@ def _has_terminal_punctuation(text: str, *, allow_source_marker: bool = True) ->
     return value[-1] in ".!?\"'):]}>"
 
 
+def _looks_like_truncated_source(text: str) -> bool:
+    """Best-effort heuristic for *source* truncation (not translation truncation).
+
+    We keep this conservative: false negatives are preferable to mislabeling intact
+    source data as truncated. Marker usage is gated on this.
+    """
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if value.endswith(("...", "…")):
+        return True
+    if value[-1] in ",،;؛:":
+        return True
+
+    tokens = value.split()
+    if not tokens:
+        return False
+    last = tokens[-1]
+    # Common Arabic connector tokens that strongly suggest a cut-off when trailing.
+    if last in {"و", "ب", "ل", "في", "على", "من", "عن", "إلى", "الى", "حتى", "ثم", "كما", "أو", "او"}:
+        return True
+    if len(tokens) >= 2 and tokens[-2] == "كما" and tokens[-1] == "و":
+        return True
+    return False
+
+
+def _xlsx_marker_count(draft: dict[str, Any] | None) -> int:
+    if not isinstance(draft, dict):
+        return 0
+    entries = draft.get("xlsx_translation_map")
+    if not isinstance(entries, list):
+        return 0
+    count = 0
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and SOURCE_TRUNCATED_MARKER and SOURCE_TRUNCATED_MARKER in text:
+            count += 1
+    return count
+
+
 def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     """Return (findings, meta) for missing/incomplete preserve maps."""
     findings: list[str] = []
@@ -421,6 +463,8 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
             translated_has_terminal = _has_terminal_punctuation(text, allow_source_marker=False) and not marker_present
             if text.endswith("...") or text.endswith("…"):
                 reason = "ellipsis"
+            elif marker_present:
+                reason = "marker"
             elif len(text) > 100 and not translated_has_terminal:
                 reason = "no_terminal_punct"
             else:
@@ -434,7 +478,12 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
                 "source_has_terminal": source_has_terminal,
                 "marker_present": marker_present,
             }
-            if src_text and not source_has_terminal:
+            if marker_present:
+                if src_text and (not source_has_terminal) and _looks_like_truncated_source(src_text):
+                    source_truncated_cells.append(row)
+                else:
+                    translation_truncated_cells.append(row)
+            elif src_text and not source_has_terminal:
                 source_truncated_cells.append(row)
             else:
                 translation_truncated_cells.append(row)
@@ -4113,6 +4162,11 @@ def run(
             if xlsx_sources:
                 max_cells = int(os.getenv("OPENCLAW_XLSX_TRANSLATION_MAX_CELLS", "2000"))
                 max_chars = int(os.getenv("OPENCLAW_XLSX_MAX_CHARS_PER_CELL", "2000"))
+                if task_type == "SPREADSHEET_TRANSLATION":
+                    min_chars = int(os.getenv("OPENCLAW_XLSX_MIN_CHARS_PER_CELL_FOR_COMPLETENESS", "2000"))
+                    if max_chars > 0 and max_chars < min_chars:
+                        status_flags.append("xlsx_cell_text_cap_increased")
+                        max_chars = min_chars
                 src_lang = str(intent.get("source_language") or "").strip().lower()
                 arabic_only = False
                 if src_lang in {"ar", "arabic"}:
@@ -4385,6 +4439,7 @@ def run(
                         "gemini_pass": False,
                         "pass": False,
                         "score": -1.0,
+                        "xlsx_marker_count": 0,
                     }
                 generator_pass = bool(draft.get("codex_pass"))
                 reviewed = bool(review)
@@ -4399,6 +4454,7 @@ def run(
                     "gemini_pass": gemini_pass,
                     "pass": pass_flag,
                     "score": score,
+                    "xlsx_marker_count": _xlsx_marker_count(draft),
                 }
 
             codex_info = _candidate_info("codex", codex_data, codex_review)
@@ -4419,6 +4475,7 @@ def run(
                         key=lambda x: (
                             bool(x.get("pass")),
                             float(x.get("score", -1.0)),
+                            -int(x.get("xlsx_marker_count", 0) or 0),
                             1 if x.get("source") == "codex" else 0,
                         ),
                     )
