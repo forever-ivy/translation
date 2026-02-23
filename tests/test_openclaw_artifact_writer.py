@@ -154,6 +154,60 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
                 self.assertTrue(Path(entry["path"]).exists())
             self.assertNotIn("final_xlsx", manifest)
 
+    def test_write_artifacts_emits_per_source_translated_docx_when_multiple_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            review = Path(tmp) / "_VERIFY" / "job_multi_docx"
+            src1 = Path(tmp) / "one.docx"
+            src2 = Path(tmp) / "two.docx"
+            _make_docx(src1, "مرحبا")
+            _make_docx(src2, "شكرا")
+
+            manifest = write_artifacts(
+                review_dir=str(review),
+                draft_a_template_path=str(src1),
+                delta_pack={"added": [], "removed": [], "modified": [], "summary_by_section": [], "stats": {}},
+                model_scores={"judge_margin": 0.12, "term_hit": 0.97},
+                quality={"judge_margin": 0.12, "term_hit": 0.97, "expansion_used": False},
+                quality_report={"rounds": [], "convergence_reached": True, "stop_reason": "double_pass"},
+                job_id="job_multi_docx",
+                task_type="MULTI_FILE_BATCH",
+                confidence=0.9,
+                estimated_minutes=8,
+                runtime_timeout_minutes=10,
+                iteration_count=1,
+                double_pass=True,
+                status_flags=[],
+                candidate_files=[
+                    {"path": str(src1), "name": src1.name},
+                    {"path": str(src2), "name": src2.name},
+                ],
+                review_questions=[],
+                draft_payload={
+                    "final_text": "ignored",
+                    "final_reflow_text": "ignored",
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "docx_translation_map": [
+                        {"file": src1.name, "id": "p:1", "text": "Hello"},
+                        {"file": src2.name, "id": "p:1", "text": "Thanks"},
+                    ],
+                },
+                plan_payload={"intent": {"task_type": "MULTI_FILE_BATCH"}, "plan": {"estimated_minutes": 8}},
+            )
+
+            self.assertIn("docx_files", manifest)
+            self.assertEqual(len(manifest["docx_files"]), 2)
+            self.assertEqual(manifest["primary_docx"], manifest["final_docx"])
+            for entry in manifest["docx_files"]:
+                self.assertTrue(Path(entry["path"]).exists())
+
+            translated_one = review / "one_translated.docx"
+            translated_two = review / "two_translated.docx"
+            self.assertTrue(translated_one.exists())
+            self.assertTrue(translated_two.exists())
+            self.assertIn("Hello", Document(str(translated_one)).paragraphs[0].text)
+            self.assertIn("Thanks", Document(str(translated_two)).paragraphs[0].text)
+
 
 if __name__ == "__main__":
     unittest.main()

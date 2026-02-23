@@ -923,6 +923,22 @@ class PromptCompactionHelpersTest(unittest.TestCase):
         self.assertIn("xlsx_translation_truncated:cells=1", findings)
         self.assertEqual(meta.get("xlsx_source_truncated_count"), None)
 
+    def test_validate_format_preserve_coverage_docx_sources_are_file_scoped(self):
+        context = {
+            "format_preserve": {
+                "docx_sources": [
+                    {"file": "one.docx", "units": [{"file": "one.docx", "id": "p:1", "text": "a"}]},
+                    {"file": "two.docx", "units": [{"file": "two.docx", "id": "p:1", "text": "b"}]},
+                ]
+            }
+        }
+        draft = {"docx_translation_map": [{"file": "one.docx", "id": "p:1", "text": "A"}]}
+        findings, meta = _validate_format_preserve_coverage(context, draft)
+        self.assertIn("docx_translation_map_incomplete:missing=1", findings)
+        self.assertEqual(meta.get("docx_expected"), 2)
+        self.assertEqual(meta.get("docx_got"), 1)
+        self.assertEqual((meta.get("docx_missing_sample") or [])[0].get("file"), "two.docx")
+
 
 class CodexGenerateFallbackTest(unittest.TestCase):
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
@@ -1137,6 +1153,83 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         self.assertTrue(out.get("ok"))
         self.assertEqual(len((out.get("data") or {}).get("xlsx_translation_map") or []), 2)
         self.assertEqual(mocked_agent_call.call_count, 3)
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_docx_batches_and_merges_multi_file(self, mocked_agent_call):
+        mocked_agent_call.side_effect = [
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [
+                        {"file": "one.docx", "id": "p:1", "text": "One-1"},
+                        {"file": "one.docx", "id": "p:2", "text": "One-2"},
+                    ],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "batch1",
+                }
+            ),
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [
+                        {"file": "two.docx", "id": "p:1", "text": "Two-1"},
+                    ],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "batch2",
+                }
+            ),
+        ]
+
+        context = {
+            "task_intent": {"task_type": "MULTI_FILE_BATCH"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+            "format_preserve": {
+                "docx_sources": [
+                    {
+                        "file": "one.docx",
+                        "units": [
+                            {"file": "one.docx", "id": "p:1", "text": "a1"},
+                            {"file": "one.docx", "id": "p:2", "text": "a2"},
+                        ],
+                    },
+                    {
+                        "file": "two.docx",
+                        "units": [{"file": "two.docx", "id": "p:1", "text": "b1"}],
+                    },
+                ]
+            },
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "OPENCLAW_DOCX_BATCH_MAX_UNITS": "2",
+                "OPENCLAW_DOCX_BATCH_MAX_SOURCE_CHARS": "10000",
+                "OPENCLAW_DOCX_BATCH_RETRY": "1",
+                "OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED": "0",
+                "OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED": "0",
+            },
+            clear=False,
+        ):
+            out = _codex_generate(context, None, [], 1)
+
+        self.assertTrue(out.get("ok"))
+        data = out.get("data") or {}
+        self.assertEqual(len(data.get("docx_translation_map") or []), 3)
+        self.assertEqual(mocked_agent_call.call_count, 2)
 
     @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")

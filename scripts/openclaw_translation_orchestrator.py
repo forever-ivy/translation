@@ -241,6 +241,7 @@ OPENCLAW_AGENT_PROMPT_MAX_BYTES = max(
 OPENCLAW_KB_CONTEXT_MAX_HITS = max(0, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_HITS", "6")))
 OPENCLAW_KB_CONTEXT_MAX_CHARS = max(120, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_CHARS", "1200")))
 OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS = max(40, int(os.getenv("OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS", "2000")))
+OPENCLAW_DOCX_PROMPT_TEXT_MAX_CHARS = max(80, int(os.getenv("OPENCLAW_DOCX_PROMPT_TEXT_MAX_CHARS", "800")))
 OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES = max(100, int(os.getenv("OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES", "1200")))
 OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT = max(1, int(os.getenv("OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT", "50")))
 SOURCE_TRUNCATED_MARKER = str(os.getenv("OPENCLAW_SOURCE_TRUNCATED_MARKER", "[SOURCE TRUNCATED]")).strip() or "[SOURCE TRUNCATED]"
@@ -267,25 +268,39 @@ def _normalize_text(text: str) -> str:
     return text.strip()
 
 
-def _normalize_docx_translation_map_ids(entries: Any) -> set[str]:
-    ids: set[str] = set()
+def _normalize_docx_key(file_name: str, unit_id: str) -> tuple[str, str]:
+    return (
+        str(file_name or "").strip(),
+        str(unit_id or "").strip(),
+    )
+
+
+def _normalize_docx_translation_map_keys(entries: Any, *, docx_files: list[str]) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
     if not entries:
-        return ids
+        return keys
+
+    default_file = docx_files[0] if len(docx_files) == 1 else ""
     if isinstance(entries, dict):
+        if not default_file:
+            return keys
         for k in entries.keys():
-            key = str(k or "").strip()
-            if key:
-                ids.add(key)
-        return ids
+            unit_id = str(k or "").strip()
+            if unit_id:
+                keys.add(_normalize_docx_key(default_file, unit_id))
+        return keys
+
     if not isinstance(entries, list):
-        return ids
+        return keys
+
     for item in entries:
         if not isinstance(item, dict):
             continue
         unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
-        if unit_id:
-            ids.add(unit_id)
-    return ids
+        file_name = str(item.get("file") or "").strip() or default_file
+        if file_name and unit_id:
+            keys.add(_normalize_docx_key(file_name, unit_id))
+    return keys
 
 
 def _normalize_xlsx_translation_map_keys(entries: Any, *, xlsx_files: list[str]) -> set[tuple[str, str, str]]:
@@ -377,18 +392,40 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
     meta: dict[str, Any] = {}
     preserve = (context.get("format_preserve") or {}) if isinstance(context.get("format_preserve"), dict) else {}
 
-    docx = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
-    if docx and isinstance(docx.get("units"), list):
-        expected = {str(u.get("id") or "").strip() for u in docx.get("units") if isinstance(u, dict) and str(u.get("id") or "").strip()}
-        got = _normalize_docx_translation_map_ids(draft.get("docx_translation_map"))
-        missing = sorted(expected - got)
-        meta["docx_expected"] = len(expected)
-        meta["docx_got"] = len(got)
-        if expected and not got:
+    docx_sources = preserve.get("docx_sources") if isinstance(preserve.get("docx_sources"), list) else []
+    if not docx_sources:
+        # Backward compatibility for older payloads.
+        docx = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
+        if docx and isinstance(docx.get("units"), list):
+            docx_sources = [docx]
+    if docx_sources:
+        expected_keys: set[tuple[str, str]] = set()
+        docx_files: list[str] = []
+        for src in docx_sources:
+            if not isinstance(src, dict):
+                continue
+            file_name = str(src.get("file") or "").strip()
+            if file_name:
+                docx_files.append(file_name)
+            for unit in (src.get("units") or []):
+                if not isinstance(unit, dict):
+                    continue
+                unit_id = str(unit.get("id") or "").strip()
+                unit_file = str(unit.get("file") or file_name).strip()
+                if unit_file and unit_id:
+                    expected_keys.add(_normalize_docx_key(unit_file, unit_id))
+        got_keys = _normalize_docx_translation_map_keys(draft.get("docx_translation_map"), docx_files=docx_files)
+        missing_keys = sorted(expected_keys - got_keys)
+        meta["docx_expected"] = len(expected_keys)
+        meta["docx_got"] = len(got_keys)
+        if expected_keys and not got_keys:
             findings.append("docx_translation_map_missing")
-        elif missing:
-            findings.append(f"docx_translation_map_incomplete:missing={len(missing)}")
-            meta["docx_missing_sample"] = missing[:8]
+        elif missing_keys:
+            findings.append(f"docx_translation_map_incomplete:missing={len(missing_keys)}")
+            meta["docx_missing_sample"] = [
+                {"file": f, "id": uid}
+                for (f, uid) in missing_keys[:8]
+            ]
 
     xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
     if xlsx_sources:
@@ -579,20 +616,39 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
         return findings, meta
 
     # Normalize translation maps for lookup.
-    docx_map: dict[str, str] = {}
+    docx_sources = preserve.get("docx_sources") if isinstance(preserve.get("docx_sources"), list) else []
+    if not docx_sources:
+        docx_t = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
+        if docx_t:
+            docx_sources = [docx_t]
+    docx_files = [
+        str(src.get("file") or "").strip()
+        for src in docx_sources
+        if isinstance(src, dict) and str(src.get("file") or "").strip()
+    ]
+    if len(docx_files) == 1:
+        default_docx_file = docx_files[0]
+    elif len(docx_sources) == 1:
+        default_docx_file = "__docx_template__"
+    else:
+        default_docx_file = ""
+    docx_map: dict[tuple[str, str], str] = {}
     d_entries = draft.get("docx_translation_map")
     if isinstance(d_entries, dict):
+        if not default_docx_file:
+            d_entries = {}
         for k, v in d_entries.items():
-            key = str(k or "").strip()
-            if key:
-                docx_map[key] = str(v or "")
+            unit_id = str(k or "").strip()
+            if unit_id:
+                docx_map[(default_docx_file, unit_id)] = str(v or "")
     elif isinstance(d_entries, list):
         for row in d_entries:
             if not isinstance(row, dict):
                 continue
             unit_id = str(row.get("id") or row.get("unit_id") or row.get("block_id") or row.get("cell_id") or "").strip()
-            if unit_id:
-                docx_map[unit_id] = str(row.get("text") or "")
+            file_name = str(row.get("file") or "").strip() or default_docx_file
+            if file_name and unit_id:
+                docx_map[(file_name, unit_id)] = str(row.get("text") or "")
 
     xlsx_map: dict[tuple[str, str, str], str] = {}
     x_entries = draft.get("xlsx_translation_map")
@@ -664,18 +720,23 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
                 return
 
     # DOCX units
-    docx = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
-    if docx and isinstance(docx.get("units"), list) and docx_map:
-        for unit in docx.get("units") or []:
-            if not isinstance(unit, dict):
+    if docx_sources and docx_map:
+        for src in docx_sources:
+            if not isinstance(src, dict):
                 continue
-            unit_id = str(unit.get("id") or "").strip()
-            src_text = str(unit.get("text") or "")
-            if not unit_id or not src_text:
-                continue
-            meta["docx_checked_units"] += 1
-            out_text = docx_map.get(unit_id, "")
-            _check_unit(where="docx", unit_key=unit_id, src_text=src_text, out_text=out_text)
+            file_name = str(src.get("file") or "").strip() or default_docx_file
+            for unit in (src.get("units") or []):
+                if not isinstance(unit, dict):
+                    continue
+                unit_id = str(unit.get("id") or "").strip()
+                src_text = str(unit.get("text") or "")
+                unit_file = str(unit.get("file") or file_name).strip() or default_docx_file
+                if not unit_file or not unit_id or not src_text:
+                    continue
+                meta["docx_checked_units"] += 1
+                out_text = docx_map.get((unit_file, unit_id), "")
+                where_key = unit_id if unit_file == "__docx_template__" else f"{unit_file}:{unit_id}"
+                _check_unit(where="docx", unit_key=where_key, src_text=src_text, out_text=out_text)
 
     # XLSX cells
     if xlsx_sources and xlsx_map:
@@ -788,16 +849,29 @@ def _strip_redundant_glossary_suffixes(context: dict[str, Any], draft: dict[str,
 
     meta["enabled"] = True
 
-    docx_source_map: dict[str, str] = {}
-    docx_t = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
-    if docx_t and isinstance(docx_t.get("units"), list):
-        for unit in docx_t.get("units") or []:
+    docx_sources = preserve.get("docx_sources") if isinstance(preserve.get("docx_sources"), list) else []
+    if not docx_sources:
+        docx_t = preserve.get("docx_template") if isinstance(preserve.get("docx_template"), dict) else None
+        if docx_t:
+            docx_sources = [docx_t]
+
+    docx_default_file = ""
+    if len(docx_sources) == 1 and isinstance(docx_sources[0], dict):
+        docx_default_file = str(docx_sources[0].get("file") or "").strip() or "__docx_template__"
+
+    docx_source_map: dict[tuple[str, str], str] = {}
+    for src in docx_sources:
+        if not isinstance(src, dict):
+            continue
+        file_name = str(src.get("file") or "").strip() or docx_default_file
+        for unit in (src.get("units") or []):
             if not isinstance(unit, dict):
                 continue
             uid = str(unit.get("id") or "").strip()
-            src = str(unit.get("text") or "")
-            if uid and src:
-                docx_source_map[uid] = src
+            src_text = str(unit.get("text") or "")
+            unit_file = str(unit.get("file") or file_name).strip() or docx_default_file
+            if uid and unit_file and src_text:
+                docx_source_map[(unit_file, uid)] = src_text
 
     xlsx_source_map: dict[tuple[str, str, str], str] = {}
     xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
@@ -826,15 +900,23 @@ def _strip_redundant_glossary_suffixes(context: dict[str, Any], draft: dict[str,
                 xlsx_source_map[(file_name, sheet, cell)] = text
 
     d_entries = draft.get("docx_translation_map")
+    if isinstance(d_entries, dict) and docx_default_file:
+        d_entries = [
+            {"file": docx_default_file, "id": str(k or "").strip(), "text": str(v or "")}
+            for k, v in d_entries.items()
+            if str(k or "").strip()
+        ]
     if isinstance(d_entries, list):
         for row in d_entries:
             if not isinstance(row, dict):
                 continue
             uid = str(row.get("id") or row.get("unit_id") or row.get("block_id") or row.get("cell_id") or "").strip()
-            if not uid or uid not in docx_source_map:
+            file_name = str(row.get("file") or "").strip() or docx_default_file
+            key = (file_name, uid)
+            if not uid or not file_name or key not in docx_source_map:
                 continue
             before = str(row.get("text") or "")
-            after = _clean_tail_for_source(out_text=before, src_text=docx_source_map[uid])
+            after = _clean_tail_for_source(out_text=before, src_text=docx_source_map[key])
             if after != before:
                 row["text"] = after
                 meta["cleaned_docx_units"] = int(meta["cleaned_docx_units"]) + 1
@@ -860,7 +942,7 @@ def _strip_redundant_glossary_suffixes(context: dict[str, Any], draft: dict[str,
 
 
 def _merge_docx_translation_map(prev_val: Any, new_val: Any) -> Any:
-    """Merge docx translation maps by unit id, preferring new entries on conflict."""
+    """Merge docx translation maps by (file, unit id), preferring new entries on conflict."""
     if not prev_val:
         return new_val
     if not new_val:
@@ -873,19 +955,38 @@ def _merge_docx_translation_map(prev_val: Any, new_val: Any) -> Any:
     if not isinstance(prev_val, list) or not isinstance(new_val, list):
         return new_val
 
-    merged: dict[str, dict[str, Any]] = {}
+    all_items = [x for x in (list(prev_val) + list(new_val)) if isinstance(x, dict)]
+    files = sorted(
+        {
+            str(item.get("file") or "").strip()
+            for item in all_items
+            if str(item.get("file") or "").strip()
+        }
+    )
+    default_file = files[0] if len(files) == 1 else ""
+
+    def _norm_key(item: dict[str, Any]) -> tuple[str, str] | None:
+        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
+        file_name = str(item.get("file") or "").strip() or default_file
+        if not unit_id:
+            return None
+        if not file_name and files:
+            return None
+        return (file_name, unit_id)
+
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
     for item in prev_val:
         if not isinstance(item, dict):
             continue
-        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
-        if unit_id:
-            merged[unit_id] = item
+        key = _norm_key(item)
+        if key is not None:
+            merged[key] = item
     for item in new_val:
         if not isinstance(item, dict):
             continue
-        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
-        if unit_id:
-            merged[unit_id] = item
+        key = _norm_key(item)
+        if key is not None:
+            merged[key] = item
     return list(merged.values())
 
 
@@ -1224,6 +1325,52 @@ def _collect_translated_xlsx_keys(previous_payload: dict[str, Any] | None) -> se
     return keys
 
 
+def _trim_docx_prompt_text(context_payload: dict[str, Any], *, max_chars_per_unit: int) -> int:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return 0
+    sources = preserve.get("docx_sources")
+    if not isinstance(sources, list):
+        return 0
+    trimmed = 0
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        units = src.get("units")
+        if not isinstance(units, list):
+            continue
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            text = unit.get("text")
+            if not isinstance(text, str):
+                continue
+            if len(text) > max_chars_per_unit:
+                unit["text"] = _truncate_text(text, max_chars=max_chars_per_unit)
+                trimmed += 1
+    return trimmed
+
+
+def _collect_translated_docx_keys(previous_payload: dict[str, Any] | None) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    if not isinstance(previous_payload, dict):
+        return keys
+    entries = previous_payload.get("docx_translation_map")
+    if not entries:
+        return keys
+    docx_files: list[str] = []
+    preserve = previous_payload.get("format_preserve")
+    if isinstance(preserve, dict):
+        sources = preserve.get("docx_sources")
+        if isinstance(sources, list):
+            docx_files = [
+                str(src.get("file") or "").strip()
+                for src in sources
+                if isinstance(src, dict) and str(src.get("file") or "").strip()
+            ]
+    return _normalize_docx_translation_map_keys(entries, docx_files=docx_files)
+
+
 def _estimate_xlsx_source_chars(context_payload: dict[str, Any]) -> int:
     """Estimate total source text characters in xlsx_sources for output size prediction."""
     preserve = context_payload.get("format_preserve")
@@ -1387,6 +1534,113 @@ def _compact_xlsx_prompt_payload(
     }
 
 
+def _count_docx_prompt_units(context_payload: dict[str, Any]) -> int:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return 0
+    sources = preserve.get("docx_sources")
+    if not isinstance(sources, list):
+        return 0
+    total = 0
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        units = src.get("units")
+        if isinstance(units, list):
+            total += len(units)
+    return total
+
+
+def _cap_docx_prompt_units(context_payload: dict[str, Any], *, max_units: int) -> int:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return 0
+    sources = preserve.get("docx_sources")
+    if not isinstance(sources, list):
+        return 0
+
+    keep = max(1, int(max_units))
+    kept = 0
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        units = src.get("units")
+        if not isinstance(units, list):
+            continue
+        remaining = keep - kept
+        if remaining <= 0:
+            src["units"] = []
+            continue
+        if len(units) > remaining:
+            src["units"] = units[:remaining]
+        kept += min(len(src.get("units") or []), remaining)
+    return kept
+
+
+def _compact_docx_prompt_payload(
+    context_payload: dict[str, Any],
+    *,
+    previous_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return {"changed": False, "total_units": 0, "kept_units": 0, "skipped_existing": 0}
+    sources = preserve.get("docx_sources")
+    if not isinstance(sources, list):
+        return {"changed": False, "total_units": 0, "kept_units": 0, "skipped_existing": 0}
+
+    translated_keys = _collect_translated_docx_keys(previous_payload)
+    compact_sources: list[dict[str, Any]] = []
+    total_units = 0
+    kept_units = 0
+    skipped_existing = 0
+    changed = False
+
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        file_name = str(src.get("file") or "").strip()
+        units = src.get("units") if isinstance(src.get("units"), list) else []
+        pending_units: list[dict[str, Any]] = []
+        existing_units: list[dict[str, Any]] = []
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("id") or "").strip()
+            unit_file = str(unit.get("file") or file_name).strip()
+            if not unit_id or not unit_file:
+                continue
+            total_units += 1
+            key = _normalize_docx_key(unit_file, unit_id)
+            if translated_keys and key in translated_keys:
+                existing_units.append(unit)
+                skipped_existing += 1
+            else:
+                pending_units.append(unit)
+
+        selected_units = pending_units if pending_units else existing_units
+        if selected_units:
+            kept_units += len(selected_units)
+
+        compact_src = {"file": file_name, "units": selected_units}
+        if "path" in src:
+            compact_src["path"] = src.get("path")
+        if "meta" in src:
+            compact_src["meta"] = src.get("meta")
+        if compact_src.get("units"):
+            compact_sources.append(compact_src)
+        if "units" in src:
+            changed = True
+
+    preserve["docx_sources"] = compact_sources
+    return {
+        "changed": changed,
+        "total_units": total_units,
+        "kept_units": kept_units,
+        "skipped_existing": skipped_existing,
+    }
+
+
 def _compact_previous_draft_for_prompt(previous_payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     if not isinstance(previous_payload, dict):
         return {}, False
@@ -1402,6 +1656,151 @@ def _compact_previous_draft_for_prompt(previous_payload: dict[str, Any]) -> tupl
             out[key] = entries[:OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES]
             changed = True
     return out, changed
+
+
+def _flatten_docx_prompt_units(context_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    preserve = context_payload.get("format_preserve")
+    if not isinstance(preserve, dict):
+        return []
+    sources = preserve.get("docx_sources")
+    if not isinstance(sources, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        file_name = str(src.get("file") or "").strip()
+        path = str(src.get("path") or "").strip()
+        meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+        units = src.get("units")
+        if not isinstance(units, list):
+            continue
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("id") or unit.get("unit_id") or unit.get("block_id") or unit.get("cell_id") or "").strip()
+            unit_file = str(unit.get("file") or file_name).strip()
+            if not unit_file or not unit_id:
+                continue
+            rows.append(
+                {
+                    "file": unit_file,
+                    "path": path,
+                    "meta": meta,
+                    "id": unit_id,
+                    "kind": str(unit.get("kind") or ""),
+                    "style": str(unit.get("style") or ""),
+                    "text": str(unit.get("text") or ""),
+                }
+            )
+    return rows
+
+
+def _group_docx_units_as_sources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        file_name = str(row.get("file") or "").strip()
+        unit_id = str(row.get("id") or "").strip()
+        if not file_name or not unit_id:
+            continue
+        if file_name not in grouped:
+            grouped[file_name] = {"file": file_name, "units": []}
+            order.append(file_name)
+        grouped[file_name]["units"].append(
+            {
+                "file": file_name,
+                "id": unit_id,
+                "kind": str(row.get("kind") or ""),
+                "style": str(row.get("style") or ""),
+                "text": str(row.get("text") or ""),
+            }
+        )
+    out: list[dict[str, Any]] = []
+    for file_name in order:
+        src = grouped[file_name]
+        if src.get("units"):
+            out.append(src)
+    return out
+
+
+def _chunk_docx_units_for_translation(
+    rows: list[dict[str, Any]],
+    *,
+    max_units: int,
+    max_source_chars: int,
+) -> list[list[dict[str, Any]]]:
+    if not rows:
+        return []
+    unit_cap = max(1, int(max_units))
+    char_cap = max(200, int(max_source_chars))
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_chars = 0
+    for row in rows:
+        text_len = len(str(row.get("text") or ""))
+        if current and (len(current) >= unit_cap or current_chars + text_len > char_cap):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(row)
+        current_chars += text_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _docx_batch_key_set(rows: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        file_name = str(row.get("file") or "").strip()
+        unit_id = str(row.get("id") or "").strip()
+        if file_name and unit_id:
+            keys.add(_normalize_docx_key(file_name, unit_id))
+    return keys
+
+
+def _filter_docx_map_for_keys(entries: Any, keys: set[tuple[str, str]], *, default_file: str = "") -> list[dict[str, Any]]:
+    if not keys:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    if isinstance(entries, dict):
+        if not default_file:
+            return []
+        for unit_id, text in entries.items():
+            key = _normalize_docx_key(default_file, str(unit_id or "").strip())
+            if key in keys and key not in seen and key[1]:
+                out.append({"file": default_file, "id": key[1], "text": str(text or "")})
+                seen.add(key)
+        return out
+
+    if not isinstance(entries, list):
+        return []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        file_name = str(item.get("file") or "").strip() or default_file
+        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
+        if not file_name or not unit_id:
+            continue
+        key = _normalize_docx_key(file_name, unit_id)
+        if key not in keys or key in seen:
+            continue
+        out.append(
+            {
+                "file": file_name,
+                "id": unit_id,
+                "text": str(item.get("text") or ""),
+            }
+        )
+        seen.add(key)
+    return out
 
 
 def _flatten_xlsx_prompt_rows(context_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2508,7 +2907,7 @@ def _build_execution_context(
     revision_pack: RevisionPack | None = None,
 ) -> dict[str, Any]:
     task_type = str(intent.get("task_type", "LOW_CONTEXT_TASK"))
-    include_candidate_text = task_type != "SPREADSHEET_TRANSLATION"
+    include_candidate_text = task_type not in {"SPREADSHEET_TRANSLATION", "MULTI_FILE_BATCH"}
     context: dict[str, Any] = {
         "job_id": meta.get("job_id"),
         "subject": meta.get("subject", ""),
@@ -2554,6 +2953,8 @@ PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
         local_findings: list[str],
         xlsx_batch_mode: bool = False,
         xlsx_batch_hint: str = "",
+        docx_batch_mode: bool = False,
+        docx_batch_hint: str = "",
     ) -> str:
         batch_rules = ""
         if xlsx_batch_mode:
@@ -2564,6 +2965,16 @@ PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
 - If you detect a source cell itself is truncated/incomplete, append {SOURCE_TRUNCATED_MARKER} at the end of that cell's translation.
 - XLSX batch hint: {xlsx_batch_hint}
 """
+        if docx_batch_mode:
+            batch_rules = (
+                batch_rules
+                + f"""
+- This is DOCX BATCH MODE. Translate ONLY the docx units present in this batch payload.
+- You MUST return docx_translation_map for every provided unit in the batch.
+- Each docx_translation_map item MUST include file + id + text.
+- DOCX batch hint: {docx_batch_hint}
+"""
+            )
 
         return f"""
 You are Codex translator. Work on this translation job and return strict JSON only.
@@ -2598,6 +3009,7 @@ Rules:
 - Follow the tool instructions above for this specific task type.
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
+- If execution_context.format_preserve.docx_sources is present, you MUST fill docx_translation_map for every provided (file, id).
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
 - XLSX COMPLETENESS: For each cell in xlsx_translation_map, your translated text MUST cover the ENTIRE source text.
   Compare your translation against the source: if the source has 5 sentences, your translation must have 5 sentences.
@@ -2787,6 +3199,8 @@ Rules:
         local_findings: list[str],
         xlsx_batch_mode: bool = False,
         xlsx_batch_hint: str = "",
+        docx_batch_mode: bool = False,
+        docx_batch_hint: str = "",
     ) -> dict[str, Any]:
         prompt_max_bytes = OPENCLAW_AGENT_PROMPT_MAX_BYTES
         if task_type == "SPREADSHEET_TRANSLATION":
@@ -2824,6 +3238,8 @@ Rules:
             local_findings=local_findings,
             xlsx_batch_mode=xlsx_batch_mode,
             xlsx_batch_hint=xlsx_batch_hint,
+            docx_batch_mode=docx_batch_mode,
+            docx_batch_hint=docx_batch_hint,
         )
         prompt_bytes = len(prompt.encode("utf-8"))
         compactions: list[str] = []
@@ -2839,6 +3255,8 @@ Rules:
                 local_findings=local_findings,
                 xlsx_batch_mode=xlsx_batch_mode,
                 xlsx_batch_hint=xlsx_batch_hint,
+                docx_batch_mode=docx_batch_mode,
+                docx_batch_hint=docx_batch_hint,
             )
             prompt_bytes = len(prompt.encode("utf-8"))
 
@@ -2856,6 +3274,8 @@ Rules:
                     local_findings=local_findings,
                     xlsx_batch_mode=xlsx_batch_mode,
                     xlsx_batch_hint=xlsx_batch_hint,
+                    docx_batch_mode=docx_batch_mode,
+                    docx_batch_hint=docx_batch_hint,
                 )
                 prompt_bytes = len(prompt.encode("utf-8"))
 
@@ -2876,6 +3296,8 @@ Rules:
                     local_findings=local_findings,
                     xlsx_batch_mode=xlsx_batch_mode,
                     xlsx_batch_hint=xlsx_batch_hint,
+                    docx_batch_mode=docx_batch_mode,
+                    docx_batch_hint=docx_batch_hint,
                 )
                 prompt_bytes = len(prompt.encode("utf-8"))
 
@@ -2893,9 +3315,74 @@ Rules:
                     local_findings=local_findings,
                     xlsx_batch_mode=xlsx_batch_mode,
                     xlsx_batch_hint=xlsx_batch_hint,
+                    docx_batch_mode=docx_batch_mode,
+                    docx_batch_hint=docx_batch_hint,
                 )
                 prompt_bytes = len(prompt.encode("utf-8"))
                 total_rows = _count_xlsx_prompt_rows(context_payload)
+                shrink_round += 1
+
+        has_docx_sources = _count_docx_prompt_units(context_payload) > 0
+        if prompt_bytes > prompt_max_bytes and has_docx_sources:
+            trimmed_units = _trim_docx_prompt_text(
+                context_payload,
+                max_chars_per_unit=OPENCLAW_DOCX_PROMPT_TEXT_MAX_CHARS,
+            )
+            if trimmed_units > 0:
+                compactions.append(f"trim_docx_text:{trimmed_units}")
+                prompt = _render_prompt(
+                    context_payload=context_payload,
+                    previous_payload=previous_payload,
+                    revision_section=revision_context_section,
+                    local_findings=local_findings,
+                    xlsx_batch_mode=xlsx_batch_mode,
+                    xlsx_batch_hint=xlsx_batch_hint,
+                    docx_batch_mode=docx_batch_mode,
+                    docx_batch_hint=docx_batch_hint,
+                )
+                prompt_bytes = len(prompt.encode("utf-8"))
+
+        if prompt_bytes > prompt_max_bytes and has_docx_sources:
+            compact_stats = _compact_docx_prompt_payload(
+                context_payload,
+                previous_payload=previous_payload,
+            )
+            if compact_stats.get("changed"):
+                compactions.append(
+                    "compact_docx_units:"
+                    f"{int(compact_stats.get('kept_units') or 0)}/{int(compact_stats.get('total_units') or 0)}"
+                )
+                prompt = _render_prompt(
+                    context_payload=context_payload,
+                    previous_payload=previous_payload,
+                    revision_section=revision_context_section,
+                    local_findings=local_findings,
+                    xlsx_batch_mode=xlsx_batch_mode,
+                    xlsx_batch_hint=xlsx_batch_hint,
+                    docx_batch_mode=docx_batch_mode,
+                    docx_batch_hint=docx_batch_hint,
+                )
+                prompt_bytes = len(prompt.encode("utf-8"))
+
+        if prompt_bytes > prompt_max_bytes and has_docx_sources:
+            total_units = _count_docx_prompt_units(context_payload)
+            shrink_round = 0
+            while prompt_bytes > prompt_max_bytes and total_units > 1 and shrink_round < 8:
+                target_units = max(1, int(total_units * 0.7))
+                kept = _cap_docx_prompt_units(context_payload, max_units=target_units)
+                compactions.append(f"cap_docx_units:{kept}/{total_units}")
+                prompt = _render_prompt(
+                    context_payload=context_payload,
+                    previous_payload=previous_payload,
+                    revision_section=revision_context_section,
+                    local_findings=local_findings,
+                    xlsx_batch_mode=xlsx_batch_mode,
+                    xlsx_batch_hint=xlsx_batch_hint,
+                    docx_batch_mode=docx_batch_mode,
+                    docx_batch_hint=docx_batch_hint,
+                )
+                prompt_bytes = len(prompt.encode("utf-8"))
+                total_units = _count_docx_prompt_units(context_payload)
                 shrink_round += 1
 
         if prompt_bytes > prompt_max_bytes and previous_payload:
@@ -2910,6 +3397,8 @@ Rules:
                     local_findings=local_findings,
                     xlsx_batch_mode=xlsx_batch_mode,
                     xlsx_batch_hint=xlsx_batch_hint,
+                    docx_batch_mode=docx_batch_mode,
+                    docx_batch_hint=docx_batch_hint,
                 )
                 prompt_bytes = len(prompt.encode("utf-8"))
 
@@ -2925,6 +3414,8 @@ Rules:
                 local_findings=local_findings,
                 xlsx_batch_mode=xlsx_batch_mode,
                 xlsx_batch_hint=xlsx_batch_hint,
+                docx_batch_mode=docx_batch_mode,
+                docx_batch_hint=docx_batch_hint,
             )
             prompt_bytes = len(prompt.encode("utf-8"))
 
@@ -2951,6 +3442,192 @@ Rules:
 
     context_for_prompt = copy.deepcopy(context)
     previous_for_prompt = copy.deepcopy(previous_draft or {})
+
+    # DOCX batch path for multi-docx or very large DOCX payloads.
+    docx_all_units = _flatten_docx_prompt_units(context_for_prompt)
+    docx_files = sorted({str(row.get("file") or "").strip() for row in docx_all_units if str(row.get("file") or "").strip()})
+    docx_batch_max_units = max(1, int(os.getenv("OPENCLAW_DOCX_BATCH_MAX_UNITS", "80")))
+    docx_batch_max_chars = max(200, int(os.getenv("OPENCLAW_DOCX_BATCH_MAX_SOURCE_CHARS", "12000")))
+    docx_batch_retry = max(0, int(os.getenv("OPENCLAW_DOCX_BATCH_RETRY", "2")))
+    should_docx_batch = (
+        task_type != "SPREADSHEET_TRANSLATION"
+        and bool(docx_all_units)
+        and (len(docx_files) >= 2 or len(docx_all_units) > docx_batch_max_units)
+    )
+    if should_docx_batch:
+        chunks = _chunk_docx_units_for_translation(
+            docx_all_units,
+            max_units=docx_batch_max_units,
+            max_source_chars=docx_batch_max_chars,
+        )
+        chunk_queue: list[dict[str, Any]] = [
+            {"label": str(i), "rows": list(chunk)}
+            for i, chunk in enumerate(chunks, start=1)
+        ]
+        default_docx_file = docx_files[0] if len(docx_files) == 1 else ""
+        merged_docx_map: Any = previous_for_prompt.get("docx_translation_map") if isinstance(previous_for_prompt, dict) else []
+        merged_xlsx_map: Any = previous_for_prompt.get("xlsx_translation_map") if isinstance(previous_for_prompt, dict) else []
+        aggregate_data: dict[str, Any] = {
+            "final_text": "",
+            "final_reflow_text": "",
+            "docx_translation_map": merged_docx_map if isinstance(merged_docx_map, list) else [],
+            "xlsx_translation_map": merged_xlsx_map if isinstance(merged_xlsx_map, list) else [],
+            "review_brief_points": [],
+            "change_log_points": [],
+            "resolved": [],
+            "unresolved": [],
+            "codex_pass": True,
+            "reasoning_summary": "",
+        }
+        first_call_meta: dict[str, Any] = {}
+        failed_batches: list[dict[str, Any]] = []
+
+        while chunk_queue:
+            chunk_item = chunk_queue.pop(0)
+            chunk_label = str(chunk_item.get("label") or "?")
+            chunk_units = chunk_item.get("rows") if isinstance(chunk_item.get("rows"), list) else []
+            if not chunk_units:
+                continue
+            expected_keys = _docx_batch_key_set(chunk_units)
+            batch_context = copy.deepcopy(context_for_prompt)
+            preserve = batch_context.get("format_preserve")
+            if not isinstance(preserve, dict):
+                preserve = {}
+                batch_context["format_preserve"] = preserve
+            preserve["docx_sources"] = _group_docx_units_as_sources(chunk_units)
+            if "docx_template" in preserve:
+                preserve.pop("docx_template", None)
+
+            batch_previous = copy.deepcopy(previous_for_prompt)
+            batch_previous["docx_translation_map"] = _filter_docx_map_for_keys(
+                aggregate_data.get("docx_translation_map"),
+                expected_keys,
+                default_file=default_docx_file,
+            )
+            attempt = 0
+            batch_result: dict[str, Any] | None = None
+            local_findings = list(findings or [])
+            batch_collected_map: Any = batch_previous.get("docx_translation_map") if isinstance(batch_previous, dict) else []
+            split_for_size = False
+            while attempt <= docx_batch_retry:
+                attempt += 1
+                hint = f"batch={chunk_label} units={len(chunk_units)} attempt={attempt} queue={len(chunk_queue)}"
+                batch_result = _run_single_generation(
+                    context_payload=copy.deepcopy(batch_context),
+                    previous_payload=copy.deepcopy(batch_previous),
+                    local_findings=local_findings,
+                    docx_batch_mode=True,
+                    docx_batch_hint=hint,
+                )
+                if not batch_result.get("ok"):
+                    err = str(batch_result.get("error") or "")
+                    detail = str(batch_result.get("detail") or "")
+                    raw_text = str(batch_result.get("raw_text") or "")
+                    if len(chunk_units) > 1 and (
+                        err.startswith("agent_request_too_large:")
+                        or _looks_like_model_request_too_large(detail)
+                        or _looks_like_model_request_too_large(raw_text)
+                    ):
+                        split_for_size = True
+                        mid = max(1, len(chunk_units) // 2)
+                        left_units = list(chunk_units[:mid])
+                        right_units = list(chunk_units[mid:])
+                        chunk_queue = [
+                            {"label": f"{chunk_label}a", "rows": left_units},
+                            {"label": f"{chunk_label}b", "rows": right_units},
+                            *chunk_queue,
+                        ]
+                        failed_batches.append(
+                            {
+                                "batch": chunk_label,
+                                "error": "agent_request_too_large",
+                                "action": "split_retry",
+                                "units": len(chunk_units),
+                                "split_units": [len(left_units), len(right_units)],
+                            }
+                        )
+                        break
+                    continue
+
+                data = batch_result.get("data") if isinstance(batch_result.get("data"), dict) else {}
+                batch_collected_map = _merge_docx_translation_map(batch_collected_map, data.get("docx_translation_map"))
+                if isinstance(batch_collected_map, list):
+                    data["docx_translation_map"] = batch_collected_map
+                got_keys = _normalize_docx_translation_map_keys(batch_collected_map, docx_files=docx_files)
+                missing = sorted(expected_keys - got_keys)
+                if not missing:
+                    break
+                missing_sample = [{"file": f, "id": uid} for (f, uid) in missing[:50]]
+                local_findings = list(findings or []) + [
+                    f"docx_missing_batch_units:{json.dumps(missing_sample, ensure_ascii=False)}"
+                ]
+                batch_previous["docx_translation_map"] = batch_collected_map if isinstance(batch_collected_map, list) else []
+
+            if split_for_size:
+                continue
+
+            if not batch_result or not batch_result.get("ok"):
+                failed_batches.append({"batch": chunk_label, "error": str((batch_result or {}).get("error") or "batch_failed")})
+                continue
+
+            if not first_call_meta:
+                first_call_meta = batch_result.get("call_meta") if isinstance(batch_result.get("call_meta"), dict) else {}
+
+            data = batch_result.get("data") if isinstance(batch_result.get("data"), dict) else {}
+            aggregate_data["docx_translation_map"] = _merge_docx_translation_map(
+                aggregate_data.get("docx_translation_map"),
+                data.get("docx_translation_map"),
+            )
+            aggregate_data["xlsx_translation_map"] = _merge_xlsx_translation_map(
+                aggregate_data.get("xlsx_translation_map"),
+                data.get("xlsx_translation_map"),
+            )
+            aggregate_data["review_brief_points"] = sorted(
+                set([str(x) for x in (aggregate_data.get("review_brief_points") or [])] + [str(x) for x in (data.get("review_brief_points") or [])])
+            )
+            aggregate_data["change_log_points"] = sorted(
+                set([str(x) for x in (aggregate_data.get("change_log_points") or [])] + [str(x) for x in (data.get("change_log_points") or [])])
+            )
+            aggregate_data["resolved"] = sorted(
+                set([str(x) for x in (aggregate_data.get("resolved") or [])] + [str(x) for x in (data.get("resolved") or [])])
+            )
+            aggregate_data["unresolved"] = sorted(
+                set([str(x) for x in (aggregate_data.get("unresolved") or [])] + [str(x) for x in (data.get("unresolved") or [])])
+            )
+            aggregate_data["codex_pass"] = bool(aggregate_data.get("codex_pass")) and bool(data.get("codex_pass", True))
+            if not aggregate_data.get("final_text") and str(data.get("final_text") or "").strip():
+                aggregate_data["final_text"] = str(data.get("final_text") or "")
+            if not aggregate_data.get("final_reflow_text") and str(data.get("final_reflow_text") or "").strip():
+                aggregate_data["final_reflow_text"] = str(data.get("final_reflow_text") or "")
+            aggregate_data["reasoning_summary"] = str(data.get("reasoning_summary") or aggregate_data.get("reasoning_summary") or "")
+
+        expected_all_keys = _docx_batch_key_set(docx_all_units)
+        got_all_keys = _normalize_docx_translation_map_keys(aggregate_data.get("docx_translation_map"), docx_files=docx_files)
+        missing_all = sorted(expected_all_keys - got_all_keys)
+        if missing_all:
+            aggregate_data["unresolved"] = sorted(
+                set([str(x) for x in (aggregate_data.get("unresolved") or [])] + [f"docx_translation_map_incomplete:missing={len(missing_all)}"])
+            )
+            aggregate_data["codex_pass"] = False
+            failed_batches.append({"batch": "backfill", "missing_units": len(missing_all)})
+
+        if failed_batches and not aggregate_data.get("reasoning_summary"):
+            aggregate_data["reasoning_summary"] = "DOCX batch translation partially failed."
+
+        if not aggregate_data.get("docx_translation_map") and failed_batches:
+            return {
+                "ok": False,
+                "error": "docx_batch_generation_failed",
+                "detail": {"failed_batches": failed_batches},
+                "raw_text": "",
+            }
+
+        return {
+            "ok": True,
+            "data": aggregate_data,
+            "raw": {"batch_mode": True, "failed_batches": failed_batches},
+            "call_meta": first_call_meta,
+        }
 
     if task_type != "SPREADSHEET_TRANSLATION":
         return _run_single_generation(
@@ -3477,6 +4154,7 @@ Rules:
 - Follow the tool instructions above for this specific task type.
 - Produce complete output text for the selected task.
 - If execution_context.format_preserve.docx_template is present, you MUST fill docx_translation_map for every unit id provided.
+- If execution_context.format_preserve.docx_sources is present, you MUST fill docx_translation_map for every provided (file, id).
 - If execution_context.format_preserve.xlsx_sources is present, you MUST fill xlsx_translation_map for every provided (file, sheet, cell), whether entries are in cell_units objects or rows tuples [sheet, cell, source_text].
 - XLSX COMPLETENESS: For each cell in xlsx_translation_map, your translated text MUST cover the ENTIRE source text.
   Compare your translation against the source: if the source has 5 sentences, your translation must have 5 sentences.
@@ -4202,17 +4880,50 @@ def run(
                          len(sources_payload),
                          sum(len(s.get("cell_units", [])) for s in sources_payload))
 
-            # DOCX template units (used for preserve output)
+            # DOCX preserve payload.
             template_docx = _select_docx_template(candidates, target_language=str(intent.get("target_language") or ""))
-            if template_docx and Path(template_docx).suffix.lower() == ".docx":
+            if task_type == "MULTI_FILE_BATCH":
+                docx_paths = [
+                    Path(str(c.get("path") or "")).expanduser().resolve()
+                    for c in candidates
+                    if str(c.get("path") or "") and Path(str(c.get("path") or "")).suffix.lower() == ".docx"
+                ]
+            elif template_docx and Path(template_docx).suffix.lower() == ".docx":
+                docx_paths = [Path(template_docx).expanduser().resolve()]
+            else:
+                docx_paths = []
+            if docx_paths:
                 max_units = int(os.getenv("OPENCLAW_DOCX_TRANSLATION_MAX_UNITS", "1200"))
                 max_chars = int(os.getenv("OPENCLAW_DOCX_MAX_CHARS_PER_UNIT", "800"))
-                units, meta_info = extract_docx_units(Path(template_docx), max_units=max_units, max_chars_per_unit=max_chars)
+                docx_sources_payload: list[dict[str, Any]] = []
+                for src in docx_paths:
+                    units, meta_info = extract_docx_units(src, max_units=max_units, max_chars_per_unit=max_chars)
+                    docx_sources_payload.append(
+                        {
+                            "file": src.name,
+                            "path": str(src),
+                            "units": docx_units_to_payload(units),
+                            "meta": meta_info,
+                        }
+                    )
+                format_preserve["docx_sources"] = docx_sources_payload
+
+                # Backward-compatible single-template view.
+                selected = (
+                    next(
+                        (s for s in docx_sources_payload if str(s.get("path") or "") == str(Path(template_docx).expanduser().resolve())),
+                        None,
+                    )
+                    if template_docx
+                    else None
+                )
+                if not selected:
+                    selected = docx_sources_payload[0]
                 format_preserve["docx_template"] = {
-                    "file": Path(template_docx).name,
-                    "path": str(Path(template_docx).expanduser().resolve()),
-                    "units": docx_units_to_payload(units),
-                    "meta": meta_info,
+                    "file": str(selected.get("file") or ""),
+                    "path": str(selected.get("path") or ""),
+                    "units": list(selected.get("units") or []),
+                    "meta": dict(selected.get("meta") or {}),
                 }
         except Exception as exc:
             status_flags.append("format_preserve_payload_error")
@@ -4247,9 +4958,15 @@ def run(
                 )
 
                 source_texts: list[str] = []
-                docx_template = format_preserve.get("docx_template") if isinstance(format_preserve.get("docx_template"), dict) else None
-                if docx_template and isinstance(docx_template.get("units"), list):
-                    for u in docx_template.get("units") or []:
+                docx_sources = format_preserve.get("docx_sources") if isinstance(format_preserve.get("docx_sources"), list) else []
+                if not docx_sources:
+                    docx_template = format_preserve.get("docx_template") if isinstance(format_preserve.get("docx_template"), dict) else None
+                    if docx_template:
+                        docx_sources = [docx_template]
+                for src in docx_sources:
+                    if not isinstance(src, dict):
+                        continue
+                    for u in (src.get("units") or []):
                         if not isinstance(u, dict):
                             continue
                         t = u.get("text")

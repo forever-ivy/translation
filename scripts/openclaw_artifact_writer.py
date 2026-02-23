@@ -132,6 +132,34 @@ def _ensure_change_log_text(change_log_points: list[str], task_type: str) -> str
     )
 
 
+def _normalize_docx_map_entries(entries: Any, *, default_file: str = "") -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not entries:
+        return out
+    if isinstance(entries, dict):
+        if not default_file:
+            return out
+        for unit_id, text in entries.items():
+            uid = str(unit_id or "").strip()
+            if not uid:
+                continue
+            out.append({"file": default_file, "id": uid, "text": str(text or "")})
+        return out
+    if not isinstance(entries, list):
+        return out
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
+        file_name = str(item.get("file") or "").strip() or default_file
+        if not unit_id:
+            continue
+        if not file_name and default_file:
+            file_name = default_file
+        out.append({"file": file_name, "id": unit_id, "text": str(item.get("text") or "")})
+    return out
+
+
 def write_artifacts(
     *,
     review_dir: str,
@@ -190,13 +218,65 @@ def write_artifacts(
     delta_summary_json = system / "Delta Summary.json"
     model_scores_json = system / "Model Scores.json"
 
+    docx_sources = [
+        Path(str(item.get("path") or "")).expanduser().resolve()
+        for item in (candidate_files or [])
+        if str(item.get("path") or "") and Path(str(item.get("path") or "")).suffix.lower() == ".docx"
+    ]
+    docx_default_file = docx_sources[0].name if len(docx_sources) == 1 else ""
+    docx_map_rows = _normalize_docx_map_entries(docx_translation_map, default_file=docx_default_file)
+
     template = Path(draft_a_template_path) if draft_a_template_path else None
-    if template and template.exists() and docx_translation_map:
-        apply_docx_translation_map(template_docx=template, output_docx=final_docx, translation_map_entries=docx_translation_map)
+    final_docx_apply_result: dict[str, Any] = {}
+    if template and template.exists() and docx_map_rows:
+        template_entries = [
+            {"id": row["id"], "text": row["text"]}
+            for row in docx_map_rows
+            if str(row.get("file") or "").strip() in {"", template.name}
+        ]
+        if not template_entries and len(docx_sources) == 1:
+            template_entries = [{"id": row["id"], "text": row["text"]} for row in docx_map_rows]
+        final_docx_apply_result = apply_docx_translation_map(
+            template_docx=template,
+            output_docx=final_docx,
+            translation_map_entries=template_entries,
+        )
     elif template and template.exists():
         build_doc(template, final_docx, final_text)
     else:
         _write_docx(final_docx, "Final", _text_to_lines(final_text))
+
+    docx_entries: list[dict[str, Any]] = []
+    if len(docx_sources) == 1:
+        src = docx_sources[0]
+        docx_entries.append(
+            {
+                "name": final_docx.name,
+                "path": str(final_docx.resolve()),
+                "source_path": str(src),
+                "apply_result": final_docx_apply_result,
+            }
+        )
+    elif len(docx_sources) >= 2 and docx_map_rows:
+        for src in docx_sources:
+            src_entries = [
+                {"id": row["id"], "text": row["text"]}
+                for row in docx_map_rows
+                if str(row.get("file") or "").strip() == src.name
+            ]
+            if not src_entries:
+                continue
+            out_path = review / f"{src.stem}_translated.docx"
+            res = apply_docx_translation_map(
+                template_docx=src,
+                output_docx=out_path,
+                translation_map_entries=src_entries,
+            )
+            docx_entries.append({"name": out_path.name, "path": str(out_path.resolve()), "source_path": str(src), "apply_result": res})
+
+    primary_docx = str(final_docx.resolve())
+    if len(docx_entries) >= 2:
+        primary_docx = str(docx_entries[0]["path"])
 
     _write_docx(final_reflow_docx, "Final-Reflow", _text_to_lines(final_reflow_text))
 
@@ -270,7 +350,8 @@ def write_artifacts(
     _write_json(model_scores_json, model_scores)
 
     manifest: dict[str, Any] = {
-        "final_docx": str(final_docx.resolve()),
+        "final_docx": str(primary_docx),
+        "primary_docx": str(primary_docx),
         "final_reflow_docx": str(final_reflow_docx.resolve()),
         "review_brief_docx": str(review_brief_docx.resolve()),
         "change_log_md": str(change_log_md.resolve()),
@@ -279,6 +360,8 @@ def write_artifacts(
         "delta_summary_json": str(delta_summary_json.resolve()),
         "model_scores_json": str(model_scores_json.resolve()),
     }
+    if docx_entries:
+        manifest["docx_files"] = docx_entries
     if xlsx_entries and len(xlsx_entries) == 1 and xlsx_entries[0]["name"] == final_xlsx.name:
         manifest["final_xlsx"] = str(final_xlsx.resolve())
         manifest["xlsx_files"] = xlsx_entries
