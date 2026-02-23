@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use chrono::{Local, TimeZone};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -210,6 +210,64 @@ pub struct ApiUsage {
 }
 
 // ============================================================================
+// Overview / Operations Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverviewMetrics {
+    pub total_jobs: u64,
+    pub completed_jobs: u64,
+    pub failed_jobs: u64,
+    pub review_ready_jobs: u64,
+    pub running_jobs: u64,
+    pub backlog_jobs: u64,
+    pub success_rate: f64,
+    pub avg_turnaround_minutes: f64,
+    pub services_running: u64,
+    pub services_total: u64,
+    pub open_alerts: u64,
+    pub period_hours: u32,
+    pub generated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrendPoint {
+    pub timestamp: i64,
+    pub label: String,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertItem {
+    pub id: String,
+    pub title: String,
+    pub message: String,
+    pub severity: String, // "critical" | "warning" | "info"
+    pub status: String,   // "open" | "acknowledged"
+    pub source: String,
+    pub metric_value: Option<i64>,
+    pub created_at: i64,
+    pub action_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueSnapshot {
+    pub pending: u64,
+    pub running: u64,
+    pub review_ready: u64,
+    pub done: u64,
+    pub failed: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunSummary {
+    pub date: String,
+    pub text: String,
+    pub generated_at: i64,
+}
+
+// ============================================================================
 // Model Availability Types
 // ============================================================================
 
@@ -273,6 +331,8 @@ pub struct GlmAvailability {
 
 pub struct AppState {
     pub services: Mutex<HashMap<String, ServiceStatus>>,
+    pub acknowledged_alert_ids: Mutex<HashSet<String>>,
+    pub ack_alerts_path: String,
     pub config_path: String,
     pub scripts_path: String,
     pub pids_dir: String,
@@ -311,9 +371,13 @@ impl Default for AppState {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
         let runtime_dir = format!("{}/.openclaw/runtime/translation", home);
         let project_root = detect_project_root();
+        let ack_alerts_path = format!("{}/ack_alerts.json", runtime_dir);
+        let acknowledged_alert_ids = load_ack_alert_ids(&ack_alerts_path);
 
         Self {
             services: Mutex::new(HashMap::new()),
+            acknowledged_alert_ids: Mutex::new(acknowledged_alert_ids),
+            ack_alerts_path,
             config_path: project_root.clone(),
             scripts_path: format!("{}/scripts", project_root),
             pids_dir: format!("{}/pids", runtime_dir),
@@ -1780,6 +1844,507 @@ fn get_job_milestones(job_id: String, state: State<'_, AppState>) -> Result<Vec<
     Ok(milestones)
 }
 
+fn load_ack_alert_ids(path: &str) -> HashSet<String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return HashSet::new(),
+    };
+
+    let ids: Vec<String> = match serde_json::from_str(&content) {
+        Ok(ids) => ids,
+        Err(_) => return HashSet::new(),
+    };
+
+    ids.into_iter().collect()
+}
+
+fn persist_ack_alert_ids(path: &str, ids: &HashSet<String>) -> Result<(), String> {
+    let path_buf = PathBuf::from(path);
+    if let Some(parent) = path_buf.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to prepare alert state dir: {}", e))?;
+    }
+
+    let mut sorted_ids: Vec<String> = ids.iter().cloned().collect();
+    sorted_ids.sort();
+    let payload = serde_json::to_string_pretty(&sorted_ids)
+        .map_err(|e| format!("Failed to serialize alert state: {}", e))?;
+    fs::write(path, payload).map_err(|e| format!("Failed to persist alert state: {}", e))?;
+    Ok(())
+}
+
+fn now_epoch_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn parse_timestamp_local(ts: &str) -> Option<DateTime<Local>> {
+    let s = ts.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Local));
+    }
+
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Local
+            .from_local_datetime(&naive)
+            .single()
+            .or_else(|| Local.from_local_datetime(&naive).earliest());
+    }
+
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Local
+            .from_local_datetime(&naive)
+            .single()
+            .or_else(|| Local.from_local_datetime(&naive).earliest());
+    }
+
+    None
+}
+
+fn read_log_file_inner(state: &AppState, service: &str, lines: u32) -> Result<Vec<String>, String> {
+    let log_file = match service {
+        "telegram" => format!("{}/telegram.log", state.logs_dir),
+        "worker" => format!("{}/worker.log", state.logs_dir),
+        _ => return Err(format!("Unknown service: {}", service)),
+    };
+
+    let output = Command::new("tail")
+        .args(["-n", &lines.to_string(), &log_file])
+        .output()
+        .map_err(|e| format!("Failed to read log: {}", e))?;
+
+    let content = String::from_utf8_lossy(&output.stdout);
+    Ok(content.lines().map(|s| s.to_string()).collect())
+}
+
+fn load_recent_jobs(state: &AppState, limit: u32) -> Result<Vec<JobInfo>, String> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open(&state.db_path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT job_id, status, task_type, sender, created_at, updated_at
+         FROM jobs
+         ORDER BY created_at DESC
+         LIMIT ?1"
+    ).map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt.query_map(rusqlite::params![limit], |row| {
+        Ok(JobInfo {
+            job_id: row.get(0)?,
+            status: row.get(1)?,
+            task_type: row.get(2)?,
+            sender: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    }).map_err(|e| format!("Failed to query jobs: {}", e))?;
+
+    rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect jobs: {}", e))
+}
+
+fn filter_jobs_by_period(jobs: &[JobInfo], period_hours: u32) -> Vec<JobInfo> {
+    let cutoff = Local::now() - Duration::hours(period_hours as i64);
+    jobs.iter()
+        .filter(|job| {
+            parse_timestamp_local(&job.created_at)
+                .map(|ts| ts >= cutoff)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+fn build_queue_snapshot(jobs: &[JobInfo]) -> QueueSnapshot {
+    let mut queue = QueueSnapshot {
+        pending: 0,
+        running: 0,
+        review_ready: 0,
+        done: 0,
+        failed: 0,
+        total: jobs.len() as u64,
+    };
+
+    for job in jobs {
+        let status = job.status.to_lowercase();
+        match status.as_str() {
+            "verified" => queue.done += 1,
+            "failed" => queue.failed += 1,
+            "review_ready" | "needs_attention" => queue.review_ready += 1,
+            "running" | "round_1_done" | "round_2_done" | "round_3_done" => queue.running += 1,
+            _ => queue.pending += 1,
+        }
+    }
+
+    queue
+}
+
+fn push_alert_item(
+    alerts: &mut Vec<AlertItem>,
+    acked: &HashSet<String>,
+    now_ms: i64,
+    id: String,
+    title: String,
+    message: String,
+    severity: &str,
+    source: &str,
+    metric: Option<i64>,
+    action: Option<String>,
+) {
+    let status = if acked.contains(&id) { "acknowledged" } else { "open" };
+    alerts.push(AlertItem {
+        id,
+        title,
+        message,
+        severity: severity.to_string(),
+        status: status.to_string(),
+        source: source.to_string(),
+        metric_value: metric,
+        created_at: now_ms,
+        action_label: action,
+    });
+}
+
+fn build_alerts(state: &AppState, jobs: &[JobInfo], services: &[ServiceStatus], queue: &QueueSnapshot) -> Vec<AlertItem> {
+    let mut alerts: Vec<AlertItem> = Vec::new();
+    let now_ms = now_epoch_ms();
+    let acked = state
+        .acknowledged_alert_ids
+        .lock()
+        .map(|set| set.clone())
+        .unwrap_or_default();
+
+    for service in services {
+        if service.status != "running" {
+            push_alert_item(
+                &mut alerts,
+                &acked,
+                now_ms,
+                format!("service_{}_not_running", service.name.to_lowercase().replace(' ', "_")),
+                format!("{} is not running", service.name),
+                "Service health is degraded. Start or restart this service.".to_string(),
+                "critical",
+                "service",
+                None,
+                Some("Open Service Control".to_string()),
+            );
+        }
+    }
+
+    let failed_jobs = jobs.iter().filter(|j| j.status.eq_ignore_ascii_case("failed")).count() as i64;
+    if failed_jobs > 0 {
+        let sev = if failed_jobs >= 5 { "critical" } else { "warning" };
+        push_alert_item(
+            &mut alerts,
+            &acked,
+            now_ms,
+            "jobs_failed_recent".to_string(),
+            "Failed jobs detected".to_string(),
+            format!("{} jobs failed in the selected period.", failed_jobs),
+            sev,
+            "jobs",
+            Some(failed_jobs),
+            Some("Review failed jobs".to_string()),
+        );
+    }
+
+    if queue.review_ready >= 3 {
+        push_alert_item(
+            &mut alerts,
+            &acked,
+            now_ms,
+            "review_backlog".to_string(),
+            "Review backlog growing".to_string(),
+            format!("{} jobs are waiting for review.", queue.review_ready),
+            "warning",
+            "verify",
+            Some(queue.review_ready as i64),
+            Some("Open Verify queue".to_string()),
+        );
+    }
+
+    if queue.pending >= 10 {
+        push_alert_item(
+            &mut alerts,
+            &acked,
+            now_ms,
+            "queue_pending_high".to_string(),
+            "Pending queue is high".to_string(),
+            format!("{} jobs are still waiting in the queue.", queue.pending),
+            "warning",
+            "queue",
+            Some(queue.pending as i64),
+            Some("Check queue board".to_string()),
+        );
+    }
+
+    if let Ok(worker_lines) = read_log_file_inner(state, "worker", 200) {
+        let err_count = worker_lines
+            .iter()
+            .filter(|line| {
+                let up = line.to_uppercase();
+                up.contains(" ERROR ") || up.contains("[ERROR]") || up.contains("CRITICAL")
+            })
+            .count() as i64;
+
+        if err_count > 0 {
+            push_alert_item(
+                &mut alerts,
+                &acked,
+                now_ms,
+                "worker_error_logs".to_string(),
+                "Worker error logs found".to_string(),
+                format!("{} error-level log lines found recently.", err_count),
+                if err_count >= 10 { "critical" } else { "warning" },
+                "logs",
+                Some(err_count),
+                Some("Inspect technical logs".to_string()),
+            );
+        }
+    }
+
+    if alerts.is_empty() {
+        push_alert_item(
+            &mut alerts,
+            &acked,
+            now_ms,
+            "system_nominal".to_string(),
+            "No active issues".to_string(),
+            "System is healthy. Continue routine monitoring.".to_string(),
+            "info",
+            "system",
+            None,
+            None,
+        );
+    }
+
+    alerts.sort_by(|a, b| {
+        let weight = |sev: &str| match sev {
+            "critical" => 0,
+            "warning" => 1,
+            _ => 2,
+        };
+        let sa = if a.status == "open" { 0 } else { 1 };
+        let sb = if b.status == "open" { 0 } else { 1 };
+        sa.cmp(&sb)
+            .then(weight(&a.severity).cmp(&weight(&b.severity)))
+            .then(b.created_at.cmp(&a.created_at))
+    });
+
+    alerts
+}
+
+fn build_overview_data(state: &AppState, period_hours: u32) -> Result<(OverviewMetrics, QueueSnapshot, Vec<AlertItem>, Vec<JobInfo>), String> {
+    let jobs = filter_jobs_by_period(&load_recent_jobs(state, 2000)?, period_hours);
+    let queue = build_queue_snapshot(&jobs);
+    let services = get_service_status_inner(state)?;
+    let alerts = build_alerts(state, &jobs, &services, &queue);
+
+    let completed_jobs = queue.done;
+    let failed_jobs = queue.failed;
+    let processed_jobs = completed_jobs + failed_jobs;
+    let success_rate = if processed_jobs > 0 {
+        (completed_jobs as f64 / processed_jobs as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let mut turnaround_sum = 0f64;
+    let mut turnaround_count = 0f64;
+    for job in &jobs {
+        if !matches!(job.status.as_str(), "verified" | "failed" | "review_ready") {
+            continue;
+        }
+        let created = parse_timestamp_local(&job.created_at);
+        let updated = parse_timestamp_local(&job.updated_at);
+        if let (Some(c), Some(u)) = (created, updated) {
+            let mins = (u - c).num_seconds() as f64 / 60.0;
+            if mins.is_finite() && mins >= 0.0 {
+                turnaround_sum += mins;
+                turnaround_count += 1.0;
+            }
+        }
+    }
+    let avg_turnaround_minutes = if turnaround_count > 0.0 {
+        turnaround_sum / turnaround_count
+    } else {
+        0.0
+    };
+
+    let services_running = services.iter().filter(|s| s.status == "running").count() as u64;
+    let services_total = services.len() as u64;
+    let open_alerts = alerts.iter().filter(|a| a.status == "open" && a.id != "system_nominal").count() as u64;
+
+    let metrics = OverviewMetrics {
+        total_jobs: jobs.len() as u64,
+        completed_jobs,
+        failed_jobs,
+        review_ready_jobs: queue.review_ready,
+        running_jobs: queue.running,
+        backlog_jobs: queue.pending + queue.running + queue.review_ready,
+        success_rate,
+        avg_turnaround_minutes,
+        services_running,
+        services_total,
+        open_alerts,
+        period_hours,
+        generated_at: now_epoch_ms(),
+    };
+
+    Ok((metrics, queue, alerts, jobs))
+}
+
+#[tauri::command]
+fn get_overview_metrics(range_hours: Option<u32>, state: State<'_, AppState>) -> Result<OverviewMetrics, String> {
+    let period = range_hours.unwrap_or(24).clamp(1, 24 * 14);
+    let (metrics, _, _, _) = build_overview_data(&state, period)?;
+    Ok(metrics)
+}
+
+#[tauri::command]
+fn get_overview_trends(metric: String, range_hours: Option<u32>, state: State<'_, AppState>) -> Result<Vec<TrendPoint>, String> {
+    let period = range_hours.unwrap_or(24).clamp(6, 24 * 14);
+    let jobs = filter_jobs_by_period(&load_recent_jobs(&state, 4000)?, period);
+    let metric_key = metric.to_lowercase();
+    let now = Local::now().timestamp();
+    let current_bucket = now - (now % 3600);
+
+    let mut buckets: HashMap<i64, i64> = HashMap::new();
+    for job in jobs {
+        let use_job = match metric_key.as_str() {
+            "failures" => job.status.eq_ignore_ascii_case("failed"),
+            "review_ready" => matches!(job.status.as_str(), "review_ready" | "needs_attention"),
+            _ => true,
+        };
+        if !use_job {
+            continue;
+        }
+
+        let ts_source = if metric_key == "failures" {
+            parse_timestamp_local(&job.updated_at).or_else(|| parse_timestamp_local(&job.created_at))
+        } else {
+            parse_timestamp_local(&job.created_at)
+        };
+        if let Some(ts) = ts_source {
+            let epoch = ts.timestamp();
+            let bucket = epoch - (epoch % 3600);
+            *buckets.entry(bucket).or_insert(0) += 1;
+        }
+    }
+
+    let mut points = Vec::new();
+    for idx in 0..period {
+        let bucket = current_bucket - ((period - 1 - idx) as i64 * 3600);
+        let value = *buckets.get(&bucket).unwrap_or(&0);
+        let label = Local
+            .timestamp_opt(bucket, 0)
+            .single()
+            .map(|d| d.format("%m-%d %H:00").to_string())
+            .unwrap_or_else(|| bucket.to_string());
+        points.push(TrendPoint {
+            timestamp: bucket * 1000,
+            label,
+            value,
+        });
+    }
+
+    Ok(points)
+}
+
+#[tauri::command]
+fn get_queue_snapshot(state: State<'_, AppState>) -> Result<QueueSnapshot, String> {
+    let jobs = filter_jobs_by_period(&load_recent_jobs(&state, 2000)?, 24);
+    Ok(build_queue_snapshot(&jobs))
+}
+
+#[tauri::command]
+fn list_alerts(status: Option<String>, severity: Option<String>, state: State<'_, AppState>) -> Result<Vec<AlertItem>, String> {
+    let (_, _, mut alerts, _) = build_overview_data(&state, 24)?;
+    if let Some(status_filter) = status {
+        let sf = status_filter.to_lowercase();
+        alerts.retain(|a| a.status.to_lowercase() == sf);
+    }
+    if let Some(sev_filter) = severity {
+        let sev = sev_filter.to_lowercase();
+        alerts.retain(|a| a.severity.to_lowercase() == sev);
+    }
+    Ok(alerts)
+}
+
+#[tauri::command]
+fn ack_alert(alert_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let mut guard = state
+        .acknowledged_alert_ids
+        .lock()
+        .map_err(|_| "Failed to lock alert state".to_string())?;
+    let inserted = guard.insert(alert_id);
+    let snapshot = guard.clone();
+    drop(guard);
+
+    persist_ack_alert_ids(&state.ack_alerts_path, &snapshot)?;
+    Ok(inserted)
+}
+
+#[tauri::command]
+fn export_run_summary(date: Option<String>, state: State<'_, AppState>) -> Result<RunSummary, String> {
+    let (metrics, queue, alerts, _) = build_overview_data(&state, 24)?;
+    let date_str = if let Some(raw) = date {
+        if let Ok(parsed) = NaiveDate::parse_from_str(&raw, "%Y-%m-%d") {
+            parsed.format("%Y-%m-%d").to_string()
+        } else {
+            Local::now().format("%Y-%m-%d").to_string()
+        }
+    } else {
+        Local::now().format("%Y-%m-%d").to_string()
+    };
+
+    let open_alerts: Vec<&AlertItem> = alerts
+        .iter()
+        .filter(|a| a.status == "open" && a.id != "system_nominal")
+        .take(3)
+        .collect();
+
+    let mut lines = vec![
+        format!("Operations Summary ({})", date_str),
+        format!(
+            "- Jobs: total {}, completed {}, failed {}, success {:.1}%",
+            metrics.total_jobs, metrics.completed_jobs, metrics.failed_jobs, metrics.success_rate
+        ),
+        format!(
+            "- Queue: pending {}, running {}, review {}, failed {}",
+            queue.pending, queue.running, queue.review_ready, queue.failed
+        ),
+        format!(
+            "- Services: {}/{} running",
+            metrics.services_running, metrics.services_total
+        ),
+        format!(
+            "- Avg turnaround: {:.1} min",
+            metrics.avg_turnaround_minutes
+        ),
+    ];
+
+    if open_alerts.is_empty() {
+        lines.push("- Alerts: no active issues".to_string());
+    } else {
+        lines.push(format!("- Alerts: {} active", open_alerts.len()));
+        for alert in open_alerts {
+            lines.push(format!("  • [{}] {}", alert.severity.to_uppercase(), alert.title));
+        }
+    }
+
+    Ok(RunSummary {
+        date: date_str,
+        text: lines.join("\n"),
+        generated_at: now_epoch_ms(),
+    })
+}
+
 // ============================================================================
 // Artifact Commands
 // ============================================================================
@@ -2418,19 +2983,7 @@ fn open_in_finder(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn read_log_file(state: State<'_, AppState>, service: String, lines: u32) -> Result<Vec<String>, String> {
-    let log_file = match service.as_str() {
-        "telegram" => format!("{}/telegram.log", state.logs_dir),
-        "worker" => format!("{}/worker.log", state.logs_dir),
-        _ => return Err(format!("Unknown service: {}", service)),
-    };
-
-    let output = Command::new("tail")
-        .args(["-n", &lines.to_string(), &log_file])
-        .output()
-        .map_err(|e| format!("Failed to read log: {}", e))?;
-
-    let content = String::from_utf8_lossy(&output.stdout);
-    Ok(content.lines().map(|s| s.to_string()).collect())
+    read_log_file_inner(&state, &service, lines)
 }
 
 // ============================================================================
@@ -2713,6 +3266,12 @@ pub fn run() {
             save_config,
             get_jobs,
             get_job_milestones,
+            get_overview_metrics,
+            get_overview_trends,
+            get_queue_snapshot,
+            list_alerts,
+            ack_alert,
+            export_run_summary,
             list_verify_artifacts,
             get_quality_report,
             get_verify_folder_path,

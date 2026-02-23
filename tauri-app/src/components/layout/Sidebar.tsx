@@ -18,14 +18,14 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 
 const navItems = [
-  { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-  { id: "services", label: "Services", icon: Server },
-  { id: "jobs", label: "Jobs", icon: Briefcase },
-  { id: "verify", label: "Verify", icon: FileCheck },
-  { id: "logs", label: "Logs", icon: ScrollText },
-  { id: "kb-health", label: "KB Health", icon: Database },
+  { id: "dashboard", label: "Overview", icon: LayoutDashboard },
+  { id: "services", label: "Service Control", icon: Server },
+  { id: "jobs", label: "Task Center", icon: Briefcase },
+  { id: "verify", label: "Review Desk", icon: FileCheck },
+  { id: "logs", label: "Technical Logs", icon: ScrollText },
+  { id: "kb-health", label: "Knowledge Health", icon: Database },
   { id: "glossary", label: "Glossary", icon: BookText },
-  { id: "api-config", label: "API Config", icon: Key },
+  { id: "api-config", label: "API Access", icon: Key },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 

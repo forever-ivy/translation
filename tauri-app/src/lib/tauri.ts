@@ -334,6 +334,84 @@ export const stopDockerServices = (): Promise<void> =>
   tInvoke<void>("stop_docker_services");
 
 // ============================================================================
+// Overview / Operations Types
+// ============================================================================
+
+export interface OverviewMetrics {
+  total_jobs: number;
+  completed_jobs: number;
+  failed_jobs: number;
+  review_ready_jobs: number;
+  running_jobs: number;
+  backlog_jobs: number;
+  success_rate: number;
+  avg_turnaround_minutes: number;
+  services_running: number;
+  services_total: number;
+  open_alerts: number;
+  period_hours: number;
+  generated_at: number;
+}
+
+export interface TrendPoint {
+  timestamp: number;
+  label: string;
+  value: number;
+}
+
+export type AlertSeverity = "critical" | "warning" | "info";
+export type AlertStatus = "open" | "acknowledged";
+
+export interface AlertItem {
+  id: string;
+  title: string;
+  message: string;
+  severity: AlertSeverity;
+  status: AlertStatus;
+  source: string;
+  metric_value?: number;
+  created_at: number;
+  action_label?: string;
+}
+
+export interface QueueSnapshot {
+  pending: number;
+  running: number;
+  review_ready: number;
+  done: number;
+  failed: number;
+  total: number;
+}
+
+export interface RunSummary {
+  date: string;
+  text: string;
+  generated_at: number;
+}
+
+// ============================================================================
+// Overview / Operations Commands
+// ============================================================================
+
+export const getOverviewMetrics = (rangeHours?: number): Promise<OverviewMetrics> =>
+  tInvoke<OverviewMetrics>("get_overview_metrics", { rangeHours });
+
+export const getOverviewTrends = (metric: string, rangeHours?: number): Promise<TrendPoint[]> =>
+  tInvoke<TrendPoint[]>("get_overview_trends", { metric, rangeHours });
+
+export const getQueueSnapshot = (): Promise<QueueSnapshot> =>
+  tInvoke<QueueSnapshot>("get_queue_snapshot");
+
+export const listAlerts = (status?: AlertStatus, severity?: AlertSeverity): Promise<AlertItem[]> =>
+  tInvoke<AlertItem[]>("list_alerts", { status, severity });
+
+export const ackAlert = (alertId: string): Promise<boolean> =>
+  tInvoke<boolean>("ack_alert", { alertId });
+
+export const exportRunSummary = (date?: string): Promise<RunSummary> =>
+  tInvoke<RunSummary>("export_run_summary", { date });
+
+// ============================================================================
 // API Provider Types
 // ============================================================================
 

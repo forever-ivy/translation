@@ -111,6 +111,57 @@ export interface ApiUsage {
   fetchedAt: number;
 }
 
+export interface OverviewMetrics {
+  totalJobs: number;
+  completedJobs: number;
+  failedJobs: number;
+  reviewReadyJobs: number;
+  runningJobs: number;
+  backlogJobs: number;
+  successRate: number;
+  avgTurnaroundMinutes: number;
+  servicesRunning: number;
+  servicesTotal: number;
+  openAlerts: number;
+  periodHours: number;
+  generatedAt: number;
+}
+
+export interface TrendPoint {
+  timestamp: number;
+  label: string;
+  value: number;
+}
+
+export type OverviewTrendMetric = "throughput" | "failures" | "review_ready";
+
+export interface AlertItem {
+  id: string;
+  title: string;
+  message: string;
+  severity: "critical" | "warning" | "info";
+  status: "open" | "acknowledged";
+  source: string;
+  metricValue?: number;
+  createdAt: number;
+  actionLabel?: string;
+}
+
+export interface QueueSnapshot {
+  pending: number;
+  running: number;
+  reviewReady: number;
+  done: number;
+  failed: number;
+  total: number;
+}
+
+export interface RunSummary {
+  date: string;
+  text: string;
+  generatedAt: number;
+}
+
 export type ModelAvailabilityReport = tauri.ModelAvailabilityReport;
 
 interface AppState {
@@ -210,6 +261,22 @@ interface AppState {
   // Model Availability
   modelAvailabilityReport: ModelAvailabilityReport | null;
   fetchModelAvailabilityReport: () => Promise<void>;
+
+  // Operations Overview
+  overviewMetrics: OverviewMetrics | null;
+  overviewTrends: TrendPoint[];
+  overviewTrendMetric: OverviewTrendMetric;
+  setOverviewTrendMetric: (metric: OverviewTrendMetric) => void;
+  overviewAlerts: AlertItem[];
+  queueSnapshot: QueueSnapshot | null;
+  runSummary: RunSummary | null;
+  fetchOverviewMetrics: (rangeHours?: number) => Promise<void>;
+  fetchOverviewTrends: (metric?: OverviewTrendMetric, rangeHours?: number) => Promise<void>;
+  fetchOverviewAlerts: (status?: "open" | "acknowledged", severity?: "critical" | "warning" | "info") => Promise<void>;
+  ackOverviewAlert: (alertId: string) => Promise<void>;
+  fetchQueueSnapshot: () => Promise<void>;
+  fetchRunSummary: (date?: string) => Promise<void>;
+  refreshOverviewData: (opts?: { includeTrends?: boolean }) => Promise<void>;
 
   // Consolidated polling actions
   refreshDashboardData: (opts?: { silent?: boolean; includeJobs?: boolean }) => Promise<void>;
@@ -320,6 +387,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   // KB Health
   kbSyncReport: null,
   kbStats: null,
+
+  // Operations Overview
+  overviewMetrics: null,
+  overviewTrends: [],
+  overviewTrendMetric: "throughput",
+  setOverviewTrendMetric: (overviewTrendMetric) => set({ overviewTrendMetric }),
+  overviewAlerts: [],
+  queueSnapshot: null,
+  runSummary: null,
 
   // UI State
   isLoading: false,
@@ -928,12 +1004,132 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  // Operations Overview
+  fetchOverviewMetrics: async (rangeHours = 24) => {
+    try {
+      const metrics = await tauri.getOverviewMetrics(rangeHours);
+      set({
+        overviewMetrics: {
+          totalJobs: metrics.total_jobs,
+          completedJobs: metrics.completed_jobs,
+          failedJobs: metrics.failed_jobs,
+          reviewReadyJobs: metrics.review_ready_jobs,
+          runningJobs: metrics.running_jobs,
+          backlogJobs: metrics.backlog_jobs,
+          successRate: metrics.success_rate,
+          avgTurnaroundMinutes: metrics.avg_turnaround_minutes,
+          servicesRunning: metrics.services_running,
+          servicesTotal: metrics.services_total,
+          openAlerts: metrics.open_alerts,
+          periodHours: metrics.period_hours,
+          generatedAt: metrics.generated_at,
+        },
+      });
+    } catch (err) {
+      console.warn("fetchOverviewMetrics failed:", err);
+    }
+  },
+  fetchOverviewTrends: async (metric, rangeHours = 24) => {
+    const selectedMetric = metric ?? get().overviewTrendMetric;
+    try {
+      const points = await tauri.getOverviewTrends(selectedMetric, rangeHours);
+      set({
+        overviewTrendMetric: selectedMetric,
+        overviewTrends: points.map((p) => ({
+          timestamp: p.timestamp,
+          label: p.label,
+          value: p.value,
+        })),
+      });
+    } catch (err) {
+      console.warn("fetchOverviewTrends failed:", err);
+    }
+  },
+  fetchOverviewAlerts: async (status, severity) => {
+    try {
+      const alerts = await tauri.listAlerts(status, severity);
+      set({
+        overviewAlerts: alerts.map((a) => ({
+          id: a.id,
+          title: a.title,
+          message: a.message,
+          severity: a.severity,
+          status: a.status,
+          source: a.source,
+          metricValue: a.metric_value,
+          createdAt: a.created_at,
+          actionLabel: a.action_label,
+        })),
+      });
+    } catch (err) {
+      console.warn("fetchOverviewAlerts failed:", err);
+    }
+  },
+  ackOverviewAlert: async (alertId: string) => {
+    try {
+      await tauri.ackAlert(alertId);
+      set((state) => ({
+        overviewMetrics: state.overviewMetrics
+          ? { ...state.overviewMetrics, openAlerts: Math.max(0, state.overviewMetrics.openAlerts - 1) }
+          : state.overviewMetrics,
+        overviewAlerts: state.overviewAlerts.map((item) =>
+          item.id === alertId ? { ...item, status: "acknowledged" } : item
+        ),
+      }));
+      await get().fetchOverviewAlerts();
+      get().addToast("success", "Alert acknowledged");
+    } catch (err) {
+      get().addToast("error", `Failed to acknowledge alert: ${err}`);
+    }
+  },
+  fetchQueueSnapshot: async () => {
+    try {
+      const queue = await tauri.getQueueSnapshot();
+      set({
+        queueSnapshot: {
+          pending: queue.pending,
+          running: queue.running,
+          reviewReady: queue.review_ready,
+          done: queue.done,
+          failed: queue.failed,
+          total: queue.total,
+        },
+      });
+    } catch (err) {
+      console.warn("fetchQueueSnapshot failed:", err);
+    }
+  },
+  fetchRunSummary: async (date?: string) => {
+    try {
+      const summary = await tauri.exportRunSummary(date);
+      set({
+        runSummary: {
+          date: summary.date,
+          text: summary.text,
+          generatedAt: summary.generated_at,
+        },
+      });
+    } catch (err) {
+      console.warn("fetchRunSummary failed:", err);
+    }
+  },
+  refreshOverviewData: async (opts?: { includeTrends?: boolean }) => {
+    await Promise.all([
+      get().fetchOverviewMetrics(24),
+      get().fetchOverviewAlerts(),
+      get().fetchQueueSnapshot(),
+      get().fetchRunSummary(),
+      opts?.includeTrends === false ? Promise.resolve() : get().fetchOverviewTrends(get().overviewTrendMetric, 24),
+    ]);
+  },
+
   // Consolidated polling actions
   refreshDashboardData: async (opts?: { silent?: boolean; includeJobs?: boolean }) => {
     await Promise.all([
       get().fetchServices(),
       get().fetchDockerStatus(),
       opts?.includeJobs ? get().fetchJobs(undefined, { silent: opts?.silent }) : Promise.resolve(),
+      get().refreshOverviewData({ includeTrends: !!opts?.includeJobs }),
     ]);
   },
   refreshJobsData: async (opts?: { silent?: boolean }) => {
