@@ -261,6 +261,56 @@ class SkillApprovalBatchSplitTest(unittest.TestCase):
             conn.close()
 
     @patch("scripts.skill_approval.send_message")
+    def test_status_redirects_from_batch_child_to_parent_overview(self, mocked_send):
+        mocked_send.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as td:
+            work_root = Path(td) / "Translation Task"
+            kb_root = Path(td) / "Knowledge Repository"
+            (kb_root / "30_Reference" / "Eventranz").mkdir(parents=True, exist_ok=True)
+            sender = "+8613"
+
+            src1 = work_root / "_INBOX" / "sources" / "A.xlsx"
+            src2 = work_root / "_INBOX" / "sources" / "B.xlsx"
+            src1.parent.mkdir(parents=True, exist_ok=True)
+            src1.write_bytes(b"")
+            src2.write_bytes(b"")
+
+            job_id = "job_test_batch_status_redirect"
+            self._make_job_with_files(work_root=work_root, kb_root=kb_root, sender=sender, job_id=job_id, paths=[src1, src2])
+
+            with patch.dict("os.environ", {"OPENCLAW_RUN_SPLIT_MULTI_XLSX": "1"}, clear=False):
+                run_res = handle_command(
+                    command_text="run",
+                    work_root=work_root,
+                    kb_root=kb_root,
+                    target=sender,
+                    sender=sender,
+                    dry_run_notify=True,
+                )
+            children = (run_res.get("batch") or {}).get("child_jobs") or []
+            self.assertEqual(len(children), 2)
+            child_id = str(children[0].get("child_job_id") or "")
+
+            rt = ensure_runtime_paths(work_root)
+            conn = db_connect(rt)
+            set_sender_active_job(conn, sender=sender, job_id=child_id)
+            conn.close()
+
+            status_res = handle_command(
+                command_text="status",
+                work_root=work_root,
+                kb_root=kb_root,
+                target=sender,
+                sender=sender,
+                dry_run_notify=True,
+            )
+            self.assertTrue(status_res["ok"])
+            self.assertEqual(status_res.get("job_id"), job_id)
+            # Ensure status message contains batch overview line.
+            sent_msg = mocked_send.call_args.kwargs.get("message", "")
+            self.assertIn("Batch:", sent_msg)
+
+    @patch("scripts.skill_approval.send_message")
     def test_new_prefills_company_from_last(self, mocked_send):
         mocked_send.return_value = {"ok": True}
         with tempfile.TemporaryDirectory() as td:
@@ -306,4 +356,3 @@ class SkillApprovalBatchSplitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

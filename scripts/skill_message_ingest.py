@@ -110,7 +110,7 @@ def _is_command(text: str) -> bool:
     if not lowered:
         return False
     head = lowered.split(" ", 1)[0]
-    return head in {"new", "run", "status", "ok", "no", "rerun", "approve", "reject"}
+    return head in {"new", "run", "status", "ok", "no", "rerun", "cancel", "discard", "help", "company", "approve", "reject"}
 
 
 def _require_new_enabled() -> bool:

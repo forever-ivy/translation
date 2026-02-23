@@ -49,7 +49,7 @@ WORK_ROOT = os.getenv("V4_WORK_ROOT", "/Users/ivy/Library/CloudStorage/OneDrive-
 KB_ROOT = os.getenv("V4_KB_ROOT", "/Users/ivy/Library/CloudStorage/OneDrive-Personal/Knowledge Repository")
 PYTHON_BIN = os.getenv("V4_PYTHON_BIN", sys.executable)
 
-COMMAND_HEADS = {"new", "run", "status", "ok", "no", "rerun", "cancel", "stop", "abort", "approve", "reject", "discard", "help"}
+COMMAND_HEADS = {"new", "run", "status", "ok", "no", "rerun", "cancel", "stop", "abort", "approve", "reject", "discard", "help", "company"}
 
 _running = True
 

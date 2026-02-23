@@ -184,6 +184,18 @@ def _split_multi_xlsx_job_and_enqueue(
         except Exception:
             pass
 
+        # Tag child as a batch child so status can redirect to the batch parent when needed.
+        try:
+            child_artifacts = {"batch": {"parent_job_id": parent_job_id, "source_file": src_path.name}}
+            child_flags = ["batch_child"]
+            conn.execute(
+                "UPDATE jobs SET artifacts_json=?, status_flags_json=?, updated_at=? WHERE job_id=?",
+                (json.dumps(child_artifacts, ensure_ascii=False), json.dumps(child_flags, ensure_ascii=False), utc_now_iso(), child_job_id),
+            )
+            conn.commit()
+        except Exception:
+            pass
+
         # Attach file record for child job.
         attach_file_to_job(work_root=paths.work_root, job_id=child_job_id, path=dst_path)
 
@@ -983,6 +995,7 @@ def handle_command(
 
 🔹 Task Management
   new [note]      - Create new task
+  company         - Select/override company for this task
   status [job_id] - Check task status
   cancel [job_id] - Cancel running task
   discard [reason]- Delete task and files
@@ -1064,17 +1077,37 @@ def handle_command(
         set_sender_active_job(conn, sender=sender.strip(), job_id=job_id)
 
     if action == "status":
-        msg = _status_text(conn, job, multiple_hint=resolve_meta.get("multiple", 0), require_new=require_new)
+        # If the active job is a batch child, redirect status to the batch parent for overview.
+        job_for_status = job
+        redirected_child_id = ""
+        if not explicit_job_id:
+            artifacts = job.get("artifacts_json") if isinstance(job.get("artifacts_json"), dict) else {}
+            batch = artifacts.get("batch") if isinstance(artifacts.get("batch"), dict) else {}
+            parent_job_id = str(batch.get("parent_job_id") or "").strip()
+            if parent_job_id:
+                parent = get_job(conn, parent_job_id)
+                if parent:
+                    redirected_child_id = str(job.get("job_id") or "").strip()
+                    job_for_status = parent
+
+        msg = _status_text(conn, job_for_status, multiple_hint=resolve_meta.get("multiple", 0), require_new=require_new)
+        if redirected_child_id:
+            msg = (
+                msg
+                + "\n\n\u21aa Active file job: "
+                + redirected_child_id
+                + f"\nSend: status {redirected_child_id} for details"
+            )
         _send_and_record(
             conn,
-            job_id=job_id,
+            job_id=str(job_for_status.get("job_id") or job_id),
             milestone="status",
             target=target,
             message=msg,
             dry_run=dry_run_notify,
         )
         conn.close()
-        return {"ok": True, "job_id": job_id, "status": str(job.get("status")), "resolve": resolve_meta}
+        return {"ok": True, "job_id": str(job_for_status.get("job_id") or job_id), "status": str(job_for_status.get("status")), "resolve": resolve_meta}
 
     current_status = str(job.get("status") or "")
     current_norm = current_status.strip().lower()
@@ -1475,10 +1508,13 @@ def handle_command(
                         sample.append(f"{entry.get('file_name')} -> {entry.get('child_job_id')}")
                 more = max(0, total - len(sample))
                 failure_list = split_res.get("failures") if isinstance(split_res.get("failures"), list) else []
+                review_dir = str(job.get("review_dir") or "").strip()
+                folder_line = f"\U0001f4c1 {review_dir}\n" if review_dir else ""
                 msg = (
                     f"\u23f3 Accepted \u00b7 batch queued ({total} files)\n"
                     f"\U0001f4cb {_task_name}\n"
                     f"\U0001f194 {job_id}\n"
+                    + folder_line
                     + ("\n".join(sample) + ("\n" if sample else ""))
                     + (f"+{more} more\n" if more else "")
                     + (f"\u26a0\ufe0f Failures: {', '.join([str(x) for x in failure_list[:3]])}\n" if failure_list else "")
