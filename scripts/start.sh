@@ -12,6 +12,10 @@
 #   ./scripts/start.sh --status     # Show service status
 #   ./scripts/start.sh --stop       # Stop all services
 #   ./scripts/start.sh --restart    # Restart all services
+#   ./scripts/start.sh --gateway-start   # Start web gateway
+#   ./scripts/start.sh --gateway-stop    # Stop web gateway
+#   ./scripts/start.sh --gateway-status  # Show web gateway status
+#   ./scripts/start.sh --gateway-login   # Check/login web gateway session
 #
 set -euo pipefail
 
@@ -239,6 +243,40 @@ start_reminder() {
     log_ok "Pending reminder completed"
 }
 
+gateway_dispatch() {
+    local subcmd="$1"
+    load_env
+    local work_root="${V4_WORK_ROOT:-$HOME/Translation Task}"
+    local kb_root="${V4_KB_ROOT:-$HOME/Knowledge Repository}"
+    local notify_target="${OPENCLAW_NOTIFY_TARGET:-}"
+
+    "$PYTHON_BIN" -m scripts.openclaw_v4_dispatcher \
+        --work-root "$work_root" \
+        --kb-root "$kb_root" \
+        --notify-target "$notify_target" \
+        "$subcmd"
+}
+
+gateway_start() {
+    log_info "Starting web gateway..."
+    gateway_dispatch "gateway-start"
+}
+
+gateway_stop() {
+    log_info "Stopping web gateway..."
+    gateway_dispatch "gateway-stop"
+}
+
+gateway_status() {
+    log_info "Checking web gateway status..."
+    gateway_dispatch "gateway-status"
+}
+
+gateway_login() {
+    log_info "Checking web gateway login state..."
+    gateway_dispatch "gateway-login"
+}
+
 stop_service() {
     local service="$1"
     local name
@@ -445,6 +483,18 @@ case "${1:-}" in
     --status|-s)
         show_status
         ;;
+    --gateway-start)
+        gateway_start
+        ;;
+    --gateway-stop)
+        gateway_stop
+        ;;
+    --gateway-status)
+        gateway_status
+        ;;
+    --gateway-login)
+        gateway_login
+        ;;
     --stop)
         stop_all
         ;;
@@ -472,6 +522,10 @@ case "${1:-}" in
         echo "  --status, -s    Show service status"
         echo "  --stop          Stop all services"
         echo "  --restart       Restart all services"
+        echo "  --gateway-start Start web gateway"
+        echo "  --gateway-stop  Stop web gateway"
+        echo "  --gateway-status Show web gateway status"
+        echo "  --gateway-login Check/login web gateway session"
         echo "  --logs          Show log directory"
         echo "  -h, --help      Show this help"
         echo ""

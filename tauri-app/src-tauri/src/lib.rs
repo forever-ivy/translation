@@ -30,6 +30,29 @@ pub struct PreflightCheck {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GatewayStatus {
+    pub running: bool,
+    pub healthy: bool,
+    pub logged_in: bool,
+    pub base_url: String,
+    pub model: String,
+    pub last_error: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuditOperationPayload {
+    pub operation_id: Option<String>,
+    pub source: String,
+    pub action: String,
+    pub job_id: Option<String>,
+    pub sender: Option<String>,
+    pub status: String,
+    pub summary: String,
+    pub detail: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job_id: String,
@@ -677,6 +700,123 @@ fn find_python_bin(state: &AppState) -> String {
     "python3".to_string()
 }
 
+fn dispatcher_notify_target(state: &AppState) -> String {
+    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
+    let env_map = read_env_map(&env_path);
+    env_map
+        .get("OPENCLAW_NOTIFY_TARGET")
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn run_dispatcher_json(state: &AppState, args: &[&str]) -> Result<serde_json::Value, String> {
+    let config = get_config_inner(state)?;
+    let python_bin = find_python_bin(state);
+    let notify_target = dispatcher_notify_target(state);
+
+    let mut cmd_args: Vec<String> = vec![
+        "-m".to_string(),
+        "scripts.openclaw_v4_dispatcher".to_string(),
+        "--work-root".to_string(),
+        config.work_root,
+        "--kb-root".to_string(),
+        config.kb_root,
+        "--notify-target".to_string(),
+        notify_target,
+    ];
+    cmd_args.extend(args.iter().map(|s| s.to_string()));
+
+    let output = Command::new(&python_bin)
+        .args(&cmd_args)
+        .current_dir(&state.config_path)
+        .output()
+        .map_err(|e| format!("Failed to run dispatcher {:?}: {}", args, e))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+        return Err(format!("dispatcher {:?} failed: {}", args, detail));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .map_err(|e| format!("Failed to parse dispatcher output: {}", e))
+}
+
+fn parse_gateway_status(value: &serde_json::Value) -> GatewayStatus {
+    let result = value.get("result").unwrap_or(value);
+    GatewayStatus {
+        running: result.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+        healthy: result.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false),
+        logged_in: result.get("logged_in").and_then(|v| v.as_bool()).unwrap_or(false),
+        base_url: result
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        model: result
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        last_error: result
+            .get("last_error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        updated_at: result
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn audit_operation_inner(state: &AppState, payload: &AuditOperationPayload) -> Result<serde_json::Value, String> {
+    let mut args: Vec<String> = vec![
+        "ops-audit".to_string(),
+        "--source".to_string(),
+        if payload.source.trim().is_empty() {
+            "tauri".to_string()
+        } else {
+            payload.source.clone()
+        },
+        "--action".to_string(),
+        payload.action.clone(),
+        "--status".to_string(),
+        if payload.status.trim().is_empty() {
+            "success".to_string()
+        } else {
+            payload.status.clone()
+        },
+        "--summary".to_string(),
+        payload.summary.clone(),
+    ];
+    if let Some(op_id) = payload.operation_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        args.push("--operation-id".to_string());
+        args.push(op_id.to_string());
+    }
+    if let Some(job_id) = payload.job_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        args.push("--job-id".to_string());
+        args.push(job_id.to_string());
+    }
+    if let Some(sender) = payload.sender.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        args.push("--sender".to_string());
+        args.push(sender.to_string());
+    }
+    if let Some(detail) = payload.detail.as_ref() {
+        args.push("--detail-json".to_string());
+        args.push(detail.to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run_dispatcher_json(state, &refs)
+}
+
+fn best_effort_audit_operation(state: &AppState, payload: AuditOperationPayload) {
+    let _ = audit_operation_inner(state, &payload);
+}
+
 fn fmt_epoch_ms(ms: i64) -> String {
     // Best-effort local timestamp formatting (human-friendly). Fallback: raw ms.
     match Local.timestamp_millis_opt(ms).single() {
@@ -1319,6 +1459,44 @@ fn start_services_inner(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn audit_operation(payload: AuditOperationPayload, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    audit_operation_inner(&state, &payload)
+}
+
+#[tauri::command]
+fn gateway_status(state: State<'_, AppState>) -> Result<GatewayStatus, String> {
+    let out = run_dispatcher_json(&state, &["gateway-status"])?;
+    Ok(parse_gateway_status(&out))
+}
+
+#[tauri::command]
+fn gateway_start(state: State<'_, AppState>) -> Result<GatewayStatus, String> {
+    let out = run_dispatcher_json(&state, &["gateway-start"])?;
+    if !out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(format!("gateway-start failed: {}", out));
+    }
+    Ok(parse_gateway_status(&out))
+}
+
+#[tauri::command]
+fn gateway_stop(state: State<'_, AppState>) -> Result<GatewayStatus, String> {
+    let out = run_dispatcher_json(&state, &["gateway-stop"])?;
+    if !out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(format!("gateway-stop failed: {}", out));
+    }
+    Ok(parse_gateway_status(&out))
+}
+
+#[tauri::command]
+fn gateway_login(state: State<'_, AppState>) -> Result<GatewayStatus, String> {
+    let out = run_dispatcher_json(&state, &["gateway-login"])?;
+    if !out.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(format!("gateway-login failed: {}", out));
+    }
+    Ok(parse_gateway_status(&out))
+}
+
 // ============================================================================
 // Service Management Commands
 // ============================================================================
@@ -1330,23 +1508,104 @@ async fn get_service_status(state: State<'_, AppState>) -> Result<Vec<ServiceSta
 
 #[tauri::command]
 async fn start_all_services(state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
-    start_services_inner(&state)?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    get_service_status_inner(&state)
+    let result = async {
+        start_services_inner(&state)?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        get_service_status_inner(&state)
+    }
+    .await;
+    match &result {
+        Ok(services) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_start".to_string(),
+                status: "success".to_string(),
+                summary: "start_all_services completed".to_string(),
+                detail: Some(serde_json::json!({ "scope": "all", "services": services })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+        Err(err) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_start".to_string(),
+                status: "failed".to_string(),
+                summary: "start_all_services failed".to_string(),
+                detail: Some(serde_json::json!({ "scope": "all", "error": err })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+    }
+    result
 }
 
 #[tauri::command]
 async fn stop_all_services(state: State<'_, AppState>) -> Result<(), String> {
-    stop_services_inner(&state)
+    let result = stop_services_inner(&state);
+    match &result {
+        Ok(_) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_stop".to_string(),
+                status: "success".to_string(),
+                summary: "stop_all_services completed".to_string(),
+                detail: Some(serde_json::json!({ "scope": "all" })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+        Err(err) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_stop".to_string(),
+                status: "failed".to_string(),
+                summary: "stop_all_services failed".to_string(),
+                detail: Some(serde_json::json!({ "scope": "all", "error": err })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+    }
+    result
 }
 
 #[tauri::command]
 async fn restart_all_services(state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
-    stop_services_inner(&state)?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    start_services_inner(&state)?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    get_service_status_inner(&state)
+    let result = async {
+        stop_services_inner(&state)?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        start_services_inner(&state)?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        get_service_status_inner(&state)
+    }
+    .await;
+    match &result {
+        Ok(services) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_restart".to_string(),
+                status: "success".to_string(),
+                summary: "restart_all_services completed".to_string(),
+                detail: Some(serde_json::json!({ "scope": "all", "services": services })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+        Err(err) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_restart".to_string(),
+                status: "failed".to_string(),
+                summary: "restart_all_services failed".to_string(),
+                detail: Some(serde_json::json!({ "scope": "all", "error": err })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+    }
+    result
 }
 
 fn service_flag(service_id: &str, action: &str) -> Result<&'static str, String> {
@@ -1363,26 +1622,113 @@ fn service_flag(service_id: &str, action: &str) -> Result<&'static str, String> 
 
 #[tauri::command]
 async fn start_service(service_id: String, state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
-    let flag = service_flag(service_id.trim(), "start")?;
-    run_start_script(&state, flag)?;
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    get_service_status_inner(&state)
+    let service_name = service_id.clone();
+    let result = async {
+        let flag = service_flag(service_id.trim(), "start")?;
+        run_start_script(&state, flag)?;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        get_service_status_inner(&state)
+    }
+    .await;
+    match &result {
+        Ok(services) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_start".to_string(),
+                status: "success".to_string(),
+                summary: format!("start_service:{} completed", service_name),
+                detail: Some(serde_json::json!({ "service": service_name, "services": services })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+        Err(err) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_start".to_string(),
+                status: "failed".to_string(),
+                summary: format!("start_service:{} failed", service_name),
+                detail: Some(serde_json::json!({ "service": service_name, "error": err })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+    }
+    result
 }
 
 #[tauri::command]
 async fn stop_service(service_id: String, state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
-    let flag = service_flag(service_id.trim(), "stop")?;
-    run_start_script(&state, flag)?;
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    get_service_status_inner(&state)
+    let service_name = service_id.clone();
+    let result = async {
+        let flag = service_flag(service_id.trim(), "stop")?;
+        run_start_script(&state, flag)?;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        get_service_status_inner(&state)
+    }
+    .await;
+    match &result {
+        Ok(services) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_stop".to_string(),
+                status: "success".to_string(),
+                summary: format!("stop_service:{} completed", service_name),
+                detail: Some(serde_json::json!({ "service": service_name, "services": services })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+        Err(err) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_stop".to_string(),
+                status: "failed".to_string(),
+                summary: format!("stop_service:{} failed", service_name),
+                detail: Some(serde_json::json!({ "service": service_name, "error": err })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+    }
+    result
 }
 
 #[tauri::command]
 async fn restart_service(service_id: String, state: State<'_, AppState>) -> Result<Vec<ServiceStatus>, String> {
-    let flag = service_flag(service_id.trim(), "restart")?;
-    run_start_script(&state, flag)?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    get_service_status_inner(&state)
+    let service_name = service_id.clone();
+    let result = async {
+        let flag = service_flag(service_id.trim(), "restart")?;
+        run_start_script(&state, flag)?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        get_service_status_inner(&state)
+    }
+    .await;
+    match &result {
+        Ok(services) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_restart".to_string(),
+                status: "success".to_string(),
+                summary: format!("restart_service:{} completed", service_name),
+                detail: Some(serde_json::json!({ "service": service_name, "services": services })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+        Err(err) => best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "service_restart".to_string(),
+                status: "failed".to_string(),
+                summary: format!("restart_service:{} failed", service_name),
+                detail: Some(serde_json::json!({ "service": service_name, "error": err })),
+                ..AuditOperationPayload::default()
+            },
+        ),
+    }
+    result
 }
 
 // ============================================================================
@@ -1520,6 +1866,17 @@ fn auto_fix_preflight(state: State<'_, AppState>) -> Result<Vec<PreflightCheck>,
 
     // Re-run preflight checks
     let checks = run_preflight_check_inner(&state);
+    best_effort_audit_operation(
+        &state,
+        AuditOperationPayload {
+            source: "tauri".to_string(),
+            action: "preflight_autofix".to_string(),
+            status: "success".to_string(),
+            summary: "auto_fix_preflight completed".to_string(),
+            detail: Some(serde_json::json!({ "checks": checks.clone() })),
+            ..AuditOperationPayload::default()
+        },
+    );
     Ok(checks)
 }
 
@@ -1800,17 +2157,52 @@ async fn start_openclaw(state: State<'_, AppState>) -> Result<Vec<PreflightCheck
     }
 
     if !started {
-        return Err("OpenClaw not found. Please install it first.".to_string());
+        let err = "OpenClaw not found. Please install it first.".to_string();
+        best_effort_audit_operation(
+            &state,
+            AuditOperationPayload {
+                source: "tauri".to_string(),
+                action: "openclaw_start".to_string(),
+                status: "failed".to_string(),
+                summary: "start_openclaw failed".to_string(),
+                detail: Some(serde_json::json!({ "error": err })),
+                ..AuditOperationPayload::default()
+            },
+        );
+        return Err(err);
     }
 
     // Re-run preflight checks
     let checks = run_preflight_check_inner(&state);
+    best_effort_audit_operation(
+        &state,
+        AuditOperationPayload {
+            source: "tauri".to_string(),
+            action: "openclaw_start".to_string(),
+            status: "success".to_string(),
+            summary: "start_openclaw completed".to_string(),
+            detail: Some(serde_json::json!({ "checks": checks.clone() })),
+            ..AuditOperationPayload::default()
+        },
+    );
     Ok(checks)
 }
 
 #[tauri::command]
 fn run_preflight_check(state: State<'_, AppState>) -> Vec<PreflightCheck> {
-    run_preflight_check_inner(&state)
+    let checks = run_preflight_check_inner(&state);
+    best_effort_audit_operation(
+        &state,
+        AuditOperationPayload {
+            source: "tauri".to_string(),
+            action: "preflight_run".to_string(),
+            status: "success".to_string(),
+            summary: "run_preflight_check completed".to_string(),
+            detail: Some(serde_json::json!({ "checks": checks.clone() })),
+            ..AuditOperationPayload::default()
+        },
+    );
+    checks
 }
 
 // ============================================================================
@@ -3911,6 +4303,11 @@ pub fn run() {
             run_preflight_check,
             auto_fix_preflight,
             start_openclaw,
+            audit_operation,
+            gateway_start,
+            gateway_stop,
+            gateway_status,
+            gateway_login,
             get_config,
             save_config,
             get_env_settings,
@@ -4187,5 +4584,43 @@ mod tests {
                 "zai/glm-5".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_gateway_status_reads_nested_result_payload() {
+        let payload = json!({
+            "ok": true,
+            "result": {
+                "running": true,
+                "healthy": true,
+                "logged_in": false,
+                "base_url": "http://127.0.0.1:8765",
+                "model": "chatgpt-web",
+                "last_error": "",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }
+        });
+        let status = parse_gateway_status(&payload);
+        assert!(status.running);
+        assert!(status.healthy);
+        assert!(!status.logged_in);
+        assert_eq!(status.base_url, "http://127.0.0.1:8765");
+        assert_eq!(status.model, "chatgpt-web");
+    }
+
+    #[test]
+    fn parse_gateway_status_handles_flat_payload() {
+        let payload = json!({
+            "running": false,
+            "healthy": false,
+            "logged_in": false,
+            "base_url": "",
+            "model": "",
+            "last_error": "gateway_unavailable",
+            "updated_at": ""
+        });
+        let status = parse_gateway_status(&payload);
+        assert!(!status.running);
+        assert_eq!(status.last_error, "gateway_unavailable");
     }
 }

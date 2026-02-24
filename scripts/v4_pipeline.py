@@ -1019,6 +1019,39 @@ def run_job_pipeline(
         errors=list(result.get("errors", [])) + pdf_errors,
     )
 
+    gateway_error_tokens = {
+        "gateway_unavailable",
+        "gateway_login_required",
+        "gateway_timeout",
+        "gateway_bad_payload",
+    }
+    gateway_error = ""
+    for token in [str(x) for x in (result.get("errors") or [])] + [str(x) for x in (result.get("status_flags") or [])]:
+        t = token.strip()
+        if t in gateway_error_tokens:
+            gateway_error = t
+            break
+        for prefix in gateway_error_tokens:
+            if t.startswith(prefix):
+                gateway_error = prefix
+                break
+        if gateway_error:
+            break
+    if gateway_error:
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="gateway_failed",
+            message=(
+                f"🚨 Gateway failed ({gateway_error})\n"
+                f"📋 {_task_name}\n"
+                "Fix: gateway-status · gateway-login · rerun"
+            ),
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+
     if result.get("status") == "queued":
         retry_after = 300
         for item in (result.get("errors") or []):

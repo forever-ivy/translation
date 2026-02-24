@@ -1464,6 +1464,137 @@ def latest_actionable_job(conn: sqlite3.Connection, *, sender: str | None = None
     return dict(row) if row else None
 
 
+def resolve_operation_notify_target(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str = "",
+    sender: str = "",
+) -> str:
+    """Resolve Telegram notify target for an operation event.
+
+    Priority:
+    1) sender from job(job_id)
+    2) sender from sender_active_jobs (explicit sender first, then latest active sender)
+    3) latest actionable job sender
+    4) OPENCLAW_NOTIFY_TARGET fallback
+    """
+    job_id_norm = (job_id or "").strip()
+    sender_norm = (sender or "").strip()
+
+    if job_id_norm:
+        job = get_job(conn, job_id_norm)
+        if job:
+            job_sender = str(job.get("sender") or "").strip()
+            if job_sender:
+                return job_sender
+        if not sender_norm:
+            interaction = get_job_interaction(conn, job_id=job_id_norm)
+            if interaction:
+                interaction_sender = str(interaction.get("sender") or "").strip()
+                if interaction_sender:
+                    sender_norm = interaction_sender
+
+    if sender_norm:
+        active_job_id = get_sender_active_job(conn, sender=sender_norm)
+        if active_job_id:
+            active_job = get_job(conn, active_job_id)
+            if active_job:
+                active_sender = str(active_job.get("sender") or "").strip()
+                if active_sender:
+                    return active_sender
+        return sender_norm
+
+    row = conn.execute(
+        """
+        SELECT sender
+        FROM sender_active_jobs
+        WHERE sender != ''
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row:
+        active_sender = str(row["sender"] or "").strip()
+        if active_sender:
+            return active_sender
+
+    latest = latest_actionable_job(conn)
+    if latest:
+        latest_sender = str(latest.get("sender") or "").strip()
+        if latest_sender:
+            return latest_sender
+
+    return str(DEFAULT_NOTIFY_TARGET or "").strip()
+
+
+def audit_operation_event(
+    conn: sqlite3.Connection,
+    *,
+    operation_payload: dict[str, Any],
+    milestone: str = "ops_audit",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    payload = dict(operation_payload or {})
+    operation_id = str(payload.get("operation_id") or "").strip() or f"op_{uuid.uuid4().hex[:12]}"
+    source = str(payload.get("source") or "").strip() or "unknown"
+    action = str(payload.get("action") or "").strip() or "unknown_action"
+    job_id = str(payload.get("job_id") or "").strip()
+    sender = str(payload.get("sender") or "").strip()
+    status = str(payload.get("status") or "").strip() or "unknown"
+    summary = str(payload.get("summary") or "").strip()
+    detail = payload.get("detail")
+    ts = str(payload.get("ts") or "").strip() or utc_now_iso()
+    target = resolve_operation_notify_target(conn, job_id=job_id, sender=sender)
+
+    normalized = {
+        "operation_id": operation_id,
+        "source": source,
+        "action": action,
+        "job_id": job_id,
+        "sender": sender,
+        "status": status,
+        "summary": summary,
+        "detail": detail,
+        "ts": ts,
+    }
+    msg = f"[OPS][{operation_id}] {action} | job={job_id or '-'} | status={status}"
+    if summary:
+        msg = f"{msg}\n{summary}"
+
+    send_result: dict[str, Any]
+    try:
+        send_result = send_message(target=target, message=msg, dry_run=dry_run)
+    except Exception as exc:  # pragma: no cover - defensive
+        send_result = {"ok": False, "error": f"audit_send_failed:{exc}"}
+
+    record_ok = True
+    record_error = ""
+    try:
+        record_event(
+            conn,
+            job_id=job_id,
+            milestone=milestone,
+            payload={
+                "operation": normalized,
+                "target": target,
+                "message": msg,
+                "send_result": send_result,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        record_ok = False
+        record_error = f"audit_record_failed:{exc}"
+
+    return {
+        "ok": record_ok,
+        "operation": normalized,
+        "target": target,
+        "message": msg,
+        "send_result": send_result,
+        "record_error": record_error,
+    }
+
+
 def mailbox_uid_seen(conn: sqlite3.Connection, mailbox: str, uid: str) -> bool:
     row = conn.execute("SELECT 1 FROM mail_seen WHERE mailbox=? AND uid=?", (mailbox, uid)).fetchone()
     return row is not None

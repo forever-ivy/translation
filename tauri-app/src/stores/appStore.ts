@@ -61,6 +61,16 @@ export interface DockerContainer {
   image: string;
 }
 
+export interface GatewayStatus {
+  running: boolean;
+  healthy: boolean;
+  loggedIn: boolean;
+  baseUrl: string;
+  model: string;
+  lastError: string;
+  updatedAt: string;
+}
+
 export interface KbSyncReport {
   ok: boolean;
   kbRoot: string;
@@ -219,6 +229,7 @@ interface AppState {
   // KB Health
   kbSyncReport: KbSyncReport | null;
   kbStats: KbStats | null;
+  gatewayStatus: GatewayStatus | null;
 
   // UI State
   isLoading: boolean;
@@ -248,6 +259,10 @@ interface AppState {
   fetchPreflightChecks: () => Promise<void>;
   autoFixPreflight: () => Promise<void>;
   startOpenclaw: () => Promise<void>;
+  fetchGatewayStatus: () => Promise<void>;
+  startGateway: () => Promise<void>;
+  stopGateway: () => Promise<void>;
+  loginGateway: () => Promise<void>;
   fetchConfig: () => Promise<void>;
   fetchJobs: (status?: string, opts?: { silent?: boolean }) => Promise<void>;
   fetchJobMilestones: (jobId: string, opts?: { silent?: boolean }) => Promise<void>;
@@ -470,6 +485,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   // KB Health
   kbSyncReport: null,
   kbStats: null,
+  gatewayStatus: null,
 
   // Operations Overview
   overviewMetrics: null,
@@ -602,8 +618,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       } else {
         get().addToast("warning", `${blockers.length} issues require manual fix`);
       }
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "preflight_autofix",
+        status: "success",
+        summary: "auto_fix_preflight completed",
+        detail: { blockers: blockers.length },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Auto-fix failed: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "preflight_autofix",
+        status: "failed",
+        summary: "auto_fix_preflight failed",
+        detail: { error: String(err) },
+      }).catch(() => undefined);
     } finally {
       set({ isLoading: false });
     }
@@ -627,8 +657,114 @@ export const useAppStore = create<AppState>((set, get) => ({
       } else {
         get().addToast("error", "Failed to start OpenClaw");
       }
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "openclaw_start",
+        status: "success",
+        summary: "start_openclaw completed",
+        detail: { openclawStatus: openclaw?.status ?? "unknown" },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Failed to start OpenClaw: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "openclaw_start",
+        status: "failed",
+        summary: "start_openclaw failed",
+        detail: { error: String(err) },
+      }).catch(() => undefined);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  fetchGatewayStatus: async () => {
+    try {
+      const status = await tauri.gatewayStatus();
+      set({
+        gatewayStatus: {
+          running: status.running,
+          healthy: status.healthy,
+          loggedIn: status.logged_in,
+          baseUrl: status.base_url,
+          model: status.model,
+          lastError: status.last_error,
+          updatedAt: status.updated_at,
+        },
+      });
+    } catch (err) {
+      get().addToast("error", `Failed to fetch gateway status: ${err}`);
+    }
+  },
+
+  startGateway: async () => {
+    set({ isLoading: true, error: null });
+    try {
+      const status = await tauri.gatewayStart();
+      set({
+        gatewayStatus: {
+          running: status.running,
+          healthy: status.healthy,
+          loggedIn: status.logged_in,
+          baseUrl: status.base_url,
+          model: status.model,
+          lastError: status.last_error,
+          updatedAt: status.updated_at,
+        },
+      });
+      get().addToast("success", "Gateway started");
+    } catch (err) {
+      get().addToast("error", `Failed to start gateway: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  stopGateway: async () => {
+    set({ isLoading: true, error: null });
+    try {
+      const status = await tauri.gatewayStop();
+      set({
+        gatewayStatus: {
+          running: status.running,
+          healthy: status.healthy,
+          loggedIn: status.logged_in,
+          baseUrl: status.base_url,
+          model: status.model,
+          lastError: status.last_error,
+          updatedAt: status.updated_at,
+        },
+      });
+      get().addToast("success", "Gateway stopped");
+    } catch (err) {
+      get().addToast("error", `Failed to stop gateway: ${err}`);
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  loginGateway: async () => {
+    set({ isLoading: true, error: null });
+    try {
+      const status = await tauri.gatewayLogin();
+      set({
+        gatewayStatus: {
+          running: status.running,
+          healthy: status.healthy,
+          loggedIn: status.logged_in,
+          baseUrl: status.base_url,
+          model: status.model,
+          lastError: status.last_error,
+          updatedAt: status.updated_at,
+        },
+      });
+      if (status.logged_in) {
+        get().addToast("success", "Gateway login verified");
+      } else {
+        get().addToast("warning", "Gateway login not completed");
+      }
+    } catch (err) {
+      get().addToast("error", `Gateway login check failed: ${err}`);
     } finally {
       set({ isLoading: false });
     }
@@ -758,8 +894,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       } else {
         get().addToast("error", "Services failed to start");
       }
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_start",
+        status: "success",
+        summary: "start_all_services completed",
+        detail: { scope: "all", running, total: services.length },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Failed to start services: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_start",
+        status: "failed",
+        summary: "start_all_services failed",
+        detail: { scope: "all", error: String(err) },
+      }).catch(() => undefined);
     } finally {
       set({ isLoading: false });
     }
@@ -772,8 +922,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       await delay(2000);
       await get().fetchServices();
       get().addToast("success", "All services stopped");
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_stop",
+        status: "success",
+        summary: "stop_all_services completed",
+        detail: { scope: "all" },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Failed to stop services: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_stop",
+        status: "failed",
+        summary: "stop_all_services failed",
+        detail: { scope: "all", error: String(err) },
+      }).catch(() => undefined);
     } finally {
       set({ isLoading: false });
     }
@@ -786,8 +950,22 @@ export const useAppStore = create<AppState>((set, get) => ({
       await delay(2000);
       await get().fetchServices();
       get().addToast("success", "All services restarted");
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_restart",
+        status: "success",
+        summary: "restart_all_services completed",
+        detail: { scope: "all" },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Failed to restart services: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_restart",
+        status: "failed",
+        summary: "restart_all_services failed",
+        detail: { scope: "all", error: String(err) },
+      }).catch(() => undefined);
     } finally {
       set({ isLoading: false });
     }
@@ -807,8 +985,22 @@ export const useAppStore = create<AppState>((set, get) => ({
         })),
       });
       get().addToast("success", `Started ${serviceId}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_start",
+        status: "success",
+        summary: `start_service:${serviceId} completed`,
+        detail: { serviceId },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Failed to start ${serviceId}: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_start",
+        status: "failed",
+        summary: `start_service:${serviceId} failed`,
+        detail: { serviceId, error: String(err) },
+      }).catch(() => undefined);
     } finally {
       set({ isLoading: false });
     }
@@ -828,8 +1020,22 @@ export const useAppStore = create<AppState>((set, get) => ({
         })),
       });
       get().addToast("success", `Stopped ${serviceId}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_stop",
+        status: "success",
+        summary: `stop_service:${serviceId} completed`,
+        detail: { serviceId },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Failed to stop ${serviceId}: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_stop",
+        status: "failed",
+        summary: `stop_service:${serviceId} failed`,
+        detail: { serviceId, error: String(err) },
+      }).catch(() => undefined);
     } finally {
       set({ isLoading: false });
     }
@@ -849,8 +1055,22 @@ export const useAppStore = create<AppState>((set, get) => ({
         })),
       });
       get().addToast("success", `Restarted ${serviceId}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_restart",
+        status: "success",
+        summary: `restart_service:${serviceId} completed`,
+        detail: { serviceId },
+      }).catch(() => undefined);
     } catch (err) {
       get().addToast("error", `Failed to restart ${serviceId}: ${err}`);
+      void tauri.auditOperation({
+        source: "tauri",
+        action: "service_restart",
+        status: "failed",
+        summary: `restart_service:${serviceId} failed`,
+        detail: { serviceId, error: String(err) },
+      }).catch(() => undefined);
     } finally {
       set({ isLoading: false });
     }

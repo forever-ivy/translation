@@ -1432,6 +1432,143 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         mocked_glm_call.assert_called_once()
         mocked_kimi_call.assert_called_once()
 
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._glm_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    def test_codex_generate_strict_gateway_only_no_direct_fallback(
+        self,
+        mocked_gateway,
+        mocked_agent_call,
+        mocked_glm_call,
+        mocked_kimi_call,
+    ):
+        mocked_gateway.return_value = {
+            "ok": True,
+            "text": json.dumps(
+                {
+                    "final_text": "Gateway output",
+                    "final_reflow_text": "Gateway output",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "ok",
+                }
+            ),
+            "source": "web_gateway",
+            "model": "chatgpt-web",
+        }
+        context = {
+            "task_intent": {"task_type": "LOW_CONTEXT_TASK"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+        }
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
+        ):
+            out = _codex_generate(context, None, [], 1)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "chatgpt-web")
+        mocked_gateway.assert_called_once()
+        mocked_agent_call.assert_not_called()
+        mocked_glm_call.assert_not_called()
+        mocked_kimi_call.assert_not_called()
+
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._glm_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    def test_codex_generate_strict_gateway_failure_returns_gateway_error(
+        self,
+        mocked_gateway,
+        mocked_agent_call,
+        mocked_glm_call,
+        mocked_kimi_call,
+    ):
+        mocked_gateway.return_value = {"ok": False, "error": "gateway_timeout", "detail": "timeout"}
+        context = {
+            "task_intent": {"task_type": "LOW_CONTEXT_TASK"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+        }
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
+        ):
+            out = _codex_generate(context, None, [], 1)
+        self.assertFalse(out.get("ok"))
+        self.assertEqual(out.get("error"), "gateway_timeout")
+        mocked_gateway.assert_called_once()
+        mocked_agent_call.assert_not_called()
+        mocked_glm_call.assert_not_called()
+        mocked_kimi_call.assert_not_called()
+
+    @patch("scripts.openclaw_translation_orchestrator.write_artifacts")
+    @patch("scripts.openclaw_translation_orchestrator._build_execution_context")
+    @patch("scripts.openclaw_translation_orchestrator._build_delta_pack")
+    @patch("scripts.openclaw_translation_orchestrator._enrich_structures")
+    @patch("scripts.openclaw_translation_orchestrator._collect_candidates")
+    @patch("scripts.openclaw_translation_orchestrator._llm_intent")
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    def test_run_strict_gateway_failure_sets_gateway_status_flag(
+        self,
+        mocked_gateway,
+        mocked_llm_intent,
+        mocked_collect_candidates,
+        mocked_enrich_structures,
+        mocked_build_delta,
+        mocked_build_context,
+        mocked_write_artifacts,
+    ):
+        mocked_gateway.return_value = {"ok": False, "error": "gateway_unavailable", "detail": "down"}
+        mocked_llm_intent.return_value = {
+            "ok": True,
+            "intent": {
+                "task_type": "LOW_CONTEXT_TASK",
+                "source_language": "ar",
+                "target_language": "en",
+                "required_inputs": [],
+                "missing_inputs": [],
+                "confidence": 0.91,
+                "reasoning_summary": "ok",
+            },
+            "estimated_minutes": 3,
+            "complexity_score": 1.0,
+        }
+        mocked_collect_candidates.return_value = [
+            {"path": "/tmp/source.docx", "name": "source.docx", "language": "ar", "version": "v1", "role": "source"}
+        ]
+        mocked_enrich_structures.return_value = mocked_collect_candidates.return_value
+        mocked_build_delta.return_value = {"job_id": "job_gw_fail"}
+        mocked_build_context.return_value = {"task_intent": {"task_type": "LOW_CONTEXT_TASK"}}
+        mocked_write_artifacts.return_value = {"quality_report_json": ""}
+
+        with tempfile.TemporaryDirectory() as td:
+            review_dir = Path(td) / "_VERIFY" / "job_gw_fail"
+            meta = {
+                "job_id": "job_gw_fail",
+                "root_path": td,
+                "review_dir": str(review_dir),
+                "candidate_files": [],
+                "knowledge_context": [],
+            }
+            with (
+                patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+                patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
+            ):
+                out = run(meta, plan_only=False)
+
+        self.assertEqual(out.get("status"), "failed")
+        self.assertIn("gateway_unavailable", [str(x) for x in (out.get("status_flags") or [])])
+        self.assertIn("gateway_unavailable", [str(x) for x in (out.get("errors") or [])])
+
 
 class AvailableSlotsTest(unittest.TestCase):
     def test_french_english_pair(self):

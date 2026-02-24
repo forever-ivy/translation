@@ -214,11 +214,11 @@ OPENCLAW_AGENT_CALL_RETRY_MAX_BACKOFF_SECONDS = max(
 )
 OPENCLAW_LOCK_RECOVERY_ENABLED = _env_flag("OPENCLAW_LOCK_RECOVERY_ENABLED", "1")
 OPENCLAW_LOCK_STALE_SECONDS = max(30, int(os.getenv("OPENCLAW_LOCK_STALE_SECONDS", "150")))
-OPENCLAW_DIRECT_API_MAX_ATTEMPTS = max(1, int(os.getenv("OPENCLAW_DIRECT_API_MAX_ATTEMPTS", "4")))
+OPENCLAW_DIRECT_API_MAX_ATTEMPTS = max(1, int(os.getenv("OPENCLAW_DIRECT_API_MAX_ATTEMPTS", "10")))
 OPENCLAW_DIRECT_API_BACKOFF_SECONDS = max(0.5, float(os.getenv("OPENCLAW_DIRECT_API_BACKOFF_SECONDS", "2.5")))
 OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS = max(
     OPENCLAW_DIRECT_API_BACKOFF_SECONDS,
-    float(os.getenv("OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS", "20")),
+    float(os.getenv("OPENCLAW_DIRECT_API_MAX_BACKOFF_SECONDS", "35")),
 )
 OPENCLAW_COOLDOWN_FRIENDLY_MODE = _env_flag("OPENCLAW_COOLDOWN_FRIENDLY_MODE", "1")
 OPENCLAW_COOLDOWN_RETRY_SECONDS = max(30, int(os.getenv("OPENCLAW_COOLDOWN_RETRY_SECONDS", "300")))
@@ -256,6 +256,11 @@ KIMI_CODING_API_BASE_URL = os.getenv(
     "OPENCLAW_KIMI_CODING_BASE_URL",
     os.getenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/v1"),
 )
+WEB_GATEWAY_ENABLED = _env_flag("OPENCLAW_WEB_GATEWAY_ENABLED", "0")
+WEB_GATEWAY_STRICT = _env_flag("OPENCLAW_WEB_GATEWAY_STRICT", "0")
+WEB_GATEWAY_BASE_URL = str(os.getenv("OPENCLAW_WEB_GATEWAY_BASE_URL", "http://127.0.0.1:8765")).strip()
+WEB_GATEWAY_MODEL = str(os.getenv("OPENCLAW_WEB_GATEWAY_MODEL", "chatgpt-web")).strip() or "chatgpt-web"
+WEB_GATEWAY_TIMEOUT_SECONDS = max(10, int(os.getenv("OPENCLAW_WEB_GATEWAY_TIMEOUT_SECONDS", "180")))
 
 
 def _glm_enabled() -> bool:
@@ -967,7 +972,11 @@ def _merge_docx_translation_map(prev_val: Any, new_val: Any) -> Any:
 
     def _norm_key(item: dict[str, Any]) -> tuple[str, str] | None:
         unit_id = str(item.get("id") or item.get("unit_id") or item.get("block_id") or item.get("cell_id") or "").strip()
-        file_name = str(item.get("file") or "").strip() or default_file
+        # Force use default_file when available to avoid LLM filename variants causing dedup failure
+        if default_file:
+            file_name = default_file
+        else:
+            file_name = str(item.get("file") or "").strip()
         if not unit_id:
             return None
         if not file_name and files:
@@ -990,7 +999,7 @@ def _merge_docx_translation_map(prev_val: Any, new_val: Any) -> Any:
     return list(merged.values())
 
 
-def _merge_xlsx_translation_map(prev_val: Any, new_val: Any) -> Any:
+def _merge_xlsx_translation_map(prev_val: Any, new_val: Any, *, default_file: str = "") -> Any:
     """Merge xlsx translation maps by (file,sheet,cell), preferring new entries on conflict."""
     if not prev_val:
         return new_val
@@ -1005,8 +1014,24 @@ def _merge_xlsx_translation_map(prev_val: Any, new_val: Any) -> Any:
     if not isinstance(prev_val, list) or not isinstance(new_val, list):
         return new_val
 
+    all_items = [x for x in (list(prev_val) + list(new_val)) if isinstance(x, dict)]
+    files = sorted(
+        {
+            str(item.get("file") or "").strip()
+            for item in all_items
+            if str(item.get("file") or "").strip()
+        }
+    )
+    # Use passed default_file if available, otherwise infer from items (single file scenario)
+    inferred_default = files[0] if len(files) == 1 else ""
+    effective_default = default_file or inferred_default
+
     def _norm_key(item: dict[str, Any]) -> tuple[str, str, str] | None:
-        file_name = str(item.get("file") or "").strip()
+        # Force use effective_default when available to avoid LLM filename variants causing dedup failure
+        if effective_default:
+            file_name = effective_default
+        else:
+            file_name = str(item.get("file") or "").strip()
         sheet = str(item.get("sheet") or "").strip()
         cell = str(item.get("cell") or "").strip().upper()
         if not (file_name and sheet and cell):
@@ -3028,8 +3053,36 @@ Rules:
 """.strip()
 
     def _execute_prompt(prompt: str, *, prefer_direct: bool = False) -> dict[str, Any]:
+        strict_gateway_mode = bool(WEB_GATEWAY_ENABLED and WEB_GATEWAY_STRICT)
         call: dict[str, Any] = {"ok": False, "error": "not_called"}
-        if prefer_direct:
+        fallback_errors: dict[str, str] = {}
+
+        if WEB_GATEWAY_ENABLED:
+            gateway_call = _web_gateway_chat_completion(prompt)
+            if gateway_call.get("ok"):
+                call = gateway_call
+            else:
+                fallback_errors["gateway"] = str(gateway_call.get("error") or "gateway_unavailable")
+                if strict_gateway_mode:
+                    mapped = _map_gateway_error(
+                        str(gateway_call.get("error") or ""),
+                        str(gateway_call.get("detail") or ""),
+                    )
+                    return {
+                        "ok": False,
+                        "error": mapped,
+                        "detail": gateway_call,
+                        "raw_text": str(gateway_call.get("raw_text") or ""),
+                    }
+        elif WEB_GATEWAY_STRICT:
+            return {
+                "ok": False,
+                "error": "gateway_unavailable",
+                "detail": {"error": "gateway_unavailable", "reason": "strict_requires_gateway_enabled"},
+                "raw_text": "",
+            }
+
+        if prefer_direct and not call.get("ok") and not strict_gateway_mode:
             if _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
                 glm_call = _glm_direct_api_call(prompt)
                 if glm_call.get("ok"):
@@ -3043,8 +3096,9 @@ Rules:
                 else:
                     call = {"ok": False, "error": str(kimi_call.get("error") or "kimi_coding_direct_failed")}
 
-        if not call.get("ok"):
+        if not call.get("ok") and not strict_gateway_mode:
             call = _agent_call(CODEX_AGENT, prompt)
+
         raw_text = str(call.get("text") or call.get("stdout") or call.get("stderr") or "")
         if call.get("ok") and _looks_like_provider_schema_error(raw_text):
             call = {
@@ -3054,9 +3108,7 @@ Rules:
                 "raw_text": raw_text,
             }
 
-        if not call.get("ok"):
-            fallback_errors: dict[str, str] = {}
-
+        if not call.get("ok") and not strict_gateway_mode:
             if CODEX_FALLBACK_AGENT and CODEX_FALLBACK_AGENT != CODEX_AGENT:
                 fallback_call = _agent_call(CODEX_FALLBACK_AGENT, prompt)
                 fallback_text = str(
@@ -3090,11 +3142,14 @@ Rules:
                 else:
                     fallback_errors["kimi_coding"] = str(kimi_call.get("error") or "kimi_coding_direct_failed")
 
-            if not call.get("ok"):
-                detail = dict(call)
-                if fallback_errors:
-                    detail["fallback_errors"] = fallback_errors
-                return {"ok": False, "error": call.get("error"), "detail": detail, "raw_text": raw_text}
+        if not call.get("ok"):
+            detail = dict(call)
+            if fallback_errors:
+                detail["fallback_errors"] = fallback_errors
+            err = str(call.get("error") or "codex_generate_failed")
+            if strict_gateway_mode:
+                err = _map_gateway_error(err, str(call.get("detail") or ""))
+            return {"ok": False, "error": err, "detail": detail, "raw_text": raw_text}
 
         parse_error: str | None = None
         try:
@@ -3103,7 +3158,7 @@ Rules:
             parse_error = str(exc)
             parsed = None
 
-        if parsed is None and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
+        if parsed is None and not strict_gateway_mode and _env_flag("OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED", "1"):
             glm_call = _glm_direct_api_call(prompt)
             if glm_call.get("ok"):
                 try:
@@ -3119,7 +3174,7 @@ Rules:
                 glm_err = str(glm_call.get("error") or "glm_direct_failed")
                 parse_error = f"{parse_error}; glm_direct_failed:{glm_err}" if parse_error else f"glm_direct_failed:{glm_err}"
 
-        if parsed is None and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
+        if parsed is None and not strict_gateway_mode and _env_flag("OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED", "1"):
             kimi_call = _kimi_coding_direct_api_call(prompt)
             if kimi_call.get("ok"):
                 try:
@@ -3140,9 +3195,12 @@ Rules:
                 )
 
         if parsed is None:
+            err = "codex_json_parse_failed"
+            if strict_gateway_mode and str(call.get("source") or "") == "web_gateway":
+                err = "gateway_bad_payload"
             return {
                 "ok": False,
-                "error": "codex_json_parse_failed",
+                "error": err,
                 "detail": parse_error or "invalid_json_payload",
                 "raw_text": call.get("text", ""),
             }
@@ -3162,6 +3220,13 @@ Rules:
                 "agent_id": "direct_api_glm",
                 "provider": str(GLM_MODEL or "").split("/", 1)[0] if "/" in str(GLM_MODEL or "") else "zai",
                 "model": str(GLM_MODEL or "zai/glm-5"),
+                **call_meta,
+            }
+        if isinstance(call, dict) and call.get("source") == "web_gateway":
+            call_meta = {
+                "agent_id": "web_gateway",
+                "provider": "chatgpt-web",
+                "model": str(call.get("model") or WEB_GATEWAY_MODEL),
                 **call_meta,
             }
 
@@ -3675,6 +3740,7 @@ Rules:
     first_call_meta: dict[str, Any] = {}
     failed_batches: list[dict[str, Any]] = []
     xlsx_files = sorted({str(row.get("file") or "").strip() for row in all_rows if str(row.get("file") or "").strip()})
+    default_xlsx_file = xlsx_files[0] if len(xlsx_files) == 1 else ""
 
     while chunk_queue:
         chunk_item = chunk_queue.pop(0)
@@ -3741,7 +3807,7 @@ Rules:
                     break
                 continue
             data = batch_result.get("data") if isinstance(batch_result.get("data"), dict) else {}
-            batch_collected_map = _merge_xlsx_translation_map(batch_collected_map, data.get("xlsx_translation_map"))
+            batch_collected_map = _merge_xlsx_translation_map(batch_collected_map, data.get("xlsx_translation_map"), default_file=default_xlsx_file)
             if isinstance(batch_collected_map, list):
                 data["xlsx_translation_map"] = batch_collected_map
             got_keys = _normalize_xlsx_translation_map_keys(batch_collected_map, xlsx_files=xlsx_files)
@@ -3772,6 +3838,7 @@ Rules:
         aggregate_data["xlsx_translation_map"] = _merge_xlsx_translation_map(
             aggregate_data.get("xlsx_translation_map"),
             data.get("xlsx_translation_map"),
+            default_file=default_xlsx_file,
         )
         aggregate_data["review_brief_points"] = sorted(
             set([str(x) for x in (aggregate_data.get("review_brief_points") or [])] + [str(x) for x in (data.get("review_brief_points") or [])])
@@ -3992,6 +4059,98 @@ def _looks_like_model_request_too_large(text: str) -> bool:
         and "total message size" in lowered
         and "exceeds limit" in lowered
     )
+
+
+def _map_gateway_error(error_type: str, detail: str = "") -> str:
+    token = str(error_type or "").strip().lower()
+    if token in {"gateway_unavailable", "gateway_login_required", "gateway_timeout", "gateway_bad_payload"}:
+        return token
+    merged = f"{token}:{detail}".lower()
+    if "login" in merged or "auth" in merged:
+        return "gateway_login_required"
+    if "timeout" in merged:
+        return "gateway_timeout"
+    if "payload" in merged or "json" in merged or "messages" in merged:
+        return "gateway_bad_payload"
+    return "gateway_unavailable"
+
+
+def _web_gateway_chat_completion(prompt: str) -> dict[str, Any]:
+    import urllib.error
+    import urllib.request
+
+    if not WEB_GATEWAY_ENABLED:
+        return {"ok": False, "error": "gateway_unavailable", "detail": "gateway_disabled"}
+
+    base = str(WEB_GATEWAY_BASE_URL or "").strip().rstrip("/")
+    if not base:
+        return {"ok": False, "error": "gateway_unavailable", "detail": "gateway_base_url_missing"}
+    url = f"{base}/v1/chat/completions"
+    body = json.dumps(
+        {
+            "model": WEB_GATEWAY_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=WEB_GATEWAY_TIMEOUT_SECONDS) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        raw_err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        err_type = ""
+        err_detail = raw_err
+        try:
+            parsed = json.loads(raw_err)
+            err = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(err, dict):
+                err_type = str(err.get("type") or "")
+                err_detail = str(err.get("message") or raw_err)
+        except json.JSONDecodeError:
+            pass
+        mapped = _map_gateway_error(err_type, err_detail)
+        return {
+            "ok": False,
+            "error": mapped,
+            "detail": f"http_{exc.code}:{err_detail[:800]}",
+            "raw_text": raw_err[:2000],
+        }
+    except TimeoutError:
+        return {"ok": False, "error": "gateway_timeout", "detail": "gateway request timeout"}
+    except urllib.error.URLError as exc:
+        return {"ok": False, "error": "gateway_unavailable", "detail": f"url_error:{exc}"}
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": "gateway_bad_payload", "detail": f"json_decode_error:{exc}"}
+    except Exception as exc:
+        return {"ok": False, "error": "gateway_unavailable", "detail": f"gateway_request_failed:{exc}"}
+
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return {"ok": False, "error": "gateway_bad_payload", "detail": "choices_missing"}
+    choice0 = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice0.get("message") if isinstance(choice0, dict) else {}
+    content = message.get("content") if isinstance(message, dict) else ""
+    if not isinstance(content, str) or not content.strip():
+        return {"ok": False, "error": "gateway_bad_payload", "detail": "message_content_missing"}
+    return {
+        "ok": True,
+        "text": content,
+        "source": "web_gateway",
+        "model": str(data.get("model") or WEB_GATEWAY_MODEL),
+        "meta": {
+            "agent_id": "web_gateway",
+            "provider": "chatgpt-web",
+            "model": str(data.get("model") or WEB_GATEWAY_MODEL),
+            "base_url": base,
+        },
+    }
 
 
 def _kimi_coding_direct_api_call(prompt: str) -> dict[str, Any]:
@@ -5031,7 +5190,8 @@ def run(
         errors: list[str] = []
         gemini_enabled = bool(meta.get("gemini_available", True))
         gemini_initially_enabled = gemini_enabled
-        glm_enabled = _glm_enabled()
+        strict_gateway_mode = bool(WEB_GATEWAY_ENABLED and WEB_GATEWAY_STRICT)
+        glm_enabled = _glm_enabled() and not strict_gateway_mode
         system_round_root = Path(review_dir) / ".system" / "rounds"
         system_round_root.mkdir(parents=True, exist_ok=True)
         disallow_markdown = _env_flag("OPENCLAW_DISALLOW_MARKDOWN", "1")
@@ -5107,6 +5267,17 @@ def run(
                 generation_errors["glm"] = str(glm_gen.get("error", "glm_generation_failed"))
             if not codex_data and not glm_data:
                 errors.append(f"no_generator_candidates:{generation_errors}")
+                gateway_tokens = [
+                    _map_gateway_error(str(v), str(v))
+                    for v in generation_errors.values()
+                    if str(v).startswith("gateway_")
+                ]
+                if gateway_tokens:
+                    gw_error = gateway_tokens[0]
+                    if gw_error not in errors:
+                        errors.append(gw_error)
+                    if gw_error not in status_flags:
+                        status_flags.append(gw_error)
                 if generation_errors and all(_is_cooldown_provider_error(str(v or "")) for v in generation_errors.values()):
                     status_flags.append("all_providers_cooldown")
                     if OPENCLAW_COOLDOWN_FRIENDLY_MODE:

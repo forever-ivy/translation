@@ -112,6 +112,27 @@ export interface PreflightCheck {
   message: string;
 }
 
+export interface GatewayStatus {
+  running: boolean;
+  healthy: boolean;
+  logged_in: boolean;
+  base_url: string;
+  model: string;
+  last_error: string;
+  updated_at: string;
+}
+
+export interface AuditOperationPayload {
+  operationId?: string;
+  source: string;
+  action: string;
+  jobId?: string;
+  sender?: string;
+  status: string;
+  summary: string;
+  detail?: unknown;
+}
+
 export interface Job {
   job_id: string;
   status: string;
@@ -203,6 +224,32 @@ export const autoFixPreflight = (): Promise<PreflightCheck[]> =>
 
 export const startOpenclaw = (): Promise<PreflightCheck[]> =>
   tInvoke<PreflightCheck[]>("start_openclaw");
+
+export const auditOperation = (payload: AuditOperationPayload): Promise<unknown> =>
+  tInvoke("audit_operation", {
+    payload: {
+      operation_id: payload.operationId,
+      source: payload.source,
+      action: payload.action,
+      job_id: payload.jobId,
+      sender: payload.sender,
+      status: payload.status,
+      summary: payload.summary,
+      detail: payload.detail,
+    },
+  });
+
+export const gatewayStart = (): Promise<GatewayStatus> =>
+  tInvoke<GatewayStatus>("gateway_start");
+
+export const gatewayStop = (): Promise<GatewayStatus> =>
+  tInvoke<GatewayStatus>("gateway_stop");
+
+export const gatewayStatus = (): Promise<GatewayStatus> =>
+  tInvoke<GatewayStatus>("gateway_status");
+
+export const gatewayLogin = (): Promise<GatewayStatus> =>
+  tInvoke<GatewayStatus>("gateway_login");
 
 // ============================================================================
 // Config Commands
