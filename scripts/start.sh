@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Translation System One-Click Start/Stop Script
+# Translation System One-Click Start/Stop Script (CLI fallback path).
 # Usage:
 #   ./scripts/start.sh              # Interactive mode
 #   ./scripts/start.sh --all        # Start all services
@@ -16,6 +16,7 @@
 #   ./scripts/start.sh --gateway-stop    # Stop web gateway
 #   ./scripts/start.sh --gateway-status  # Show web gateway status
 #   ./scripts/start.sh --gateway-login   # Check/login web gateway session
+#   ./scripts/start.sh --gateway-diagnose # Diagnose gateway selectors/session
 #
 set -euo pipefail
 
@@ -30,8 +31,10 @@ cd "$ROOT_DIR"
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
 
 # Paths
-PID_DIR="$HOME/.openclaw/runtime/translation/pids"
-LOG_DIR="$HOME/.openclaw/runtime/translation/logs"
+RUNTIME_DIR="$HOME/.openclaw/runtime/translation"
+PID_DIR="$RUNTIME_DIR/pids"
+LOG_DIR="$RUNTIME_DIR/logs"
+TELEGRAM_LOCK_PID_FILE="$RUNTIME_DIR/tg_bot.pid"
 PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 
 # =============================================================================
@@ -121,6 +124,41 @@ get_pid() {
     fi
 }
 
+get_telegram_lock_pid() {
+    if [[ -f "$TELEGRAM_LOCK_PID_FILE" ]]; then
+        cat "$TELEGRAM_LOCK_PID_FILE" 2>/dev/null || echo ""
+    fi
+}
+
+cleanup_stale_telegram_lock() {
+    local lock_pid
+    lock_pid="$(get_telegram_lock_pid)"
+    if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        log_warn "Removing stale Telegram lock PID file ($lock_pid)"
+        rm -f "$TELEGRAM_LOCK_PID_FILE"
+    fi
+}
+
+kill_telegram_by_pattern() {
+    local pids
+    pids="$(pgrep -f "scripts.telegram_bot" 2>/dev/null || true)"
+    if [[ -z "$pids" ]]; then
+        return 0
+    fi
+    log_warn "Cleaning existing Telegram processes: $pids"
+    while read -r pid; do
+        [[ -z "$pid" ]] && continue
+        kill "$pid" 2>/dev/null || true
+    done <<< "$pids"
+    sleep 1
+    while read -r pid; do
+        [[ -z "$pid" ]] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done <<< "$pids"
+}
+
 save_pid() {
     echo "$2" > "$(get_pid_file "$1")"
 }
@@ -134,6 +172,17 @@ clear_pid() {
 # =============================================================================
 
 start_telegram() {
+    cleanup_stale_telegram_lock
+
+    # If the bot lock says another instance is active, sync PID file and avoid double-start.
+    local lock_pid
+    lock_pid="$(get_telegram_lock_pid)"
+    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+        save_pid "telegram" "$lock_pid"
+        log_warn "Telegram bot lock is active (PID: $lock_pid); skipping duplicate start"
+        return 0
+    fi
+
     if is_running "telegram"; then
         log_warn "Telegram bot is already running (PID: $(get_pid "telegram"))"
         return 0
@@ -149,6 +198,9 @@ start_telegram() {
     if is_truthy "${OPENCLAW_RUN_WORKER_AUTOSTART:-1}"; then
         start_worker || log_warn "Worker auto-start skipped (may already be running)"
     fi
+
+    # Harden against orphan pollers that cause Telegram 409 conflicts.
+    kill_telegram_by_pattern
 
     nohup "$PYTHON_BIN" -m scripts.telegram_bot >>"$log_file" 2>&1 &
     local pid=$!
@@ -245,6 +297,7 @@ start_reminder() {
 
 gateway_dispatch() {
     local subcmd="$1"
+    shift
     load_env
     local work_root="${V4_WORK_ROOT:-$HOME/Translation Task}"
     local kb_root="${V4_KB_ROOT:-$HOME/Knowledge Repository}"
@@ -254,7 +307,7 @@ gateway_dispatch() {
         --work-root "$work_root" \
         --kb-root "$kb_root" \
         --notify-target "$notify_target" \
-        "$subcmd"
+        "$subcmd" "$@"
 }
 
 gateway_start() {
@@ -274,7 +327,16 @@ gateway_status() {
 
 gateway_login() {
     log_info "Checking web gateway login state..."
-    gateway_dispatch "gateway-login"
+    # Prefer interactive login for the primary provider so this command actually
+    # resolves "needs_attention: gateway_login_required:*" jobs.
+    local provider="${OPENCLAW_WEB_LLM_PRIMARY:-gemini_web}"
+    local timeout="${OPENCLAW_WEB_GATEWAY_LOGIN_TIMEOUT_SECONDS:-60}"
+    gateway_dispatch "gateway-login" --provider "$provider" --interactive-login --timeout-seconds "$timeout"
+}
+
+gateway_diagnose() {
+    log_info "Diagnosing web gateway session/selectors..."
+    gateway_dispatch "gateway-diagnose"
 }
 
 stop_service() {
@@ -333,6 +395,11 @@ stop_service() {
                 kill -9 "$real_pid" 2>/dev/null || true
             fi
         fi
+    fi
+
+    if [[ "$service" == "telegram" ]]; then
+        kill_telegram_by_pattern
+        rm -f "$TELEGRAM_LOCK_PID_FILE"
     fi
 
     clear_pid "$service"
@@ -495,6 +562,9 @@ case "${1:-}" in
     --gateway-login)
         gateway_login
         ;;
+    --gateway-diagnose)
+        gateway_diagnose
+        ;;
     --stop)
         stop_all
         ;;
@@ -526,6 +596,7 @@ case "${1:-}" in
         echo "  --gateway-stop  Stop web gateway"
         echo "  --gateway-status Show web gateway status"
         echo "  --gateway-login Check/login web gateway session"
+        echo "  --gateway-diagnose Diagnose web gateway selectors/session"
         echo "  --logs          Show log directory"
         echo "  -h, --help      Show this help"
         echo ""

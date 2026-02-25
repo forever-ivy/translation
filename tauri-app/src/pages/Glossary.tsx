@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { useAppStore } from "@/stores/appStore";
+import { useConfigStore } from "@/stores/configStore";
+import { useUiStore } from "@/stores/uiStore";
 import * as tauri from "@/lib/tauri";
 import {
   BookText,
@@ -17,9 +18,9 @@ import {
 } from "lucide-react";
 
 export function Glossary() {
-  const addToast = useAppStore((s) => s.addToast);
-  const config = useAppStore((s) => s.config);
-  const fetchConfig = useAppStore((s) => s.fetchConfig);
+  const addToast = useUiStore((s) => s.addToast);
+  const config = useConfigStore((s) => s.config);
+  const fetchConfig = useConfigStore((s) => s.fetchConfig);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [items, setItems] = useState<tauri.GlossaryTerm[]>([]);

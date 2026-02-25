@@ -1,123 +1,119 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { useAppStore } from "@/stores/appStore";
+import { useJobStore } from "@/stores/jobStore";
+import { useUiStore } from "@/stores/uiStore";
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { GlassMotionCard, staggerContainer, staggerItem, AnimatedProgress } from "@/components/ui/motion";
-import { Clock, CheckCircle2, Loader2, FileText, RefreshCw } from "lucide-react";
+import { GlassMotionCard, staggerContainer, staggerItem } from "@/components/ui/motion";
+import { AlertTriangle, CheckCircle2, FileText, Loader2, RefreshCw } from "lucide-react";
 
 const statusColors: Record<string, "success" | "warning" | "secondary" | "default"> = {
+  queued: "secondary",
+  received: "secondary",
+  preflight: "secondary",
+  running: "default",
   review_ready: "success",
   needs_attention: "warning",
-  running: "default",
+  needs_revision: "warning",
+  missing_inputs: "warning",
+  incomplete_input: "warning",
   verified: "secondary",
   failed: "warning",
   collecting: "secondary",
+  canceled: "secondary",
+  discarded: "secondary",
 };
 
-const milestoneOrder = [
-  "job_created",
-  "run_accepted",
-  "kb_sync_done",
-  "intent_classified",
-  "round_1_done",
-  "round_2_done",
-  "round_3_done",
+const STATUS_FILTER_OPTIONS = [
+  "queued",
+  "preflight",
+  "running",
   "review_ready",
+  "needs_attention",
+  "needs_revision",
+  "missing_inputs",
+  "collecting",
+  "received",
   "verified",
-];
+  "failed",
+  "incomplete_input",
+  "canceled",
+  "discarded",
+] as const;
 
-const milestoneLabels: Record<string, string> = {
-  job_created: "Job Created",
-  run_accepted: "Run Accepted",
-  kb_sync_done: "KB Sync",
-  intent_classified: "Intent Classified",
-  round_1_done: "Round 1",
-  round_2_done: "Round 2",
-  round_3_done: "Round 3",
-  review_ready: "Review Ready",
-  verified: "Verified",
-};
+function labelFromEventType(eventType: string) {
+  const explicit: Record<string, string> = {
+    received: "Received",
+    new_created: "Created",
+    run_enqueued: "Enqueued",
+    preflight_started: "Preflight started",
+    preflight_done: "Preflight passed",
+    preflight_failed: "Preflight failed",
+    kb_retrieve_done: "KB retrieve done",
+    intent_classified: "Intent classified",
+    running: "Running",
+    review_ready: "Review ready",
+    needs_attention: "Needs attention",
+    failed: "Failed",
+    verified: "Verified",
+  };
+  if (explicit[eventType]) return explicit[eventType];
+
+  const roundMatch = eventType.match(/^round_(\d+)_(started|done)$/);
+  if (roundMatch) {
+    const [, round, phase] = roundMatch;
+    return `Round ${round} ${phase}`;
+  }
+
+  const cleaned = eventType.replace(/_/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned.length ? cleaned : eventType;
+}
+
+function parseTimestampMs(ts: string) {
+  const ms = Date.parse(ts);
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
+function formatTimestamp(ts: string) {
+  const d = new Date(ts);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+
+  // Fallbacks for non-ISO formats
+  if (ts.includes("T")) {
+    const timePart = ts.split("T")[1] || "";
+    return timePart.replace(/Z$/, "").split(/[.+]/)[0]?.slice(0, 8) || null;
+  }
+  if (ts.includes(" ")) {
+    return ts.split(" ")[1]?.slice(0, 8) || null;
+  }
+  return ts.slice(0, 8);
+}
 
 export function Jobs() {
-  const jobs = useAppStore((s) => s.jobs);
-  const selectedJobId = useAppStore((s) => s.selectedJobId);
-  const selectedJobMilestones = useAppStore((s) => s.selectedJobMilestones);
-  const fetchJobs = useAppStore((s) => s.fetchJobs);
-  const fetchJobMilestones = useAppStore((s) => s.fetchJobMilestones);
-  const isLoading = useAppStore((s) => s.isLoading);
+  const jobs = useJobStore((s) => s.jobs);
+  const selectedJobId = useJobStore((s) => s.selectedJobId);
+  const selectedJobMilestones = useJobStore((s) => s.selectedJobMilestones);
+  const fetchJobs = useJobStore((s) => s.fetchJobs);
+  const fetchJobMilestones = useJobStore((s) => s.fetchJobMilestones);
+  const setSelectedJobId = useJobStore((s) => s.setSelectedJobId);
+  const isLoading = useUiStore((s) => s.isLoading);
   const [statusFilter, setStatusFilter] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchJobs(statusFilter ?? undefined);
-  }, [fetchJobs, statusFilter]);
+    void fetchJobs(undefined);
+  }, [fetchJobs]);
 
   const handleJobClick = async (jobId: string) => {
-    useAppStore.getState().setSelectedJobId(jobId);
+    setSelectedJobId(jobId);
     await fetchJobMilestones(jobId);
   };
 
   const filteredJobs = statusFilter ? jobs.filter((j) => j.status === statusFilter) : jobs;
 
-  const getMilestoneIcon = (_eventType: string, isComplete: boolean, isCurrent: boolean) => {
-    if (isComplete) {
-      return (
-        <motion.div
-          initial={{ scale: 0 }}
-          animate={{ scale: 1 }}
-          transition={{ type: "spring", stiffness: 500 }}
-        >
-          <CheckCircle2 className="h-3 w-3 text-green-400" />
-        </motion.div>
-      );
-    }
-    if (isCurrent) {
-      return <Loader2 className="h-3 w-3 text-primary animate-spin" />;
-    }
-    return <Clock className="h-3 w-3 text-gray-500" />;
-  };
-
-  const getMilestoneTime = (eventType: string) => {
-    const milestone = selectedJobMilestones.find((m) => m.eventType === eventType);
-    const ts = milestone?.timestamp;
-    if (!ts) return null;
-
-    const d = new Date(ts);
-    if (!Number.isNaN(d.getTime())) {
-      return d.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    }
-
-    // Fallbacks for non-ISO formats
-    if (ts.includes("T")) {
-      const timePart = ts.split("T")[1] || "";
-      return timePart.replace(/Z$/, "").split(/[.+]/)[0]?.slice(0, 8) || null;
-    }
-    if (ts.includes(" ")) {
-      return ts.split(" ")[1]?.slice(0, 8) || null;
-    }
-    return ts.slice(0, 8);
-  };
-
-  const isMilestoneComplete = (eventType: string) => {
-    return selectedJobMilestones.some((m) => m.eventType === eventType);
-  };
-
-  const getCurrentMilestone = () => {
-    for (const milestone of milestoneOrder) {
-      if (!isMilestoneComplete(milestone)) {
-        return milestone;
-      }
-    }
-    return null;
-  };
-
-  const getProgress = () => {
-    const completed = milestoneOrder.filter(isMilestoneComplete).length;
-    return (completed / milestoneOrder.length) * 100;
-  };
-
-  const currentMilestone = getCurrentMilestone();
+  const activeJobStatuses = new Set(["queued", "received", "collecting", "preflight", "running"]);
 
   return (
     <div className="p-6 space-y-6">
@@ -134,13 +130,14 @@ export function Jobs() {
             onChange={(e) => setStatusFilter(e.target.value || null)}
           >
             <option value="">All Statuses</option>
-            <option value="running">Running</option>
-            <option value="review_ready">Review Ready</option>
-            <option value="verified">Verified</option>
-            <option value="failed">Failed</option>
+            {STATUS_FILTER_OPTIONS.map((status) => (
+              <option key={status} value={status}>
+                {status}
+              </option>
+            ))}
           </select>
           <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
-            <Button variant="outline" size="sm" onClick={() => fetchJobs(statusFilter ?? undefined)} disabled={isLoading}>
+            <Button variant="outline" size="sm" onClick={() => fetchJobs(undefined)} disabled={isLoading}>
               <RefreshCw className={`h-4 w-4 mr-2 ${isLoading ? "animate-spin" : ""}`} />
               Refresh
             </Button>
@@ -212,7 +209,7 @@ export function Jobs() {
 
                       {/* Milestone Timeline - only show for selected job */}
                       <AnimatePresence>
-                        {selectedJobId === job.jobId && selectedJobMilestones.length > 0 && (
+                        {selectedJobId === job.jobId && (
                           <motion.div
                             initial={{ opacity: 0, height: 0 }}
                             animate={{ opacity: 1, height: "auto" }}
@@ -220,80 +217,56 @@ export function Jobs() {
                             transition={{ duration: 0.3 }}
                             className="mt-4 overflow-hidden"
                           >
-                            {/* Progress bar */}
-                            <div className="mb-3">
-                              <div className="flex justify-between text-xs text-muted-foreground mb-1">
-                                <span>Progress</span>
-                                <span>{Math.round(getProgress())}%</span>
-                              </div>
-                              <div className="h-2 bg-muted rounded-full overflow-hidden">
-                                <AnimatedProgress value={getProgress()} />
-                              </div>
-                            </div>
+                            {selectedJobMilestones.length === 0 ? (
+                              <div className="pl-2 text-sm text-muted-foreground">No milestones recorded yet.</div>
+                            ) : (
+                              (() => {
+                                const sorted = [...selectedJobMilestones].sort(
+                                  (a, b) => parseTimestampMs(a.timestamp) - parseTimestampMs(b.timestamp),
+                                );
+                                const recent = sorted.slice(-30);
+                                const isActive = activeJobStatuses.has(job.status);
+                                return (
+                                  <div className="pl-2 border-l-2 border-muted">
+                                    <div className="space-y-2">
+                                      {recent.map((milestone, index) => {
+                                        const isLatest = index === recent.length - 1;
+                                        const time = formatTimestamp(milestone.timestamp);
+                                        const label = labelFromEventType(milestone.eventType);
+                                        const isFailure = /failed|error/i.test(milestone.eventType);
+                                        const isAttention = /needs_attention/i.test(milestone.eventType);
+                                        const Icon = isFailure || isAttention ? AlertTriangle : isLatest && isActive ? Loader2 : CheckCircle2;
+                                        const iconClass = isFailure
+                                          ? "text-red-400"
+                                          : isAttention
+                                            ? "text-yellow-400"
+                                            : isLatest && isActive
+                                              ? "text-primary animate-spin"
+                                              : "text-green-400";
 
-                            <div className="pl-2 border-l-2 border-muted">
-                              <div className="space-y-2">
-                                {milestoneOrder.map((milestone, index) => {
-                                  const isComplete = isMilestoneComplete(milestone);
-                                  const isCurrent = currentMilestone === milestone;
-                                  const time = getMilestoneTime(milestone);
-
-                                  if (!isComplete && !isCurrent) {
-                                    return (
-                                      <motion.div
-                                        key={milestone}
-                                        initial={{ opacity: 0, x: -10 }}
-                                        animate={{ opacity: 0.5, x: 0 }}
-                                        transition={{ delay: index * 0.03 }}
-                                        className="flex items-center gap-2 text-sm text-muted-foreground/50"
-                                      >
-                                        <Clock className="h-3 w-3" />
-                                        <span>{milestoneLabels[milestone] || milestone}</span>
-                                      </motion.div>
-                                    );
-                                  }
-
-                                  return (
-                                    <motion.div
-                                      key={milestone}
-                                      initial={{ opacity: 0, x: -10 }}
-                                      animate={{ opacity: 1, x: 0 }}
-                                      transition={{ delay: index * 0.03 }}
-                                      className={`flex items-center gap-2 text-sm ${isCurrent ? "text-foreground font-medium" : ""}`}
-                                    >
-                                      {getMilestoneIcon(milestone, isComplete, isCurrent)}
-                                      <span className={isComplete ? "text-muted-foreground" : ""}>
-                                        {milestoneLabels[milestone] || milestone}
-                                      </span>
-                                      {time && <span className="text-xs text-muted-foreground/70 ml-auto">{time}</span>}
-                                      {isCurrent && (
-                                        <motion.span
-                                          className="text-xs text-primary ml-auto"
-                                          animate={{ opacity: [1, 0.5, 1] }}
-                                          transition={{ duration: 1.5, repeat: Infinity }}
-                                        >
-                                          running...
-                                        </motion.span>
-                                      )}
-                                    </motion.div>
-                                  );
-                                })}
-                              </div>
-                            </div>
+                                        return (
+                                          <motion.div
+                                            key={`${milestone.eventType}-${milestone.timestamp}`}
+                                            initial={{ opacity: 0, x: -10 }}
+                                            animate={{ opacity: 1, x: 0 }}
+                                            transition={{ delay: index * 0.01 }}
+                                            className="flex items-center gap-2 text-sm"
+                                          >
+                                            <Icon className={`h-3 w-3 ${iconClass}`} />
+                                            <span className="text-muted-foreground">{label}</span>
+                                            <span className="text-[11px] text-muted-foreground/70">{milestone.eventType}</span>
+                                            {time && <span className="text-xs text-muted-foreground/70 ml-auto">{time}</span>}
+                                          </motion.div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                );
+                              })()
+                            )}
                           </motion.div>
                         )}
                       </AnimatePresence>
-
-                      {/* Show hint if no milestones loaded */}
-                      {selectedJobId === job.jobId && selectedJobMilestones.length === 0 && (
-                        <motion.div
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          className="mt-4 pl-2 text-sm text-muted-foreground"
-                        >
-                          Loading milestones...
-                        </motion.div>
-                      )}
                     </CardContent>
                   </Card>
                 </GlassMotionCard>

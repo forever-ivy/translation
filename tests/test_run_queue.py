@@ -71,7 +71,7 @@ class RunQueueTest(unittest.TestCase):
             conn2.close()
             self.assertIsNone(item2)
 
-    def test_claim_syncs_job_status_to_running(self):
+    def test_claim_syncs_job_status_to_preflight(self):
         with tempfile.TemporaryDirectory() as td:
             work_root = Path(td) / "Translation Task"
             paths = ensure_runtime_paths(work_root)
@@ -88,7 +88,7 @@ class RunQueueTest(unittest.TestCase):
             self.assertIsNotNone(claimed)
             row = conn.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             self.assertIsNotNone(row)
-            self.assertEqual(str(row["status"]), "running")
+            self.assertEqual(str(row["status"]), "preflight")
             conn.close()
 
     def test_requeue_stuck_running(self):

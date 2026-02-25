@@ -102,6 +102,10 @@ def _gateway_status(args: argparse.Namespace) -> dict[str, Any]:
     base_url = (args.base_url or DEFAULT_GATEWAY_BASE_URL).strip()
     health: dict[str, Any] = {}
     healthy = False
+    providers: dict[str, Any] = {}
+    primary_provider = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+    primary_last_error = ""
+    primary_logged_in = False
     if pid:
         try:
             health = _http_json(_gateway_url("/health", base_url=base_url), timeout=3.0)
@@ -114,15 +118,22 @@ def _gateway_status(args: argparse.Namespace) -> dict[str, Any]:
                 except Exception:
                     health = {}
             healthy = bool(health.get("healthy", False))
+    providers = health.get("providers") if isinstance(health.get("providers"), dict) else {}
+    if isinstance(providers.get(primary_provider), dict):
+        primary_last_error = str(providers[primary_provider].get("last_error") or "")
+        primary_logged_in = bool(providers[primary_provider].get("logged_in", False))
     return {
         "running": bool(pid),
         "healthy": healthy,
         "pid": pid or 0,
         "base_url": base_url,
-        "model": str(health.get("model") or os.getenv("OPENCLAW_WEB_GATEWAY_MODEL", "chatgpt-web")),
-        "logged_in": bool(health.get("logged_in", False)),
-        "last_error": str(health.get("last_error") or ""),
+        "model": str(os.getenv("OPENCLAW_WEB_GATEWAY_MODEL", "web-llm")),
+        "logged_in": bool(health.get("logged_in", primary_logged_in)),
+        "last_error": str(health.get("last_error") or primary_last_error),
         "updated_at": str(health.get("updated_at") or ""),
+        "version": str(health.get("version") or ""),
+        "primary_provider": str(health.get("primary_provider") or primary_provider),
+        "providers": providers,
         "health": health,
     }
 
@@ -140,8 +151,8 @@ def _gateway_start(args: argparse.Namespace) -> dict[str, Any]:
     log_file = _gateway_log_path()
     log_file.parent.mkdir(parents=True, exist_ok=True)
     health_file = _gateway_health_file(args)
-    profile_dir = Path("~/.openclaw/runtime/translation/web-gateway-profile").expanduser()
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    profiles_dir = Path(os.getenv("OPENCLAW_WEB_GATEWAY_PROFILES_DIR", "~/.openclaw/runtime/translation/web-profiles")).expanduser()
+    profiles_dir.mkdir(parents=True, exist_ok=True)
     base_url = (args.base_url or DEFAULT_GATEWAY_BASE_URL).strip()
     host = base_url.replace("http://", "").replace("https://", "").split(":", 1)[0] or "127.0.0.1"
     port = int(base_url.rsplit(":", 1)[-1]) if ":" in base_url else int(os.getenv("OPENCLAW_WEB_GATEWAY_PORT", "8765"))
@@ -156,8 +167,8 @@ def _gateway_start(args: argparse.Namespace) -> dict[str, Any]:
         str(port),
         "--health-file",
         str(health_file),
-        "--profile-dir",
-        str(profile_dir),
+        "--profiles-dir",
+        str(profiles_dir),
     ]
     model = str(os.getenv("OPENCLAW_WEB_GATEWAY_MODEL", "chatgpt-web")).strip()
     if model:
@@ -220,16 +231,45 @@ def _gateway_login(args: argparse.Namespace) -> dict[str, Any]:
         if not start_result.get("ok"):
             return {"ok": False, "action": "login", "error": "gateway_start_failed", "start_result": start_result}
     base_url = (args.base_url or DEFAULT_GATEWAY_BASE_URL).strip()
+    provider = str(getattr(args, "provider", "") or "").strip()
+    timeout_seconds = int(getattr(args, "timeout_seconds", 15) or 15)
     try:
         login = _http_json(
             _gateway_url("/session/login", base_url=base_url),
             method="POST",
-            payload={"interactive": bool(args.interactive_login)},
+            payload={
+                "provider": provider,
+                "interactive": bool(args.interactive_login),
+                "timeout_seconds": timeout_seconds,
+            },
             timeout=30.0,
         )
     except urllib.error.URLError as exc:
         return {"ok": False, "action": "login", "error": f"gateway_login_request_failed:{exc}"}
     return {"ok": bool(login.get("ok", False)), "action": "login", "result": login, "status": _gateway_status(args)}
+
+
+def _gateway_diagnose(args: argparse.Namespace) -> dict[str, Any]:
+    status = _gateway_status(args)
+    base_url = (args.base_url or DEFAULT_GATEWAY_BASE_URL).strip()
+    if not status.get("running"):
+        return {
+            "ok": False,
+            "action": "diagnose",
+            "status": status,
+            "diagnose": {"ok": False, "error": "gateway_not_running"},
+        }
+    provider = str(getattr(args, "provider", "") or "").strip()
+    suffix = "/session/diagnose"
+    if provider:
+        from urllib.parse import quote
+
+        suffix = f"/session/diagnose?provider={quote(provider)}"
+    try:
+        diagnose = _http_json(_gateway_url(suffix, base_url=base_url), timeout=8.0)
+    except Exception as exc:
+        diagnose = {"ok": False, "error": f"gateway_diagnose_request_failed:{exc}"}
+    return {"ok": bool(diagnose.get("ok", False)), "action": "diagnose", "status": status, "diagnose": diagnose}
 
 
 def cmd_email_poll(args: argparse.Namespace) -> int:
@@ -450,6 +490,20 @@ def cmd_gateway_login(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def cmd_gateway_diagnose(args: argparse.Namespace) -> int:
+    result = _gateway_diagnose(args)
+    op_status = "success" if result.get("ok") else "failed"
+    _gateway_audit(
+        args,
+        action="gateway_diagnose",
+        status=op_status,
+        summary=f"Gateway diagnose {op_status}",
+        detail=result,
+    )
+    print(json.dumps({"ok": bool(result.get("ok")), "result": result}, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="OpenClaw V6.0 dispatcher")
     parser.add_argument("--work-root", default=str(DEFAULT_WORK_ROOT))
@@ -497,13 +551,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_ops.add_argument("--milestone", default="ops_audit")
     p_ops.add_argument("--ts", default="")
 
-    for cmd in ("gateway-start", "gateway-stop", "gateway-status", "gateway-login"):
+    for cmd in ("gateway-start", "gateway-stop", "gateway-status", "gateway-login", "gateway-diagnose"):
         p_gw = sub.add_parser(cmd)
         p_gw.add_argument("--base-url", default=DEFAULT_GATEWAY_BASE_URL)
         p_gw.add_argument("--job-id", default="")
         p_gw.add_argument("--sender", default="")
         p_gw.add_argument("--operation-id", default="")
         p_gw.add_argument("--interactive-login", action="store_true")
+        p_gw.add_argument("--provider", default="")
+        p_gw.add_argument("--timeout-seconds", type=int, default=15)
 
     return parser
 
@@ -534,6 +590,8 @@ def main() -> int:
         return cmd_gateway_status(args)
     if args.cmd == "gateway-login":
         return cmd_gateway_login(args)
+    if args.cmd == "gateway-diagnose":
+        return cmd_gateway_diagnose(args)
 
     parser.error(f"unsupported cmd: {args.cmd}")
     return 2

@@ -8,6 +8,7 @@ import email
 import imaplib
 import json
 import re
+import ssl
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parseaddr
@@ -98,7 +99,32 @@ def main() -> int:
     conn = db_connect(paths)
 
     jobs: list[dict[str, Any]] = []
-    with imaplib.IMAP4_SSL(args.imap_host, args.imap_port) as imap:
+    # Create a custom SSL context that is more permissive for problematic servers
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    # Try lower TLS versions for compatibility
+    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    
+    try:
+        imap = imaplib.IMAP4_SSL(args.imap_host, args.imap_port, ssl_context=ssl_context)
+    except ssl.SSLEOFError as e:
+        print(json.dumps({
+            "ok": False,
+            "error": "ssl_handshake_failed",
+            "detail": str(e),
+            "hint": "SSL handshake failed. Check if VPN/proxy is interfering, or try different network."
+        }, ensure_ascii=False))
+        return 1
+    except Exception as e:
+        print(json.dumps({
+            "ok": False,
+            "error": "connection_failed",
+            "detail": str(e)
+        }, ensure_ascii=False))
+        return 1
+    
+    with imap:
         imap.login(args.imap_user, args.imap_password)
         sel_status, sel_data = imap.select(args.mailbox)
         if sel_status != "OK":

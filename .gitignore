@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 .DS_Store
 *.log
+.worktrees/
+.system/
+.env*.bak-*
 .env
 .env.v4.local
 .claude/settings.local.json

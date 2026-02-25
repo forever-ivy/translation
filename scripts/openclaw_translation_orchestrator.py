@@ -31,6 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.build_delta_pack import build_delta, flatten_blocks
 from scripts.docx_preserver import extract_units as extract_docx_units
 from scripts.docx_preserver import units_to_payload as docx_units_to_payload
+from scripts.gateway_format_contract import build_section_format_contract
 from scripts.revision_pack import RevisionPack, build_revision_pack, format_revision_context_for_prompt
 from scripts.extract_docx_structure import extract_structure
 from scripts.openclaw_artifact_writer import write_artifacts
@@ -256,11 +257,14 @@ KIMI_CODING_API_BASE_URL = os.getenv(
     "OPENCLAW_KIMI_CODING_BASE_URL",
     os.getenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/v1"),
 )
-WEB_GATEWAY_ENABLED = _env_flag("OPENCLAW_WEB_GATEWAY_ENABLED", "0")
+WEB_GATEWAY_ENABLED = _env_flag("OPENCLAW_WEB_GATEWAY_ENABLED", "1")
 WEB_GATEWAY_STRICT = _env_flag("OPENCLAW_WEB_GATEWAY_STRICT", "0")
 WEB_GATEWAY_BASE_URL = str(os.getenv("OPENCLAW_WEB_GATEWAY_BASE_URL", "http://127.0.0.1:8765")).strip()
 WEB_GATEWAY_MODEL = str(os.getenv("OPENCLAW_WEB_GATEWAY_MODEL", "chatgpt-web")).strip() or "chatgpt-web"
 WEB_GATEWAY_TIMEOUT_SECONDS = max(10, int(os.getenv("OPENCLAW_WEB_GATEWAY_TIMEOUT_SECONDS", "180")))
+WEB_LLM_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+WEB_LLM_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_FALLBACK", "chatgpt_web")).strip() or "chatgpt_web"
+WEB_LLM_SESSION_MODE = str(os.getenv("OPENCLAW_WEB_SESSION_MODE", "per_request")).strip().lower() or "per_request"
 
 
 def _glm_enabled() -> bool:
@@ -544,6 +548,25 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
     return findings, meta
 
 
+def _parse_sectioned_output_map(text: str, *, prefix: str = "§") -> dict[int, str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    marker_re = re.compile(rf"{re.escape(prefix)}(\d+){re.escape(prefix)}")
+    matches = list(marker_re.finditer(raw))
+    if not matches:
+        return {}
+    out: dict[int, str] = {}
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+        section_no = int(match.group(1))
+        content = raw[start:end].strip()
+        if content:
+            out[section_no] = content
+    return out
+
+
 def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     """Return (findings, meta) for strict glossary enforcement.
 
@@ -563,6 +586,7 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
         "terms": 0,
         "docx_checked_units": 0,
         "xlsx_checked_cells": 0,
+        "section_checked_units": 0,
         "violations": 0,
         "skipped_reason": "",
     }
@@ -579,10 +603,6 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
         return findings, meta
 
     preserve = (context.get("format_preserve") or {}) if isinstance(context.get("format_preserve"), dict) else {}
-    if not preserve:
-        meta["enabled"] = True
-        meta["skipped_reason"] = "no_format_preserve"
-        return findings, meta
 
     try:
         from scripts.kb_glossary_enforcer import contains_arabic_term, normalize_arabic, normalize_english
@@ -761,8 +781,25 @@ def _validate_glossary_enforcer(context: dict[str, Any], draft: dict[str, Any]) 
                 out_text = xlsx_map.get((file_name, sheet, cell), "")
                 _check_unit(where="xlsx", unit_key=f"{file_name}:{sheet}!{cell}", src_text=src_text, out_text=out_text)
 
+    # Sectioned text fallback (used when no preserve payload exists).
+    if not preserve:
+        source_sections = _parse_sectioned_output_map(str(context.get("message_text") or ""), prefix="§")
+        target_sections = _parse_sectioned_output_map(
+            str(draft.get("final_text") or draft.get("final_reflow_text") or ""),
+            prefix="§",
+        )
+        for section_no in sorted(source_sections.keys()):
+            src_text = str(source_sections.get(section_no) or "")
+            if not src_text:
+                continue
+            meta["section_checked_units"] += 1
+            out_text = str(target_sections.get(section_no) or "")
+            _check_unit(where="section", unit_key=str(section_no), src_text=src_text, out_text=out_text)
+
     meta["violations"] = len(findings)
-    if not findings:
+    if not preserve and int(meta.get("section_checked_units", 0) or 0) <= 0:
+        meta["skipped_reason"] = "no_format_preserve"
+    elif not findings:
         meta["skipped_reason"] = ""
     elif len(findings) >= max_violations:
         meta["skipped_reason"] = "violations_truncated"
@@ -3052,28 +3089,57 @@ Rules:
 - JSON only.
 """.strip()
 
-    def _execute_prompt(prompt: str, *, prefer_direct: bool = False) -> dict[str, Any]:
+    def _execute_prompt(
+        prompt: str,
+        *,
+        prefer_direct: bool = False,
+        format_contract: dict[str, Any] | None = None,
+        job_id: str = "",
+        operation_id: str = "",
+    ) -> dict[str, Any]:
         strict_gateway_mode = bool(WEB_GATEWAY_ENABLED and WEB_GATEWAY_STRICT)
         call: dict[str, Any] = {"ok": False, "error": "not_called"}
         fallback_errors: dict[str, str] = {}
 
         if WEB_GATEWAY_ENABLED:
-            gateway_call = _web_gateway_chat_completion(prompt)
-            if gateway_call.get("ok"):
-                call = gateway_call
-            else:
-                fallback_errors["gateway"] = str(gateway_call.get("error") or "gateway_unavailable")
-                if strict_gateway_mode:
-                    mapped = _map_gateway_error(
-                        str(gateway_call.get("error") or ""),
-                        str(gateway_call.get("detail") or ""),
-                    )
-                    return {
-                        "ok": False,
-                        "error": mapped,
-                        "detail": gateway_call,
-                        "raw_text": str(gateway_call.get("raw_text") or ""),
-                    }
+            providers_to_try = [WEB_LLM_PRIMARY_PROVIDER, WEB_LLM_FALLBACK_PROVIDER]
+            seen: set[str] = set()
+            last_gateway_failure: dict[str, Any] = {}
+            for provider in providers_to_try:
+                provider_norm = str(provider or "").strip()
+                if not provider_norm or provider_norm in seen:
+                    continue
+                seen.add(provider_norm)
+                gateway_call = _web_gateway_chat_completion(
+                    prompt,
+                    provider=provider_norm,
+                    format_contract=format_contract,
+                    job_id=job_id,
+                    operation_id=operation_id,
+                    round_index=int(round_index),
+                    strict_mode=strict_gateway_mode,
+                    new_chat=(WEB_LLM_SESSION_MODE in {"per_request", "per-request", "new_chat", "new-chat"}),
+                )
+                if gateway_call.get("ok"):
+                    call = gateway_call
+                    break
+                last_gateway_failure = gateway_call
+                fallback_errors[f"gateway:{provider_norm}"] = str(gateway_call.get("error") or "gateway_unavailable")
+
+            if not call.get("ok") and strict_gateway_mode:
+                mapped = _map_gateway_error(
+                    str(last_gateway_failure.get("error") or ""),
+                    str(last_gateway_failure.get("detail") or ""),
+                )
+                detail_text = json.dumps(last_gateway_failure, ensure_ascii=False)
+                if mapped == "gateway_bad_payload" and "format_contract_failed" in detail_text:
+                    mapped = "gateway_bad_payload:format_contract_failed"
+                return {
+                    "ok": False,
+                    "error": mapped,
+                    "detail": last_gateway_failure,
+                    "raw_text": str(last_gateway_failure.get("raw_text") or ""),
+                }
         elif WEB_GATEWAY_STRICT:
             return {
                 "ok": False,
@@ -3149,6 +3215,10 @@ Rules:
             err = str(call.get("error") or "codex_generate_failed")
             if strict_gateway_mode:
                 err = _map_gateway_error(err, str(call.get("detail") or ""))
+                if err == "gateway_bad_payload":
+                    detail_text = json.dumps(detail, ensure_ascii=False)
+                    if "format_contract_failed" in detail_text:
+                        err = "gateway_bad_payload:format_contract_failed"
             return {"ok": False, "error": err, "detail": detail, "raw_text": raw_text}
 
         parse_error: str | None = None
@@ -3223,10 +3293,13 @@ Rules:
                 **call_meta,
             }
         if isinstance(call, dict) and call.get("source") == "web_gateway":
+            provider_used = str(call_meta.get("provider") or "").strip()
+            if not provider_used and isinstance(call.get("gateway_meta"), dict):
+                provider_used = str((call.get("gateway_meta") or {}).get("provider") or "").strip()
             call_meta = {
                 "agent_id": "web_gateway",
-                "provider": "chatgpt-web",
-                "model": str(call.get("model") or WEB_GATEWAY_MODEL),
+                "provider": provider_used or WEB_LLM_PRIMARY_PROVIDER,
+                "model": str(call.get("model") or call_meta.get("model") or WEB_GATEWAY_MODEL),
                 **call_meta,
             }
 
@@ -3503,7 +3576,17 @@ Rules:
         if task_type == "SPREADSHEET_TRANSLATION":
             direct_min = max(10000, int(os.getenv("OPENCLAW_XLSX_DIRECT_FIRST_MIN_PROMPT_BYTES", "50000")))
             prefer_direct = prompt_bytes >= direct_min and _env_flag("OPENCLAW_XLSX_PREFER_DIRECT_API_ON_LARGE_PROMPT", "1")
-        return _execute_prompt(prompt, prefer_direct=prefer_direct)
+        format_contract = build_section_format_contract(str(context_payload.get("message_text") or ""))
+        if not format_contract:
+            format_contract = build_section_format_contract(prompt)
+        op_id = f"op_{uuid.uuid4().hex[:12]}"
+        return _execute_prompt(
+            prompt,
+            prefer_direct=prefer_direct,
+            format_contract=format_contract,
+            job_id=str(context_payload.get("job_id") or ""),
+            operation_id=op_id,
+        )
 
     context_for_prompt = copy.deepcopy(context)
     previous_for_prompt = copy.deepcopy(previous_draft or {})
@@ -3919,16 +4002,51 @@ Rules:
 - Scores are between 0 and 1.
 - JSON only.
 """.strip()
-    call = _agent_call(GEMINI_AGENT, prompt)
-    if not call.get("ok") and GEMINI_FALLBACK_AGENTS:
-        for fb_agent in GEMINI_FALLBACK_AGENTS:
-            if fb_agent == GEMINI_AGENT:
+    strict_gateway_mode = bool(WEB_GATEWAY_ENABLED and WEB_GATEWAY_STRICT)
+    call: dict[str, Any] = {"ok": False, "error": "not_called"}
+    if WEB_GATEWAY_ENABLED:
+        providers_to_try = [WEB_LLM_PRIMARY_PROVIDER, WEB_LLM_FALLBACK_PROVIDER]
+        seen: set[str] = set()
+        last_failure: dict[str, Any] = {}
+        op_id = f"op_{uuid.uuid4().hex[:12]}"
+        for provider in providers_to_try:
+            provider_norm = str(provider or "").strip()
+            if not provider_norm or provider_norm in seen:
                 continue
-            call = _agent_call(fb_agent, prompt)
-            if call.get("ok"):
+            seen.add(provider_norm)
+            gw = _web_gateway_chat_completion(
+                prompt,
+                provider=provider_norm,
+                format_contract=None,
+                job_id=str(context.get("job_id") or ""),
+                operation_id=op_id,
+                round_index=int(round_index),
+                strict_mode=strict_gateway_mode,
+                new_chat=(WEB_LLM_SESSION_MODE in {"per_request", "per-request", "new_chat", "new-chat"}),
+            )
+            if gw.get("ok"):
+                call = gw
                 break
-    if not call.get("ok"):
-        return {"ok": False, "error": call.get("error"), "detail": call}
+            last_failure = gw
+        if not call.get("ok"):
+            if strict_gateway_mode:
+                mapped = _map_gateway_error(
+                    str(last_failure.get("error") or ""),
+                    str(last_failure.get("detail") or ""),
+                )
+                return {"ok": False, "error": mapped, "detail": last_failure, "raw_text": str(last_failure.get("raw_text") or "")}
+            return {"ok": False, "error": last_failure.get("error") or "gateway_unavailable", "detail": last_failure}
+    else:
+        call = _agent_call(GEMINI_AGENT, prompt)
+        if not call.get("ok") and GEMINI_FALLBACK_AGENTS:
+            for fb_agent in GEMINI_FALLBACK_AGENTS:
+                if fb_agent == GEMINI_AGENT:
+                    continue
+                call = _agent_call(fb_agent, prompt)
+                if call.get("ok"):
+                    break
+        if not call.get("ok"):
+            return {"ok": False, "error": call.get("error"), "detail": call}
     try:
         parsed = _extract_json_from_text(str(call.get("text", "")))
     except Exception as exc:
@@ -4075,7 +4193,18 @@ def _map_gateway_error(error_type: str, detail: str = "") -> str:
     return "gateway_unavailable"
 
 
-def _web_gateway_chat_completion(prompt: str) -> dict[str, Any]:
+def _web_gateway_chat_completion(
+    prompt: str,
+    *,
+    provider: str = "",
+    format_contract: dict[str, Any] | None = None,
+    job_id: str = "",
+    operation_id: str = "",
+    round_index: int = 0,
+    batch_id: str = "",
+    new_chat: bool = True,
+    strict_mode: bool = False,
+) -> dict[str, Any]:
     import urllib.error
     import urllib.request
 
@@ -4086,13 +4215,29 @@ def _web_gateway_chat_completion(prompt: str) -> dict[str, Any]:
     if not base:
         return {"ok": False, "error": "gateway_unavailable", "detail": "gateway_base_url_missing"}
     url = f"{base}/v1/chat/completions"
-    body = json.dumps(
-        {
-            "model": WEB_GATEWAY_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-        }
-    ).encode("utf-8")
+    request_payload: dict[str, Any] = {
+        "model": WEB_GATEWAY_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "new_chat": bool(new_chat),
+    }
+    provider_norm = str(provider or "").strip()
+    if provider_norm:
+        request_payload["provider"] = provider_norm
+    if format_contract:
+        request_payload["format_contract"] = format_contract
+    if job_id:
+        request_payload["job_id"] = str(job_id)
+    if operation_id:
+        request_payload["operation_id"] = str(operation_id)
+    if int(round_index or 0) > 0:
+        request_payload["round"] = int(round_index)
+    batch_norm = str(batch_id or "").strip()
+    if batch_norm:
+        request_payload["batch_id"] = batch_norm
+    if strict_mode:
+        request_payload["strict_mode"] = True
+    body = json.dumps(request_payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
@@ -4139,16 +4284,22 @@ def _web_gateway_chat_completion(prompt: str) -> dict[str, Any]:
     content = message.get("content") if isinstance(message, dict) else ""
     if not isinstance(content, str) or not content.strip():
         return {"ok": False, "error": "gateway_bad_payload", "detail": "message_content_missing"}
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    gateway_meta = meta.get("gateway") if isinstance(meta.get("gateway"), dict) else {}
+    provider_used = str(gateway_meta.get("provider") or provider_norm or "")
     return {
         "ok": True,
         "text": content,
         "source": "web_gateway",
         "model": str(data.get("model") or WEB_GATEWAY_MODEL),
+        "gateway_meta": gateway_meta,
         "meta": {
             "agent_id": "web_gateway",
-            "provider": "chatgpt-web",
+            "provider": provider_used or "web-llm",
             "model": str(data.get("model") or WEB_GATEWAY_MODEL),
             "base_url": base,
+            "page_url": str(gateway_meta.get("page_url") or ""),
+            "screenshot_path": str(gateway_meta.get("screenshot_path") or ""),
         },
     }
 
@@ -5191,7 +5342,9 @@ def run(
         gemini_enabled = bool(meta.get("gemini_available", True))
         gemini_initially_enabled = gemini_enabled
         strict_gateway_mode = bool(WEB_GATEWAY_ENABLED and WEB_GATEWAY_STRICT)
-        glm_enabled = _glm_enabled() and not strict_gateway_mode
+        # In web-gateway mode, each round is "one generate + one review" with provider fallback
+        # handled inside the gateway. Disable non-web generator paths to avoid extra model calls.
+        glm_enabled = _glm_enabled() and (not strict_gateway_mode) and (not WEB_GATEWAY_ENABLED)
         system_round_root = Path(review_dir) / ".system" / "rounds"
         system_round_root.mkdir(parents=True, exist_ok=True)
         disallow_markdown = _env_flag("OPENCLAW_DISALLOW_MARKDOWN", "1")
@@ -5267,6 +5420,9 @@ def run(
                 generation_errors["glm"] = str(glm_gen.get("error", "glm_generation_failed"))
             if not codex_data and not glm_data:
                 errors.append(f"no_generator_candidates:{generation_errors}")
+                if any("format_contract_failed" in str(v or "") for v in generation_errors.values()):
+                    if "format_contract_failed" not in status_flags:
+                        status_flags.append("format_contract_failed")
                 gateway_tokens = [
                     _map_gateway_error(str(v), str(v))
                     for v in generation_errors.values()
@@ -5383,55 +5539,23 @@ def run(
             if not review_findings:
                 review_findings = list(selected_draft.get("unresolved") or [])
 
+            # Policy: one generation + one review per round. If we need fixes, we push
+            # findings into the next round instead of doing in-round re-generation.
             did_fix = False
-            if review_findings:
-                prev_selected = selected_draft
-                codex_fix = _codex_generate(execution_context, selected_draft, review_findings, round_idx)
-                if codex_fix.get("ok"):
-                    selected_draft = _preserve_nonempty_translation_maps(prev_selected, codex_fix["data"])
-                    selected_generator_meta = (
-                        codex_fix.get("call_meta") if isinstance(codex_fix.get("call_meta"), dict) else selected_generator_meta
-                    )
-                    did_fix = True
 
             glossary_suffix_cleanup = _strip_redundant_glossary_suffixes(execution_context, selected_draft)
             if gemini_enabled:
-                if did_fix:
-                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
-                    if gemini_final.get("ok"):
-                        gemini_data = gemini_final["data"]
-                        selected_review_meta = (
-                            gemini_final.get("call_meta")
-                            if isinstance(gemini_final.get("call_meta"), dict)
-                            else selected_review_meta
-                        )
-                    else:
-                        _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
-                        gemini_enabled = False
-                        status_flags.append("degraded_single_model")
-                        gemini_data = {
-                            "findings": review_findings,
-                            "resolved": list(selected_draft.get("resolved") or []),
-                            "unresolved": list(selected_draft.get("unresolved") or []),
-                            "pass": bool(selected_draft.get("codex_pass")),
-                            "terminology_rate": 0.9,
-                            "structure_complete_rate": 0.9,
-                            "target_language_purity": 0.9,
-                            "numbering_consistency": 0.9,
-                            "reasoning_summary": "Gemini second-pass failed; degraded single model path.",
-                        }
-                else:
-                    gemini_data = selected_review or {
-                        "findings": list(selected_draft.get("unresolved") or []),
-                        "resolved": list(selected_draft.get("resolved") or []),
-                        "unresolved": list(selected_draft.get("unresolved") or []),
-                        "pass": bool(selected_draft.get("codex_pass")),
-                        "terminology_rate": 0.9,
-                        "structure_complete_rate": 0.9,
-                        "target_language_purity": 0.9,
-                        "numbering_consistency": 0.9,
-                        "reasoning_summary": "Gemini review unavailable for selected candidate; degraded metrics.",
-                    }
+                gemini_data = selected_review or {
+                    "findings": list(selected_draft.get("unresolved") or []),
+                    "resolved": list(selected_draft.get("resolved") or []),
+                    "unresolved": list(selected_draft.get("unresolved") or []),
+                    "pass": bool(selected_draft.get("codex_pass")),
+                    "terminology_rate": 0.9,
+                    "structure_complete_rate": 0.9,
+                    "target_language_purity": 0.9,
+                    "numbering_consistency": 0.9,
+                    "reasoning_summary": "Gemini review unavailable for selected candidate; degraded metrics.",
+                }
             else:
                 gemini_data = {
                     "findings": list(selected_draft.get("unresolved") or []),
@@ -5492,53 +5616,7 @@ def run(
                 disallow_markdown=disallow_markdown,
                 vision_in_round=vision_in_round,
             )
-
-            while hard_findings and vision_fix_used < vision_fix_limit:
-                vision_fix_used += 1
-                retry_findings = sorted(set(_fix_findings_for_retry() + hard_findings + _hard_gate_retry_hints(hard_meta)))
-                retry_findings = [x for x in retry_findings if str(x).strip()][:40]
-                hard_fix_attempts.append({"attempt": vision_fix_used, "findings": retry_findings})
-
-                codex_fix = _codex_generate(execution_context, selected_draft, retry_findings, round_idx)
-                if not codex_fix.get("ok"):
-                    errors.append(f"hard_gate_fix_failed:{codex_fix.get('error')}")
-                    break
-                selected_draft = _preserve_nonempty_translation_maps(selected_draft, codex_fix["data"])
-                glossary_suffix_cleanup = _strip_redundant_glossary_suffixes(execution_context, selected_draft)
-                if isinstance(codex_fix.get("call_meta"), dict):
-                    selected_generator_meta = codex_fix["call_meta"]
-                did_fix = True
-
-                if gemini_enabled:
-                    gemini_final = _gemini_review(execution_context, selected_draft, round_idx)
-                    if gemini_final.get("ok"):
-                        gemini_data = gemini_final["data"]
-                        if isinstance(gemini_final.get("call_meta"), dict):
-                            selected_review_meta = gemini_final["call_meta"]
-                    else:
-                        _write_raw_error_artifacts(round_dir, "gemini_review_selected", gemini_final)
-                        gemini_enabled = False
-                        status_flags.append("degraded_single_model")
-                        gemini_data = {
-                            "findings": retry_findings,
-                            "resolved": list(selected_draft.get("resolved") or []),
-                            "unresolved": list(selected_draft.get("unresolved") or retry_findings),
-                            "pass": bool(selected_draft.get("codex_pass")),
-                            "terminology_rate": 0.9,
-                            "structure_complete_rate": 0.9,
-                            "target_language_purity": 0.9,
-                            "numbering_consistency": 0.9,
-                            "reasoning_summary": "Gemini unavailable during hard-gate retry; degraded single model path.",
-                        }
-
-                hard_findings, hard_warnings, hard_meta = _compute_hard_gates(
-                    review_dir=review_dir,
-                    context=execution_context,
-                    draft=selected_draft,
-                    round_idx=round_idx,
-                    disallow_markdown=disallow_markdown,
-                    vision_in_round=vision_in_round,
-                )
+            hard_retry_hints = _hard_gate_retry_hints(hard_meta)
 
             candidate_refs: dict[str, str] = {}
             review_refs: dict[str, str] = {}
@@ -5566,6 +5644,7 @@ def run(
                 "findings": hard_findings,
                 "warnings": hard_warnings,
                 "attempts": hard_fix_attempts,
+                "retry_hints": hard_retry_hints,
             }
             selection_meta["glossary_suffix_cleanup"] = glossary_suffix_cleanup
             _write_json(round_dir / "selection.json", selection_meta)
@@ -5592,6 +5671,7 @@ def run(
             rec["hard_findings"] = hard_findings
             rec["warnings"] = hard_warnings
             rec["hard_fix_attempts"] = hard_fix_attempts
+            rec["retry_hints"] = hard_retry_hints
             rec["metrics"]["hard_fail_items"] = list(hard_findings)
             if any(str(item).startswith("xlsx_translation_truncated:") for item in hard_findings):
                 if "translation_truncation_detected" not in status_flags:
@@ -5614,7 +5694,11 @@ def run(
             vision_trials_by_round[str(round_idx)] = hard_meta.get("vision_trial")
 
             current_draft = selected_draft
-            previous_findings = list(rec.get("unresolved") or [])
+            previous_findings = [
+                str(x)
+                for x in (list(rec.get("unresolved") or []) + list(rec.get("retry_hints") or []))
+                if str(x).strip()
+            ]
             if rec.get("pass"):
                 break
 

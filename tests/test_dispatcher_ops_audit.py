@@ -138,6 +138,46 @@ class DispatcherOpsAuditTest(unittest.TestCase):
             self.assertEqual(payload["result"]["operation"]["action"], "gateway_status")
             self.assertEqual(payload["result"]["target"], "+15552001")
 
+    @patch("scripts.openclaw_v4_dispatcher._gateway_status")
+    @patch("scripts.openclaw_v4_dispatcher._gateway_audit")
+    @patch("scripts.openclaw_v4_dispatcher._http_json")
+    def test_gateway_diagnose_command_outputs_json(self, mocked_http_json, mocked_audit, mocked_status):
+        mocked_status.return_value = {
+            "running": True,
+            "healthy": True,
+            "pid": 123,
+            "base_url": "http://127.0.0.1:8765",
+            "model": "chatgpt-web",
+            "logged_in": True,
+            "last_error": "",
+            "updated_at": "2026-02-24T00:00:00Z",
+            "health": {},
+        }
+        mocked_http_json.return_value = {
+            "ok": True,
+            "logged_in": True,
+            "selector_probe": {"prompt_textarea": True},
+            "last_error": "",
+        }
+        mocked_audit.return_value = {"ok": True}
+        with tempfile.TemporaryDirectory() as td:
+            work_root = Path(td) / "Translation Task"
+            argv = [
+                "openclaw_v4_dispatcher.py",
+                "--work-root",
+                str(work_root),
+                "gateway-diagnose",
+            ]
+            with patch.object(sys, "argv", argv):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    code = openclaw_v4_dispatcher.main()
+            self.assertEqual(code, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["result"]["diagnose"]["ok"])
+            self.assertEqual(payload["result"]["status"]["pid"], 123)
+
 
 if __name__ == "__main__":
     unittest.main()

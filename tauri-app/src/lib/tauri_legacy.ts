@@ -120,6 +120,67 @@ export interface GatewayStatus {
   model: string;
   last_error: string;
   updated_at: string;
+  version?: string;
+  primary_provider?: string;
+  providers?: Record<string, GatewayProviderStatus>;
+}
+
+export interface GatewayProviderStatus {
+  provider: string;
+  running: boolean;
+  healthy: boolean;
+  logged_in: boolean;
+  base_url: string;
+  model: string;
+  home_url: string;
+  last_error: string;
+  updated_at: string;
+  session_checked_at: string;
+  profile_dir: string;
+  last_url: string;
+}
+
+export interface GatewayLoginPayload {
+  provider?: string;
+  interactive_login?: boolean;
+  timeout_seconds?: number;
+  // Make this assignable to Tauri's InvokeArgs type (Record<string, unknown>).
+  [key: string]: unknown;
+}
+
+export interface StartupStepResult {
+  phase: string;
+  status: string;
+  message: string;
+  hint_action?: string;
+  started_at: string;
+  ended_at: string;
+}
+
+export interface StartOpenclawPayload {
+  force_restart?: boolean;
+}
+
+export interface StartTelegramPayload {
+  force_restart?: boolean;
+}
+
+export interface TelegramHealth {
+  running: boolean;
+  single_instance_ok: boolean;
+  conflict_409: boolean;
+  pid_lock: boolean;
+  poll_conflict: boolean;
+  network: string;
+  last_error: string;
+  log_tail: string[];
+  updated_at: string;
+}
+
+export interface StartupSnapshot {
+  services: ServiceStatus[];
+  gateway: GatewayStatus;
+  telegram: TelegramHealth;
 }
 
 export interface AuditOperationPayload {
@@ -225,6 +286,24 @@ export const autoFixPreflight = (): Promise<PreflightCheck[]> =>
 export const startOpenclaw = (): Promise<PreflightCheck[]> =>
   tInvoke<PreflightCheck[]>("start_openclaw");
 
+export const startOpenclawV2 = (payload?: StartOpenclawPayload): Promise<StartupStepResult[]> =>
+  tInvoke<StartupStepResult[]>("start_openclaw_v2", { payload }, 30000);
+
+export const startTelegramBotV2 = (payload?: StartTelegramPayload): Promise<TelegramHealth> =>
+  tInvoke<TelegramHealth>("start_telegram_bot_v2", { payload }, 20000);
+
+export const diagnoseTelegramBot = (): Promise<TelegramHealth> =>
+  tInvoke<TelegramHealth>("diagnose_telegram_bot");
+
+export const stopOpenclawComponent = (name: "gateway" | "worker" | "telegram"): Promise<unknown> =>
+  tInvoke("stop_openclaw_component", { name }, 20000);
+
+export const restartOpenclawComponent = (name: "gateway" | "worker" | "telegram"): Promise<unknown> =>
+  tInvoke("restart_openclaw_component", { name }, 30000);
+
+export const getStartupSnapshot = (): Promise<StartupSnapshot> =>
+  tInvoke<StartupSnapshot>("get_startup_snapshot");
+
 export const auditOperation = (payload: AuditOperationPayload): Promise<unknown> =>
   tInvoke("audit_operation", {
     payload: {
@@ -248,8 +327,8 @@ export const gatewayStop = (): Promise<GatewayStatus> =>
 export const gatewayStatus = (): Promise<GatewayStatus> =>
   tInvoke<GatewayStatus>("gateway_status");
 
-export const gatewayLogin = (): Promise<GatewayStatus> =>
-  tInvoke<GatewayStatus>("gateway_login");
+export const gatewayLogin = (payload?: GatewayLoginPayload): Promise<GatewayStatus> =>
+  tInvoke<GatewayStatus>("gateway_login", payload, 30000);
 
 // ============================================================================
 // Config Commands

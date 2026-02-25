@@ -121,5 +121,39 @@ class TelegramBotHandleUpdateTest(unittest.TestCase):
         mock_text.assert_called_once_with("123", "hello world")
 
 
+class TelegramBotPollLoopTest(unittest.TestCase):
+    @patch("scripts.telegram_bot._release_pid_lock")
+    @patch("scripts.telegram_bot._acquire_pid_lock", return_value=True)
+    @patch("scripts.telegram_bot._save_offset")
+    @patch("scripts.telegram_bot._load_offset", return_value=0)
+    @patch("scripts.telegram_bot.time.sleep")
+    @patch("scripts.telegram_bot.tg_api")
+    def test_409_conflict_retries_instead_of_exit(
+        self,
+        mock_tg_api,
+        _mock_sleep,
+        _mock_load_offset,
+        _mock_save_offset,
+        _mock_acquire_lock,
+        _mock_release_lock,
+    ):
+        import scripts.telegram_bot as bot
+
+        def stop_after_first_update(_update):
+            bot._running = False
+
+        mock_tg_api.side_effect = [
+            {"ok": False, "error_code": 409, "description": "Conflict"},
+            {"ok": True, "result": [{"update_id": 10, "message": {"chat": {"id": 123}, "text": "status"}}]},
+        ]
+
+        with patch("scripts.telegram_bot.handle_update", side_effect=stop_after_first_update):
+            bot._running = True
+            code = bot.poll_loop()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_tg_api.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

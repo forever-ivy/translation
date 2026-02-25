@@ -50,7 +50,7 @@ class V4PipelineDuplicateGuardTest(unittest.TestCase):
             queue_id = self._prepare_running_job(work_root=work_root, job_id=job_id)
 
             with (
-                patch.dict(os.environ, {"OPENCLAW_QUEUE_ID": str(queue_id)}, clear=False),
+                patch.dict(os.environ, {"OPENCLAW_QUEUE_ID": str(queue_id), "OPENCLAW_WEB_GATEWAY_PREFLIGHT": "0"}, clear=False),
                 patch("scripts.v4_pipeline.update_job_status", side_effect=RuntimeError("sentinel")),
             ):
                 with self.assertRaisesRegex(RuntimeError, "sentinel"):
@@ -69,7 +69,7 @@ class V4PipelineDuplicateGuardTest(unittest.TestCase):
             job_id = "job_pipeline_duplicate_blocked"
             self._prepare_running_job(work_root=work_root, job_id=job_id)
 
-            with patch.dict(os.environ, {"OPENCLAW_QUEUE_ID": "999999"}, clear=False):
+            with patch.dict(os.environ, {"OPENCLAW_QUEUE_ID": "999999", "OPENCLAW_WEB_GATEWAY_PREFLIGHT": "0"}, clear=False):
                 result = run_job_pipeline(
                     job_id=job_id,
                     work_root=work_root,
@@ -152,6 +152,7 @@ class V4PipelinePlanStatusTest(unittest.TestCase):
                 patch("scripts.v4_pipeline.notify_milestone", return_value=None),
                 patch("scripts.v4_pipeline.update_job_plan") as mocked_update_plan,
                 patch("scripts.v4_pipeline.run_translation", side_effect=_fake_run_translation),
+                patch.dict(os.environ, {"OPENCLAW_WEB_GATEWAY_PREFLIGHT": "0"}, clear=False),
             ):
                 with self.assertRaisesRegex(RuntimeError, "sentinel"):
                     run_job_pipeline(
@@ -247,7 +248,7 @@ class V4PipelineCooldownFriendlyTest(unittest.TestCase):
                 patch("scripts.v4_pipeline.retrieve_kb_with_fallback", return_value={"hits": [], "backend": "local", "status_flags": []}),
                 patch("scripts.v4_pipeline.notify_milestone", return_value=None) as mocked_notify,
                 patch("scripts.v4_pipeline.run_translation", side_effect=_fake_run_translation),
-                patch.dict(os.environ, {"OPENCLAW_COOLDOWN_FRIENDLY_MODE": "1"}, clear=False),
+                patch.dict(os.environ, {"OPENCLAW_COOLDOWN_FRIENDLY_MODE": "1", "OPENCLAW_WEB_GATEWAY_PREFLIGHT": "0"}, clear=False),
             ):
                 result = run_job_pipeline(
                     job_id=job_id,
@@ -340,6 +341,7 @@ class V4PipelineGatewayFailedMilestoneTest(unittest.TestCase):
                 patch("scripts.v4_pipeline.retrieve_kb_with_fallback", return_value={"hits": [], "backend": "local", "status_flags": []}),
                 patch("scripts.v4_pipeline.notify_milestone", return_value=None) as mocked_notify,
                 patch("scripts.v4_pipeline.run_translation", side_effect=_fake_run_translation),
+                patch.dict(os.environ, {"OPENCLAW_WEB_GATEWAY_PREFLIGHT": "0"}, clear=False),
             ):
                 result = run_job_pipeline(
                     job_id=job_id,
@@ -357,6 +359,101 @@ class V4PipelineGatewayFailedMilestoneTest(unittest.TestCase):
             self.assertIn("gateway-status", message)
             self.assertIn("gateway-login", message)
             self.assertIn("rerun", message)
+
+    def test_run_job_pipeline_emits_format_contract_failed_milestone(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_root = Path(td) / "Translation Task"
+            kb_root = Path(td) / "Knowledge Repository"
+            kb_root.mkdir(parents=True, exist_ok=True)
+            paths = ensure_runtime_paths(work_root)
+            conn = db_connect(paths)
+            job_id = "job_pipeline_format_contract_failed"
+            inbox_dir = paths.inbox_messaging / job_id
+            review_dir = paths.review_root / job_id
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+            review_dir.mkdir(parents=True, exist_ok=True)
+
+            write_job(
+                conn,
+                job_id=job_id,
+                source="telegram",
+                sender="+1",
+                subject="Test",
+                message_text="translate arabic to english",
+                status="planned",
+                inbox_dir=inbox_dir,
+                review_dir=review_dir,
+            )
+            xlsx_path = inbox_dir / "FD.xlsx"
+            xlsx_path.write_text("stub", encoding="utf-8")
+            conn.execute(
+                "INSERT INTO job_files(job_id, path, name, mime_type, created_at) VALUES(?,?,?,?,?)",
+                (job_id, str(xlsx_path.resolve()), xlsx_path.name, "", "2026-02-22T00:00:00+00:00"),
+            )
+            conn.commit()
+            conn.close()
+
+            plan_result = {
+                "ok": True,
+                "status": "planned",
+                "intent": {
+                    "task_type": "SPREADSHEET_TRANSLATION",
+                    "task_label": "Translate Arabic Excel file to English",
+                    "source_language": "ar",
+                    "target_language": "en",
+                    "required_inputs": ["source_document"],
+                    "missing_inputs": [],
+                    "confidence": 0.9,
+                    "reasoning_summary": "stub",
+                },
+                "plan": {
+                    "task_type": "SPREADSHEET_TRANSLATION",
+                    "confidence": 0.9,
+                    "estimated_minutes": 15,
+                    "complexity_score": 2.0,
+                    "time_budget_minutes": 20,
+                },
+                "estimated_minutes": 15,
+            }
+            run_result = {
+                "ok": False,
+                "status": "failed",
+                "errors": ["gateway_bad_payload:format_contract_failed"],
+                "status_flags": ["gateway_bad_payload", "format_contract_failed"],
+                "artifacts": {},
+                "quality_report": {"rounds": []},
+                "intent": plan_result["intent"],
+                "iteration_count": 0,
+                "double_pass": False,
+            }
+
+            def _fake_run_translation(*_args, **kwargs):
+                if kwargs.get("plan_only"):
+                    return plan_result
+                return dict(run_result)
+
+            with (
+                patch("scripts.v4_pipeline.sync_kb_with_rag", return_value={"local_report": {"created": 0, "updated": 0}, "rag_report": {}}),
+                patch("scripts.v4_pipeline.retrieve_kb_with_fallback", return_value={"hits": [], "backend": "local", "status_flags": []}),
+                patch("scripts.v4_pipeline.notify_milestone", return_value=None) as mocked_notify,
+                patch("scripts.v4_pipeline.run_translation", side_effect=_fake_run_translation),
+                patch.dict(os.environ, {"OPENCLAW_WEB_GATEWAY_PREFLIGHT": "0"}, clear=False),
+            ):
+                result = run_job_pipeline(
+                    job_id=job_id,
+                    work_root=work_root,
+                    kb_root=kb_root,
+                    dry_run_notify=True,
+                )
+
+            self.assertEqual(str(result.get("status")), "failed")
+            format_calls = [
+                c for c in mocked_notify.call_args_list if str(c.kwargs.get("milestone") or "") == "format_contract_failed"
+            ]
+            self.assertTrue(format_calls)
+            msg = str(format_calls[-1].kwargs.get("message") or "")
+            self.assertIn("gateway-status", msg)
+            self.assertIn("gateway-login", msg)
 
 
 if __name__ == "__main__":

@@ -427,7 +427,7 @@ def run_job_pipeline(
     if not job:
         raise ValueError(f"Job not found: {job_id}")
 
-    if str(job.get("status", "")) == "running":
+    if str(job.get("status", "")) in {"running", "preflight"}:
         # Duplicate guard:
         # When invoked from run-worker, job.status may already be "running"
         # (set during queue claim). In that case, allow the invocation that owns
@@ -445,6 +445,110 @@ def run_job_pipeline(
             log.warning("Job %s is already running — skipping duplicate", job_id)
             conn.close()
             return {"ok": False, "job_id": job_id, "status": "already_running", "skipped": True}
+
+    update_job_status(conn, job_id=job_id, status="preflight", errors=[])
+
+    # Web Gateway preflight (Gemini/ChatGPT web session readiness).
+    gateway_enabled = str(os.getenv("OPENCLAW_WEB_GATEWAY_ENABLED", "1")).strip().lower() not in {"0", "false", "off", "no", ""}
+    gateway_preflight_enabled = str(os.getenv("OPENCLAW_WEB_GATEWAY_PREFLIGHT", "1")).strip().lower() not in {"0", "false", "off", "no", ""}
+    if gateway_enabled and gateway_preflight_enabled:
+        import urllib.error
+        import urllib.request
+
+        base_url = str(os.getenv("OPENCLAW_WEB_GATEWAY_BASE_URL", "http://127.0.0.1:8765")).strip().rstrip("/")
+        primary_provider = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="preflight_started",
+            message="\U0001f9ea Preflight: checking web gateway session\u2026",
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+
+        payload = json.dumps(
+            {"provider": primary_provider, "interactive": False, "timeout_seconds": 15},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/session/login",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        login_resp: dict[str, Any] = {}
+        login_ok = False
+        preflight_error = ""
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            login_resp = json.loads(raw) if raw.strip().startswith("{") else {"raw": raw[:2000]}
+            login_ok = bool(login_resp.get("ok", False))
+        except urllib.error.HTTPError as exc:
+            raw_err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            preflight_error = f"http_{exc.code}:{raw_err[:800]}"
+        except urllib.error.URLError as exc:
+            preflight_error = f"url_error:{exc}"
+        except TimeoutError:
+            preflight_error = "timeout"
+        except Exception as exc:
+            preflight_error = str(exc)
+
+        if not login_ok:
+            token = f"gateway_login_required:{primary_provider}"
+            if preflight_error:
+                token = f"gateway_unavailable:{primary_provider}"
+            update_job_status(conn, job_id=job_id, status="needs_attention", errors=[token])
+            notify_milestone(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                milestone="preflight_failed",
+                message=(
+                    "\u26d4 Web gateway not ready.\n"
+                    f"Provider: {primary_provider}\n"
+                    "Open Tauri -> Gateway Login (or run: scripts/start.sh --gateway-login)."
+                ),
+                target=notify_target,
+                dry_run=dry_run_notify,
+            )
+            record_event(
+                conn,
+                job_id=job_id,
+                milestone="preflight_detail",
+                payload={
+                    "ok": False,
+                    "provider": primary_provider,
+                    "error": preflight_error or "login_required",
+                    "response": login_resp,
+                },
+            )
+            conn.close()
+            return {
+                "ok": False,
+                "job_id": job_id,
+                "status": "needs_attention",
+                "errors": [token],
+                "status_flags": [token.split(":", 1)[0]],
+            }
+
+        record_event(
+            conn,
+            job_id=job_id,
+            milestone="preflight_done",
+            payload={"ok": True, "provider": primary_provider, "response": login_resp},
+        )
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="preflight_done",
+            message=f"\u2705 Preflight OK ({primary_provider})",
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
 
     update_job_status(conn, job_id=job_id, status="running", errors=[])
     set_sender_active_job(conn, sender=str(job.get("sender", "")).strip(), job_id=job_id)
@@ -929,65 +1033,91 @@ def run_job_pipeline(
     ).strip().lower() not in {"0", "false", "off", "no"}
     if detail_validation_enabled and result.get("status") in {"review_ready", "needs_attention"}:
         try:
-            # Get original file paths from candidates
-            original_files = []
-            for c in candidates:
-                p = c.get("path")
-                if p:
-                    original_files.append(Path(p))
+            from scripts.detail_validator import ValidationReportGenerator, validate_file_pair
 
-            # Get translated file paths from artifacts
+            # Orchestrator returns a manifest with source/translated paths; prefer that over
+            # guessing based on filenames (Final.xlsx/Final.docx don't match source names).
             artifacts = dict(result.get("artifacts", {}))
-            translated_files = []
-            for artifact_name in ["Final.docx", "Final-Reflow.docx", "Translated.xlsx"]:
-                artifact_path = artifacts.get(artifact_name)
-                if artifact_path:
-                    translated_files.append(Path(artifact_path))
+            pairs: list[tuple[Path, Path]] = []
+            for entry in (artifacts.get("docx_files") or []):
+                if not isinstance(entry, dict):
+                    continue
+                src = str(entry.get("source_path") or "").strip()
+                out = str(entry.get("path") or "").strip()
+                if src and out:
+                    pairs.append((Path(src), Path(out)))
+            for entry in (artifacts.get("xlsx_files") or []):
+                if not isinstance(entry, dict):
+                    continue
+                src = str(entry.get("source_path") or "").strip()
+                out = str(entry.get("path") or "").strip()
+                if src and out:
+                    pairs.append((Path(src), Path(out)))
+
+            # Back-compat: manifest can omit *_files arrays when only a single Final.*
+            # is produced. Pair it with the first matching source candidate.
+            if not any(p[0].suffix.lower() == ".xlsx" for p in pairs):
+                final_xlsx = str(artifacts.get("final_xlsx") or "").strip()
+                if final_xlsx:
+                    src_xlsx = next((c.get("path") for c in candidates if str(c.get("path") or "").lower().endswith(".xlsx")), "")
+                    if src_xlsx:
+                        pairs.append((Path(str(src_xlsx)), Path(final_xlsx)))
+            if not any(p[0].suffix.lower() == ".docx" for p in pairs):
+                final_docx = str(artifacts.get("final_docx") or "").strip()
+                if final_docx:
+                    src_docx = next((c.get("path") for c in candidates if str(c.get("path") or "").lower().endswith(".docx")), "")
+                    if src_docx:
+                        pairs.append((Path(str(src_docx)), Path(final_docx)))
 
             # Only validate if we have both original and translated files
-            if original_files and translated_files:
-                validation_results = validate_job_artifacts(
-                    review_dir=review_dir,
-                    original_files=original_files,
-                    translated_files=translated_files,
+            validated = {}
+            for orig, trans in pairs:
+                try:
+                    orig_path = Path(orig).expanduser().resolve()
+                    trans_path = Path(trans).expanduser().resolve()
+                    if not orig_path.exists() or not trans_path.exists():
+                        continue
+                    res = validate_file_pair(orig_path, trans_path)
+                    validated[trans_path.name] = res
+                except Exception as ve:
+                    log.warning("Detail validation failed for %s -> %s: %s", orig, trans, ve)
+
+            if validated:
+                # Generate markdown report
+                generator = ValidationReportGenerator()
+                report = generator.generate_markdown(list(validated.values()))
+
+                # Write to .system directory
+                system_dir = review_dir / ".system"
+                system_dir.mkdir(parents=True, exist_ok=True)
+                report_path = system_dir / "detail_validation_report.md"
+                report_path.write_text(report, encoding="utf-8")
+
+                # Generate summary for result
+                validation_summary = generator.generate_summary(list(validated.values()))
+                result["detail_validation"] = validation_summary
+
+                # Record event
+                record_event(
+                    conn,
+                    job_id=job_id,
+                    milestone="detail_validation_done",
+                    payload={
+                        "files_validated": len(validated),
+                        "score": validation_summary.get("score", 0.0),
+                        "issues_found": validation_summary.get("failed", 0),
+                        "warnings": validation_summary.get("warnings", 0),
+                        "report_path": str(report_path.resolve()),
+                    },
                 )
 
-                if validation_results:
-                    # Generate markdown report
-                    generator = ValidationReportGenerator()
-                    report = generator.generate_markdown(list(validation_results.values()))
-
-                    # Write to .system directory
-                    system_dir = review_dir / ".system"
-                    system_dir.mkdir(parents=True, exist_ok=True)
-                    report_path = system_dir / "detail_validation_report.md"
-                    report_path.write_text(report, encoding="utf-8")
-
-                    # Generate summary for result
-                    validation_summary = generator.generate_summary(list(validation_results.values()))
-                    result["detail_validation"] = validation_summary
-
-                    # Record event
-                    record_event(
-                        conn,
-                        job_id=job_id,
-                        milestone="detail_validation_done",
-                        payload={
-                            "files_validated": len(validation_results),
-                            "score": validation_summary.get("score", 0.0),
-                            "issues_found": validation_summary.get("failed", 0),
-                            "warnings": validation_summary.get("warnings", 0),
-                            "report_path": str(report_path.resolve()),
-                        },
-                    )
-
-                    log.info(
-                        "Detail validation: %d files, score=%.2f, %d critical, %d warnings",
-                        validation_summary.get("total_files", 0),
-                        validation_summary.get("score", 0.0),
-                        validation_summary.get("failed", 0),
-                        validation_summary.get("warnings", 0),
-                    )
+                log.info(
+                    "Detail validation: %d files, score=%.2f, %d critical, %d warnings",
+                    validation_summary.get("total_files", 0),
+                    validation_summary.get("score", 0.0),
+                    validation_summary.get("failed", 0),
+                    validation_summary.get("warnings", 0),
+                )
         except Exception as e:
             # Don't fail the job if detail validation has issues
             log.warning("Detail validation failed for job %s: %s", job_id, e)
@@ -1045,6 +1175,25 @@ def run_job_pipeline(
             milestone="gateway_failed",
             message=(
                 f"🚨 Gateway failed ({gateway_error})\n"
+                f"📋 {_task_name}\n"
+                "Fix: gateway-status · gateway-login · rerun"
+            ),
+            target=notify_target,
+            dry_run=dry_run_notify,
+        )
+
+    format_contract_failed = any(
+        "format_contract_failed" in str(token or "")
+        for token in [str(x) for x in (result.get("errors") or [])] + [str(x) for x in (result.get("status_flags") or [])]
+    )
+    if format_contract_failed:
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="format_contract_failed",
+            message=(
+                "🚨 Output format contract failed\n"
                 f"📋 {_task_name}\n"
                 "Fix: gateway-status · gateway-login · rerun"
             ),

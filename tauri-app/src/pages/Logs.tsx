@@ -1,6 +1,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { useAppStore } from "@/stores/appStore";
+import { useLogStore } from "@/stores/logStore";
+import { useUiStore } from "@/stores/uiStore";
 import { useEffect, useState, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { CountUp, staggerContainer, staggerItem } from "@/components/ui/motion";
@@ -15,10 +16,11 @@ const levelColors: Record<string, string> = {
 const MAX_VISIBLE_LOG_ROWS = 300;
 
 export function Logs() {
-  const logs = useAppStore((s) => s.logs);
-  const selectedLogService = useAppStore((s) => s.selectedLogService);
-  const fetchLogs = useAppStore((s) => s.fetchLogs);
-  const isLoading = useAppStore((s) => s.isLoading);
+  const logs = useLogStore((s) => s.logs);
+  const selectedLogService = useLogStore((s) => s.selectedLogService);
+  const fetchLogs = useLogStore((s) => s.fetchLogs);
+  const setSelectedLogService = useLogStore((s) => s.setSelectedLogService);
+  const isLoading = useUiStore((s) => s.isLoading);
   const [filter, setFilter] = useState("");
   const [levelFilter, setLevelFilter] = useState<string | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -82,10 +84,11 @@ export function Logs() {
           <select
             className="px-3 py-1.5 border rounded-lg text-sm bg-background text-foreground"
             value={selectedLogService}
-            onChange={(e) => useAppStore.getState().setSelectedLogService(e.target.value)}
+            onChange={(e) => setSelectedLogService(e.target.value)}
           >
             <option value="telegram">Telegram Bot</option>
             <option value="worker">Run Worker</option>
+            <option value="gateway">Gateway</option>
           </select>
           <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
             <Button variant="outline" onClick={handleExport} disabled={logs.length === 0}>
@@ -291,9 +294,9 @@ export function Logs() {
               animate="show"
             >
               {[
-                { title: "RAG backend not available", desc: "Check if ClawRAG is running: openclaw health --json" },
-                { title: "Gemini API rate limit", desc: "System will auto-retry with fallback model" },
-                { title: "Telegram connection lost", desc: "Check TELEGRAM_BOT_TOKEN in .env.v4.local" },
+                { title: "Gateway login required", desc: "Go to Runtime and complete provider Login (Gemini / ChatGPT)." },
+                { title: "RAG backend not available", desc: "Go to KB Health and run Sync Now to see error summary." },
+                { title: "Telegram 409 conflict", desc: "Go to Runtime -> Telegram Diagnostics and restart Telegram." },
               ].map((item, i) => (
                 <motion.div
                   key={i}

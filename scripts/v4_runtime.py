@@ -1010,7 +1010,7 @@ def claim_next_queued(conn: sqlite3.Connection, *, worker_id: str) -> dict[str, 
         conn.execute(
             """
             UPDATE jobs
-            SET status='running',
+            SET status='preflight',
                 updated_at=?
             WHERE job_id=?
               AND status IN ('queued', 'planned')
@@ -1078,7 +1078,7 @@ def finish_queue_item(
         job_id = str(row["job_id"] or "").strip() if row else ""
         if job_id:
             job = get_job(conn, job_id)
-            if job and str(job.get("status") or "").strip().lower() in {"planned", "queued", "running"}:
+            if job and str(job.get("status") or "").strip().lower() in {"planned", "queued", "preflight", "running"}:
                 token = (last_error or "").strip() or ("queue_failed" if state_norm == "failed" else "canceled")
                 errors = list(job.get("errors_json") or [])
                 tag = f"queue_{state_norm}:{token}"

@@ -402,12 +402,13 @@ def _release_pid_lock() -> None:
         _pid_lock_handle = None
 
 
-def poll_loop() -> None:
+def poll_loop() -> int:
     """Long-poll Telegram getUpdates in a loop."""
     if not _acquire_pid_lock():
-        return
+        return 2
 
     offset = _load_offset()
+    conflict_count = 0
     log.info("Starting Telegram bot poll loop (offset=%d, allowed=%s)", offset, ALLOWED_CHAT_IDS)
 
     try:
@@ -418,14 +419,24 @@ def poll_loop() -> None:
             resp = tg_api("getUpdates", **params)
             if not resp.get("ok"):
                 if int(resp.get("error_code") or 0) == 409:
-                    # Telegram enforces single long-polling consumer. If we see a conflict,
-                    # another instance is alive; exit so we don't spam errors forever.
-                    log.error("getUpdates conflict (409) — another bot instance is running. Exiting.")
-                    return
+                    # Telegram enforces single long-polling consumer. A competing poller
+                    # can appear briefly (restart/race), so back off and retry instead
+                    # of exiting into a silent-down state.
+                    conflict_count += 1
+                    backoff = min(30, 2 ** min(conflict_count, 5))
+                    log.warning(
+                        "getUpdates conflict (409) — another poller is active. Retrying in %ss (conflict #%d).",
+                        backoff,
+                        conflict_count,
+                    )
+                    time.sleep(backoff)
+                    continue
+                conflict_count = 0
                 log.warning("getUpdates failed: %s", resp.get("description", "unknown"))
                 time.sleep(5)
                 continue
 
+            conflict_count = 0
             updates = resp.get("result", [])
             for update in updates:
                 update_id = update.get("update_id", 0)
@@ -435,6 +446,7 @@ def poll_loop() -> None:
                     log.exception("Error handling update %s", update_id)
                 offset = update_id + 1
                 _save_offset(offset)
+        return 0
     finally:
         _release_pid_lock()
 
@@ -448,12 +460,13 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _signal_handler)
 
     log.info("Telegram direct bot starting (token=...%s)", BOT_TOKEN[-6:])
+    exit_code = 0
     try:
-        poll_loop()
+        exit_code = poll_loop()
     except KeyboardInterrupt:
-        pass
+        exit_code = 0
     log.info("Telegram bot stopped.")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

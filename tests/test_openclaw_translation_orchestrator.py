@@ -26,6 +26,7 @@ from scripts.openclaw_translation_orchestrator import (
     _llm_intent,
     _trim_xlsx_prompt_text,
     _validate_format_preserve_coverage,
+    _validate_glossary_enforcer,
     run,
 )
 
@@ -1474,8 +1475,62 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         ):
             out = _codex_generate(context, None, [], 1)
         self.assertTrue(out.get("ok"))
-        self.assertEqual((out.get("call_meta") or {}).get("provider"), "chatgpt-web")
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "gemini_web")
         mocked_gateway.assert_called_once()
+        mocked_agent_call.assert_not_called()
+        mocked_glm_call.assert_not_called()
+        mocked_kimi_call.assert_not_called()
+
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._glm_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    def test_codex_generate_strict_gateway_passes_section_format_contract(
+        self,
+        mocked_gateway,
+        mocked_agent_call,
+        mocked_glm_call,
+        mocked_kimi_call,
+    ):
+        mocked_gateway.return_value = {
+            "ok": True,
+            "text": json.dumps(
+                {
+                    "final_text": "§1§ One\n§2§ Two\n§3§ Three",
+                    "final_reflow_text": "§1§ One\n§2§ Two\n§3§ Three",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "ok",
+                }
+            ),
+            "source": "web_gateway",
+            "model": "chatgpt-web",
+        }
+        context = {
+            "job_id": "job_section_contract",
+            "task_intent": {"task_type": "LOW_CONTEXT_TASK"},
+            "subject": "Translate",
+            "message_text": "§1§ أول\n§2§ ثاني\n§3§ ثالث",
+            "candidate_files": [],
+        }
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
+        ):
+            out = _codex_generate(context, None, [], 1)
+        self.assertTrue(out.get("ok"))
+        mocked_gateway.assert_called_once()
+        kwargs = mocked_gateway.call_args.kwargs
+        contract = kwargs.get("format_contract")
+        self.assertIsInstance(contract, dict)
+        self.assertEqual(contract.get("mode"), "sectioned_text_ar_en_v1")
+        self.assertEqual(int(contract.get("expected_sections", 0)), 3)
+        self.assertEqual(kwargs.get("job_id"), "job_section_contract")
         mocked_agent_call.assert_not_called()
         mocked_glm_call.assert_not_called()
         mocked_kimi_call.assert_not_called()
@@ -1505,7 +1560,8 @@ class CodexGenerateFallbackTest(unittest.TestCase):
             out = _codex_generate(context, None, [], 1)
         self.assertFalse(out.get("ok"))
         self.assertEqual(out.get("error"), "gateway_timeout")
-        mocked_gateway.assert_called_once()
+        # Strict gateway mode tries primary then fallback web providers.
+        self.assertEqual(mocked_gateway.call_count, 2)
         mocked_agent_call.assert_not_called()
         mocked_glm_call.assert_not_called()
         mocked_kimi_call.assert_not_called()
@@ -1568,6 +1624,19 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         self.assertEqual(out.get("status"), "failed")
         self.assertIn("gateway_unavailable", [str(x) for x in (out.get("status_flags") or [])])
         self.assertIn("gateway_unavailable", [str(x) for x in (out.get("errors") or [])])
+
+    def test_validate_glossary_enforcer_section_mode_without_format_preserve(self):
+        context = {
+            "message_text": "§1§ الوزارة أطلقت المنصة",
+            "glossary_enforcer": {
+                "enabled": True,
+                "terms": [{"ar": "الوزارة", "en": "the ministry"}],
+            },
+        }
+        draft = {"final_text": "§1§ The platform was launched"}
+        findings, meta = _validate_glossary_enforcer(context, draft)
+        self.assertTrue(meta.get("enabled"))
+        self.assertTrue(any(str(x).startswith("glossary_enforcer_missing:section:1:") for x in findings))
 
 
 class AvailableSlotsTest(unittest.TestCase):
