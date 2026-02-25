@@ -229,6 +229,7 @@ OPENCLAW_TRANSLATION_THINKING = os.getenv("OPENCLAW_TRANSLATION_THINKING", "high
 if OPENCLAW_TRANSLATION_THINKING not in VALID_THINKING_LEVELS:
     OPENCLAW_TRANSLATION_THINKING = "high"
 INTENT_CLASSIFIER_MODE = os.getenv("OPENCLAW_INTENT_CLASSIFIER_MODE", "hybrid").strip().lower() or "hybrid"
+INTENT_WEB_MODES = {"web", "gateway", "web_gateway", "web-gateway", "chatgpt_web", "chatgpt-web"}
 OPENCLAW_AGENT_MESSAGE_MAX_BYTES = max(300000, int(os.getenv("OPENCLAW_AGENT_MESSAGE_MAX_BYTES", "1800000")))
 OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES = max(500000, int(os.getenv("OPENCLAW_PROVIDER_MESSAGE_LIMIT_BYTES", "2097152")))
 OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES = max(0, int(os.getenv("OPENCLAW_AGENT_MESSAGE_OVERHEAD_BYTES", "1300000")))
@@ -268,6 +269,10 @@ WEB_LLM_GENERATE_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_PRI
 WEB_LLM_GENERATE_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_FALLBACK", "")).strip()
 WEB_LLM_REVIEW_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_REVIEW_PRIMARY", "")).strip()
 WEB_LLM_REVIEW_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_REVIEW_FALLBACK", "")).strip()
+WEB_LLM_INTENT_PRIMARY_PROVIDER = str(
+    os.getenv("OPENCLAW_WEB_LLM_INTENT_PRIMARY", os.getenv("OPENCLAW_WEB_LLM_INTENT_PROVIDER", "chatgpt_web"))
+).strip() or "chatgpt_web"
+WEB_LLM_INTENT_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_INTENT_FALLBACK", "")).strip()
 WEB_LLM_SESSION_MODE = str(os.getenv("OPENCLAW_WEB_SESSION_MODE", "per_job")).strip().lower() or "per_job"
 
 def _web_provider_chain(purpose: str) -> list[str]:
@@ -290,6 +295,12 @@ def _web_provider_chain(purpose: str) -> list[str]:
             primary = WEB_LLM_REVIEW_PRIMARY_PROVIDER
         if WEB_LLM_REVIEW_FALLBACK_PROVIDER:
             fallback = WEB_LLM_REVIEW_FALLBACK_PROVIDER
+    elif purpose == "intent":
+        if WEB_LLM_INTENT_PRIMARY_PROVIDER:
+            primary = WEB_LLM_INTENT_PRIMARY_PROVIDER
+        else:
+            primary = "chatgpt_web"
+        fallback = WEB_LLM_INTENT_FALLBACK_PROVIDER
 
     chain: list[str] = []
     for raw in (primary, fallback):
@@ -2938,7 +2949,18 @@ Rules:
 - Infer source_language and target_language from the user message (e.g. "translate French to English" → source_language: "fr", target_language: "en").
 - task_label must always be a short human-readable description of the task, never empty.
 """.strip()
-    call = _agent_call(INTENT_AGENT, prompt)
+    call: dict[str, Any]
+    mode = str(INTENT_CLASSIFIER_MODE or "").strip().lower()
+    if mode in INTENT_WEB_MODES:
+        call = _intent_via_web_gateway(prompt)
+    else:
+        call = _agent_call(INTENT_AGENT, prompt)
+        # Hybrid mode: if agent intent routing fails, try web gateway before falling
+        # all the way back to local heuristics.
+        if not call.get("ok") and WEB_GATEWAY_ENABLED:
+            web_call = _intent_via_web_gateway(prompt)
+            if web_call.get("ok"):
+                call = web_call
     if not call.get("ok"):
         return _fallback_intent(
             meta,
@@ -2970,9 +2992,13 @@ Rules:
         if dynamic_eta > 0:
             estimated_minutes = max(estimated_minutes, dynamic_eta)
             complexity_score = max(complexity_score, min(100.0, 20.0 + dynamic_eta * 1.2))
+    canonical_required = _normalize_required_inputs(REQUIRED_INPUTS_BY_TASK.get(task_type, []))
+    canonical_allowed = set(canonical_required)
     required = _normalize_required_inputs(list(parsed.get("required_inputs") or []))
+    if required:
+        required = [item for item in required if item in canonical_allowed]
     if not required:
-        required = REQUIRED_INPUTS_BY_TASK.get(task_type, [])
+        required = canonical_required
 
     slots = _available_slots(
         candidates,
@@ -2997,6 +3023,31 @@ Rules:
         "complexity_score": complexity_score,
         "raw": parsed,
     }
+
+
+def _intent_via_web_gateway(prompt: str) -> dict[str, Any]:
+    if not WEB_GATEWAY_ENABLED:
+        return {"ok": False, "error": "gateway_unavailable", "detail": "gateway_disabled"}
+
+    providers = _web_provider_chain("intent")
+    if not providers:
+        providers = ["chatgpt_web"]
+
+    last_error = "intent_provider_chain_empty"
+    for provider in providers:
+        call = _web_gateway_chat_completion(
+            prompt,
+            provider=provider,
+            operation_id="intent_classification",
+            new_chat=(WEB_LLM_SESSION_MODE in {"per_request", "per-request", "new_chat", "new-chat"}),
+            strict_mode=False,
+        )
+        if call.get("ok"):
+            return call
+        err = str(call.get("error") or "gateway_unavailable")
+        detail = str(call.get("detail") or "")
+        last_error = f"{provider}:{err}:{detail}".strip(":")
+    return {"ok": False, "error": "intent_web_gateway_failed", "detail": last_error[:1200]}
 
 
 def _build_delta_pack(

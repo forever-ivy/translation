@@ -649,6 +649,60 @@ class SpreadsheetEtaHeuristicsTest(unittest.TestCase):
         self.assertEqual((result.get("intent") or {}).get("task_type"), "SPREADSHEET_TRANSLATION")
         self.assertGreaterEqual(int(result.get("estimated_minutes") or 0), 30)
 
+    @patch("scripts.openclaw_translation_orchestrator._web_provider_chain")
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_llm_intent_web_mode_uses_gateway_chatgpt(self, mocked_agent_call, mocked_gateway_call, mocked_chain):
+        mocked_chain.return_value = ["chatgpt_web"]
+        mocked_gateway_call.return_value = {
+            "ok": True,
+            "text": json.dumps(
+                {
+                    "task_type": "SPREADSHEET_TRANSLATION",
+                    "task_label": "Translate Arabic to English in test.xlsx with in-place replacement",
+                    "source_language": "ar",
+                    "target_language": "en",
+                    "required_inputs": ["source_document"],
+                    "missing_inputs": [],
+                    "confidence": 0.85,
+                    "reasoning_summary": "Spreadsheet translation",
+                    "estimated_minutes": 15,
+                    "complexity_score": 2.0,
+                },
+                ensure_ascii=False,
+            ),
+            "source": "web_gateway",
+        }
+        candidates = [{"path": "/tmp/test.xlsx", "name": "test.xlsx", "language": "ar"}]
+        with patch("scripts.openclaw_translation_orchestrator.INTENT_CLASSIFIER_MODE", "web"):
+            result = _llm_intent({"subject": "translate", "message_text": "translate arabic to english"}, candidates)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual((result.get("intent") or {}).get("task_type"), "SPREADSHEET_TRANSLATION")
+        mocked_agent_call.assert_not_called()
+        mocked_gateway_call.assert_called()
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_llm_intent_filters_noncanonical_required_inputs(self, mocked_agent_call):
+        mocked_agent_call.return_value = _agent_ok(
+            {
+                "task_type": "SPREADSHEET_TRANSLATION",
+                "task_label": "Translate Arabic to English in test.xlsx with in-place replacement",
+                "source_language": "ar",
+                "target_language": "en",
+                "required_inputs": ["source_document", "glossary"],
+                "missing_inputs": ["glossary"],
+                "confidence": 0.9,
+                "reasoning_summary": "Spreadsheet translation",
+                "estimated_minutes": 15,
+                "complexity_score": 2.0,
+            }
+        )
+        candidates = [{"path": "/tmp/test.xlsx", "name": "test.xlsx", "language": "ar"}]
+        result = _llm_intent({"subject": "translate", "message_text": "translate arabic to english"}, candidates)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual((result.get("intent") or {}).get("required_inputs"), ["source_document"])
+        self.assertEqual((result.get("intent") or {}).get("missing_inputs"), [])
+
 
 class GlossarySuffixCleanupTest(unittest.TestCase):
     def test_strips_redundant_tail_glossary_label_in_xlsx_cell(self):

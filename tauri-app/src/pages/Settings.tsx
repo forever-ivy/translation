@@ -77,6 +77,27 @@ const GATEWAY_ENV_FIELDS: EnvFieldDef[] = [
     placeholder: "chatgpt_web",
   },
   {
+    key: "OPENCLAW_INTENT_CLASSIFIER_MODE",
+    label: "Intent Classifier Mode",
+    type: "text",
+    placeholder: "web",
+    description: "Use 'web' to classify intent via Web Gateway instead of local agents.",
+  },
+  {
+    key: "OPENCLAW_WEB_LLM_INTENT_PRIMARY",
+    label: "Intent Primary Provider",
+    type: "text",
+    placeholder: "chatgpt_web",
+    description: "Provider used for intent classification when mode=web.",
+  },
+  {
+    key: "OPENCLAW_WEB_LLM_INTENT_FALLBACK",
+    label: "Intent Fallback Provider",
+    type: "text",
+    placeholder: "",
+    description: "Optional fallback provider for intent classification.",
+  },
+  {
     key: "OPENCLAW_WEB_LLM_GENERATE_PRIMARY",
     label: "Generate Primary Provider",
     type: "text",
