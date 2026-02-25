@@ -1501,7 +1501,7 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         ):
             out = _codex_generate(context, None, [], 1)
         self.assertTrue(out.get("ok"))
-        self.assertEqual((out.get("call_meta") or {}).get("provider"), "gemini_web")
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "deepseek_web")
         mocked_gateway.assert_called_once()
         mocked_agent_call.assert_not_called()
         mocked_glm_call.assert_not_called()
@@ -1632,10 +1632,10 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         with (
             patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
             patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
-            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "deepseek_web"),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_FALLBACK_PROVIDER", "chatgpt_web"),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_PRIMARY_PROVIDER", "chatgpt_web"),
-            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_FALLBACK_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_FALLBACK_PROVIDER", "deepseek_web"),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", ""),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_FALLBACK_PROVIDER", ""),
         ):
@@ -1667,7 +1667,7 @@ class CodexGenerateFallbackTest(unittest.TestCase):
                 ensure_ascii=False,
             ),
             "source": "web_gateway",
-            "model": "gemini-web",
+            "model": "deepseek-web",
         }
         context = {"job_id": "job_review_override", "task_intent": {"task_type": "LOW_CONTEXT_TASK"}}
         draft = {"final_text": "Draft", "final_reflow_text": "Draft", "docx_translation_map": [], "xlsx_translation_map": []}
@@ -1675,8 +1675,8 @@ class CodexGenerateFallbackTest(unittest.TestCase):
             patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
             patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "chatgpt_web"),
-            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_FALLBACK_PROVIDER", "gemini_web"),
-            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_FALLBACK_PROVIDER", "deepseek_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", "deepseek_web"),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_FALLBACK_PROVIDER", "chatgpt_web"),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_PRIMARY_PROVIDER", ""),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_FALLBACK_PROVIDER", ""),
@@ -1684,14 +1684,14 @@ class CodexGenerateFallbackTest(unittest.TestCase):
             out = _gemini_review(context, draft, 1)
         self.assertTrue(out.get("ok"))
         kwargs = mocked_gateway.call_args.kwargs
-        self.assertEqual(kwargs.get("provider"), "gemini_web")
-        self.assertEqual((out.get("call_meta") or {}).get("provider"), "gemini_web")
+        self.assertEqual(kwargs.get("provider"), "deepseek_web")
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "deepseek_web")
 
     @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
     def test_gemini_review_falls_back_when_schema_invalid(self, mocked_gateway):
         def _fake_gateway(_prompt: str, **kwargs):
             provider = kwargs.get("provider")
-            if provider == "gemini_web":
+            if provider == "deepseek_web":
                 # Wrong schema (looks like generator output, not review output).
                 return {
                     "ok": True,
@@ -1700,7 +1700,7 @@ class CodexGenerateFallbackTest(unittest.TestCase):
                         ensure_ascii=False,
                     ),
                     "source": "web_gateway",
-                    "model": "gemini-web",
+                    "model": "deepseek-web",
                 }
             return {
                 "ok": True,
@@ -1728,9 +1728,9 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         with (
             patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
             patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
-            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", "deepseek_web"),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_FALLBACK_PROVIDER", "chatgpt_web"),
-            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "deepseek_web"),
             patch("scripts.openclaw_translation_orchestrator.WEB_LLM_FALLBACK_PROVIDER", "chatgpt_web"),
         ):
             out = _gemini_review(context, draft, 1)

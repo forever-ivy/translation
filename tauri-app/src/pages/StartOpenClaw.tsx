@@ -20,7 +20,7 @@ const phaseLabel: Record<string, string> = {
 };
 
 const providerLabel: Record<string, string> = {
-  gemini_web: "Gemini Web",
+  deepseek_web: "DeepSeek Web",
   chatgpt_web: "ChatGPT Web",
 };
 

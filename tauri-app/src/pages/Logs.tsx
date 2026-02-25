@@ -294,7 +294,7 @@ export function Logs() {
               animate="show"
             >
               {[
-                { title: "Gateway login required", desc: "Go to Runtime and complete provider Login (Gemini / ChatGPT)." },
+                { title: "Gateway login required", desc: "Go to Runtime and complete provider Login (DeepSeek / ChatGPT)." },
                 { title: "RAG backend not available", desc: "Go to KB Health and run Sync Now to see error summary." },
                 { title: "Telegram 409 conflict", desc: "Go to Runtime -> Telegram Diagnostics and restart Telegram." },
               ].map((item, i) => (

@@ -329,7 +329,7 @@ gateway_login() {
     log_info "Checking web gateway login state..."
     # Prefer interactive login for the providers actually used by the pipeline.
     # When per-phase overrides are set, we log in those primaries (generate/review).
-    local provider_primary="${OPENCLAW_WEB_LLM_PRIMARY:-gemini_web}"
+    local provider_primary="${OPENCLAW_WEB_LLM_PRIMARY:-deepseek_web}"
     local provider_generate="${OPENCLAW_WEB_LLM_GENERATE_PRIMARY:-}"
     local provider_review="${OPENCLAW_WEB_LLM_REVIEW_PRIMARY:-}"
     local timeout="${OPENCLAW_WEB_GATEWAY_LOGIN_TIMEOUT_SECONDS:-60}"

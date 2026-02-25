@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Allow Web Gateway provider selection to differ between generation (translation) and review (verification), e.g. generate via ChatGPT web and review via Gemini web.
+**Goal:** Allow Web Gateway provider selection to differ between generation (translation) and review (verification), e.g. generate via ChatGPT web and review via DeepSeek web.
 
 **Architecture:** Add optional per-phase env overrides and a small helper to compute provider chains. Use the chain in `_codex_generate` and `_gemini_review`. Align pipeline preflight and Tauri Settings to expose the new env keys.
 
@@ -21,12 +21,12 @@
 Add a unit test that patches the new module vars to:
 
 - generate primary = `chatgpt_web`
-- review primary = `gemini_web`
+- review primary = `deepseek_web`
 
 Mock `_web_gateway_chat_completion` and assert:
 
 - `_codex_generate(...)` calls gateway with `provider="chatgpt_web"` first
-- `_gemini_review(...)` calls gateway with `provider="gemini_web"` first
+- `_gemini_review(...)` calls gateway with `provider="deepseek_web"` first
 
 Run: `python -m unittest tests.test_openclaw_translation_orchestrator -v`
 Expected: FAIL (env vars/helper not implemented).
@@ -138,4 +138,3 @@ Run:
 - `python -m unittest discover -s tests -p 'test_*.py'`
 - `pnpm -C tauri-app run typecheck`
 - `pnpm -C tauri-app test`
-

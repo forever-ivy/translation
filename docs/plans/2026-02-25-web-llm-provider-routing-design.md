@@ -1,4 +1,4 @@
-# Web LLM Provider Routing (ChatGPT Generate, Gemini Review) Design
+# Web LLM Provider Routing (ChatGPT Generate, DeepSeek Review) Design
 
 **Date:** 2026-02-25
 
@@ -7,7 +7,7 @@
 When `OPENCLAW_WEB_GATEWAY_ENABLED=1`, select Web Gateway providers per phase:
 
 - Generation/translation uses ChatGPT web (`chatgpt_web`) as primary.
-- Verification/review uses Gemini web (`gemini_web`) as primary.
+- Verification/review uses DeepSeek web (`deepseek_web`) as primary.
 
 Must remain backward compatible with the existing globals:
 
@@ -24,7 +24,7 @@ Must remain backward compatible with the existing globals:
 
 Existing globals (current behavior):
 
-- `OPENCLAW_WEB_LLM_PRIMARY` (default: `gemini_web`)
+- `OPENCLAW_WEB_LLM_PRIMARY` (default: `deepseek_web`)
 - `OPENCLAW_WEB_LLM_FALLBACK` (default: `chatgpt_web`)
 
 New optional per-phase overrides (empty => fallback to globals):
@@ -38,8 +38,8 @@ Example configuration to match the requested behavior:
 
 ```env
 OPENCLAW_WEB_LLM_GENERATE_PRIMARY=chatgpt_web
-OPENCLAW_WEB_LLM_GENERATE_FALLBACK=gemini_web
-OPENCLAW_WEB_LLM_REVIEW_PRIMARY=gemini_web
+OPENCLAW_WEB_LLM_GENERATE_FALLBACK=deepseek_web
+OPENCLAW_WEB_LLM_REVIEW_PRIMARY=deepseek_web
 OPENCLAW_WEB_LLM_REVIEW_FALLBACK=chatgpt_web
 ```
 

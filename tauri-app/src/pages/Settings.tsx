@@ -68,7 +68,7 @@ const GATEWAY_ENV_FIELDS: EnvFieldDef[] = [
     key: "OPENCLAW_WEB_LLM_PRIMARY",
     label: "Primary Provider",
     type: "text",
-    placeholder: "gemini_web",
+    placeholder: "deepseek_web",
   },
   {
     key: "OPENCLAW_WEB_LLM_FALLBACK",
@@ -87,14 +87,14 @@ const GATEWAY_ENV_FIELDS: EnvFieldDef[] = [
     key: "OPENCLAW_WEB_LLM_GENERATE_FALLBACK",
     label: "Generate Fallback Provider",
     type: "text",
-    placeholder: "gemini_web",
+    placeholder: "deepseek_web",
     description: "Optional fallback override for translation/generation calls.",
   },
   {
     key: "OPENCLAW_WEB_LLM_REVIEW_PRIMARY",
     label: "Review Primary Provider",
     type: "text",
-    placeholder: "gemini_web",
+    placeholder: "deepseek_web",
     description: "Optional override for verification/review calls.",
   },
   {
@@ -108,7 +108,7 @@ const GATEWAY_ENV_FIELDS: EnvFieldDef[] = [
     key: "OPENCLAW_WEB_SESSION_MODE",
     label: "Session Mode",
     type: "text",
-    placeholder: "persistent",
+    placeholder: "per_job",
   },
 ];
 

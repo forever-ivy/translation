@@ -103,7 +103,7 @@ def _gateway_status(args: argparse.Namespace) -> dict[str, Any]:
     health: dict[str, Any] = {}
     healthy = False
     providers: dict[str, Any] = {}
-    primary_provider = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+    primary_provider = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "deepseek_web")).strip() or "deepseek_web"
     primary_last_error = ""
     primary_logged_in = False
     if pid:

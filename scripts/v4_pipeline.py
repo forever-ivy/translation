@@ -448,8 +448,8 @@ def run_job_pipeline(
 
     update_job_status(conn, job_id=job_id, status="preflight", errors=[])
 
-    # Web Gateway preflight (Gemini/ChatGPT web session readiness).
-    gateway_enabled = str(os.getenv("OPENCLAW_WEB_GATEWAY_ENABLED", "1")).strip().lower() not in {"0", "false", "off", "no", ""}
+    # Web Gateway preflight (web session readiness).
+    gateway_enabled = str(os.getenv("OPENCLAW_WEB_GATEWAY_ENABLED", "0")).strip().lower() not in {"0", "false", "off", "no", ""}
     gateway_preflight_enabled = str(os.getenv("OPENCLAW_WEB_GATEWAY_PREFLIGHT", "1")).strip().lower() not in {"0", "false", "off", "no", ""}
     if gateway_enabled and gateway_preflight_enabled:
         import urllib.error
@@ -457,7 +457,7 @@ def run_job_pipeline(
 
         base_url = str(os.getenv("OPENCLAW_WEB_GATEWAY_BASE_URL", "http://127.0.0.1:8765")).strip().rstrip("/")
 
-        global_primary = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+        global_primary = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "deepseek_web")).strip() or "deepseek_web"
         global_fallback = str(os.getenv("OPENCLAW_WEB_LLM_FALLBACK", "chatgpt_web")).strip() or "chatgpt_web"
         gen_primary = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_PRIMARY", "")).strip()
         gen_fallback = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_FALLBACK", "")).strip()

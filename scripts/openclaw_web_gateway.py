@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """OpenClaw Web LLM Gateway (Playwright-driven, OpenAI-compatible surface).
 
-This service drives real web UIs (Gemini/ChatGPT) and exposes a small HTTP API:
+This service drives real web UIs (DeepSeek/ChatGPT) and exposes a small HTTP API:
 - GET /health
 - GET /session
 - GET /session/diagnose?provider=...
@@ -33,10 +33,10 @@ import uvicorn
 
 from scripts.gateway_format_contract import apply_format_contract, build_format_repair_prompt
 
-PROVIDER_GEMINI_WEB = "gemini_web"
+PROVIDER_DEEPSEEK_WEB = "deepseek_web"
 PROVIDER_CHATGPT_WEB = "chatgpt_web"
 
-GEMINI_HOME_URL = "https://gemini.google.com/app"
+DEEPSEEK_HOME_URL = "https://chat.deepseek.com/"
 CHATGPT_HOME_URL = "https://chatgpt.com/"
 
 CHATGPT_PROMPT_SELECTORS = [
@@ -62,34 +62,39 @@ CHATGPT_ASSISTANT_SELECTORS = [
     "main article",
 ]
 
-GEMINI_PROMPT_SELECTORS = [
-    "div[contenteditable='true'][aria-label*='Enter a prompt']",
-    "div[contenteditable='true'][aria-label*='enter a prompt']",
-    "div[contenteditable='true'][aria-label*='Message']",
-    "div[contenteditable='true'][aria-label*='message']",
-    "textarea[aria-label*='prompt']",
+DEEPSEEK_PROMPT_SELECTORS = [
+    # Try specific placeholders first, then fall back to generic textarea/contenteditable.
+    "textarea[placeholder*='Message']",
+    "textarea[placeholder*='message']",
+    "textarea[placeholder*='Send']",
+    "textarea[placeholder*='send']",
+    "textarea[placeholder*='Ask']",
+    "textarea[placeholder*='ask']",
+    "textarea[placeholder*='输入']",
+    "textarea[placeholder*='发送']",
     "textarea",
+    "[contenteditable='true'][role='textbox']",
     "div[contenteditable='true']",
 ]
-GEMINI_SEND_SELECTORS = [
+DEEPSEEK_SEND_SELECTORS = [
+    "button[type='submit']",
     "button[aria-label*='Send']",
     "button[aria-label*='send']",
-    "button[type='submit']",
+    "button:has-text('Send')",
+    "button:has-text('发送')",
 ]
-GEMINI_LOADING_SELECTORS = [
+DEEPSEEK_LOADING_SELECTORS = [
     "button[aria-label*='Stop']",
     "button[aria-label*='stop']",
-    "button[aria-label*='Cancel']",
-    "button[aria-label*='cancel']",
-    "mat-spinner",
+    "button:has-text('Stop')",
+    "button:has-text('停止')",
     "div[class*='typing']",
 ]
-GEMINI_ASSISTANT_SELECTORS = [
-    "[data-test-id*='response']",
-    "[data-testid*='response']",
-    "[class*='model-response']",
-    "[class*='response-content']",
-    "main [class*='response']",
+DEEPSEEK_ASSISTANT_SELECTORS = [
+    "[data-message-author-role='assistant']",
+    "[class*='assistant']",
+    "main [class*='message']",
+    "main article",
 ]
 
 
@@ -802,7 +807,7 @@ class PlaywrightWebProvider:
         elapsed_ms = int((time.time() - started_at) * 1000)
         gateway_meta = {
             "provider": self.state.provider,
-            "site": ("gemini" if self.state.provider == PROVIDER_GEMINI_WEB else "chatgpt"),
+            "site": ("deepseek" if self.state.provider == PROVIDER_DEEPSEEK_WEB else "chatgpt"),
             "session_state": {"logged_in": bool(self.state.logged_in), "healthy": bool(self.state.healthy)},
             "extract_method": extract_method,
             "marker_validation": marker_validation,
@@ -866,8 +871,8 @@ def _infer_provider(request_payload: dict[str, Any], *, default_provider: str) -
     if raw_provider:
         return raw_provider
     model = str(request_payload.get("model") or "").strip().lower()
-    if "gemini" in model:
-        return PROVIDER_GEMINI_WEB
+    if "deepseek" in model:
+        return PROVIDER_DEEPSEEK_WEB
     if "chatgpt" in model or "gpt" in model:
         return PROVIDER_CHATGPT_WEB
     return default_provider
@@ -883,7 +888,7 @@ class MultiWebGateway:
         self.persist()
 
     def _primary_provider(self) -> str:
-        return str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", PROVIDER_GEMINI_WEB)).strip() or PROVIDER_GEMINI_WEB
+        return str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", PROVIDER_DEEPSEEK_WEB)).strip() or PROVIDER_DEEPSEEK_WEB
 
     def health(self) -> dict[str, Any]:
         providers = {k: v.state.to_dict() for k, v in self.providers.items()}
@@ -998,7 +1003,7 @@ def build_app(gateway: MultiWebGateway) -> FastAPI:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="OpenClaw Web LLM Gateway (Gemini/ChatGPT)")
+    parser = argparse.ArgumentParser(description="OpenClaw Web LLM Gateway (DeepSeek/ChatGPT)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--base-url", default=os.getenv("OPENCLAW_WEB_GATEWAY_BASE_URL", "http://127.0.0.1:8765"))
@@ -1023,7 +1028,7 @@ def _default_browser_channel() -> str:
     override = str(os.getenv("OPENCLAW_WEB_GATEWAY_BROWSER_CHANNEL", "")).strip()
     if override:
         return override
-    # Google login is stricter in Playwright-managed Chromium; on macOS we can
+    # Some sites are stricter in Playwright-managed Chromium; on macOS we can
     # often improve compatibility by using the system Chrome channel.
     try:
         if sys.platform == "darwin" and Path("/Applications/Google Chrome.app").exists():
@@ -1048,19 +1053,19 @@ def main() -> int:
     profiles_dir.mkdir(parents=True, exist_ok=True)
 
     providers: dict[str, PlaywrightWebProvider] = {
-        PROVIDER_GEMINI_WEB: PlaywrightWebProvider(
-            provider=PROVIDER_GEMINI_WEB,
+        PROVIDER_DEEPSEEK_WEB: PlaywrightWebProvider(
+            provider=PROVIDER_DEEPSEEK_WEB,
             model=model,
             base_url=base_url,
-            home_url=GEMINI_HOME_URL,
-            profile_dir=profiles_dir / PROVIDER_GEMINI_WEB,
+            home_url=DEEPSEEK_HOME_URL,
+            profile_dir=profiles_dir / PROVIDER_DEEPSEEK_WEB,
             headless=headless,
             browser_channel=browser_channel,
-            prompt_selectors=GEMINI_PROMPT_SELECTORS,
-            send_selectors=GEMINI_SEND_SELECTORS,
-            loading_selectors=GEMINI_LOADING_SELECTORS,
-            assistant_selectors=GEMINI_ASSISTANT_SELECTORS,
-            login_url_tokens=["accounts.google.com", "servicelogin", "/signin"],
+            prompt_selectors=DEEPSEEK_PROMPT_SELECTORS,
+            send_selectors=DEEPSEEK_SEND_SELECTORS,
+            loading_selectors=DEEPSEEK_LOADING_SELECTORS,
+            assistant_selectors=DEEPSEEK_ASSISTANT_SELECTORS,
+            login_url_tokens=["/login", "login", "/signin", "signin", "auth", "oauth"],
         ),
         PROVIDER_CHATGPT_WEB: PlaywrightWebProvider(
             provider=PROVIDER_CHATGPT_WEB,

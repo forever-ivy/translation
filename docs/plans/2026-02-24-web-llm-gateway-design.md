@@ -1,4 +1,4 @@
-# Web LLM Gateway (Gemini Primary, ChatGPT Fallback) - Design
+# Web LLM Gateway (DeepSeek Primary, ChatGPT Fallback) - Design
 
 Date: 2026-02-24
 
@@ -6,7 +6,7 @@ Date: 2026-02-24
 
 The existing translation pipeline could block or fail without clear evidence when the model runtime/CLI was unavailable (e.g., quota errors, unsupported subcommands). This refactor moves the primary translation/review execution to a Playwright-driven, observable "Web LLM Gateway" that drives real web UIs:
 
-- Primary: Gemini web (generator + reviewer)
+- Primary: DeepSeek web (generator + reviewer)
 - Fallback: ChatGPT web (generator + reviewer)
 
 The Python pipeline remains the source of truth for:
@@ -17,7 +17,7 @@ The Python pipeline remains the source of truth for:
 
 ## Goals
 
-- Web UI driving is the default for generation and review (Gemini primary, ChatGPT fallback).
+- Web UI driving is the default for generation and review (DeepSeek primary, ChatGPT fallback).
 - Support DOCX + XLSX preserve translation outputs.
 - Up to 3 rounds, early stop on pass.
 - Each round: one generation + one automatic review. No in-round regeneration loops.
@@ -35,7 +35,7 @@ The Python pipeline remains the source of truth for:
 ### Components
 
 1. Web LLM Gateway (FastAPI + Playwright)
-   - One process managing multiple providers (`gemini_web`, `chatgpt_web`)
+   - One process managing multiple providers (`deepseek_web`, `chatgpt_web`)
    - One provider call at a time per provider (internal lock)
    - Persistent profile directories per provider for cookies/sessions
 
@@ -59,8 +59,8 @@ The Python pipeline remains the source of truth for:
    - If not ready: job -> `needs_attention` with `gateway_login_required:<provider>`
 4. Orchestrator:
    - Round 1..3:
-     - Generate (Gemini web; fallback ChatGPT web)
-     - Review (Gemini web; fallback ChatGPT web)
+     - Generate (DeepSeek web; fallback ChatGPT web)
+     - Review (DeepSeek web; fallback ChatGPT web)
      - On pass: stop early
      - On fail: feed findings + retry hints into next round
 5. Artifact writer:
@@ -73,7 +73,7 @@ The Python pipeline remains the source of truth for:
 ## Web LLM Gateway API
 
 - `GET /health`
-  - Returns `{ ok, providers: { gemini_web: {...}, chatgpt_web: {...} }, primary_provider, version }`
+  - Returns `{ ok, providers: { deepseek_web: {...}, chatgpt_web: {...} }, primary_provider, version }`
 
 - `POST /session/login`
   - `{ provider, interactive, timeout_seconds }`
@@ -102,7 +102,7 @@ Location:
 
 ## Config
 
-- `OPENCLAW_WEB_LLM_PRIMARY=gemini_web`
+- `OPENCLAW_WEB_LLM_PRIMARY=deepseek_web`
 - `OPENCLAW_WEB_LLM_FALLBACK=chatgpt_web`
 - `OPENCLAW_WEB_SESSION_MODE=per_request`
 - `OPENCLAW_WEB_GATEWAY_BASE_URL=http://127.0.0.1:8765`
@@ -118,4 +118,3 @@ Location:
   - Start gateway
   - Perform interactive login in Tauri per provider
   - Run XLSX/DOCX jobs and verify traces under `_VERIFY/.../.system/web_calls/...`
-

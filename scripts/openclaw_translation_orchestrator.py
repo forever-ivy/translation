@@ -257,12 +257,12 @@ KIMI_CODING_API_BASE_URL = os.getenv(
     "OPENCLAW_KIMI_CODING_BASE_URL",
     os.getenv("ANTHROPIC_BASE_URL", "https://api.kimi.com/coding/v1"),
 )
-WEB_GATEWAY_ENABLED = _env_flag("OPENCLAW_WEB_GATEWAY_ENABLED", "1")
+WEB_GATEWAY_ENABLED = _env_flag("OPENCLAW_WEB_GATEWAY_ENABLED", "0")
 WEB_GATEWAY_STRICT = _env_flag("OPENCLAW_WEB_GATEWAY_STRICT", "0")
 WEB_GATEWAY_BASE_URL = str(os.getenv("OPENCLAW_WEB_GATEWAY_BASE_URL", "http://127.0.0.1:8765")).strip()
 WEB_GATEWAY_MODEL = str(os.getenv("OPENCLAW_WEB_GATEWAY_MODEL", "chatgpt-web")).strip() or "chatgpt-web"
 WEB_GATEWAY_TIMEOUT_SECONDS = max(10, int(os.getenv("OPENCLAW_WEB_GATEWAY_TIMEOUT_SECONDS", "180")))
-WEB_LLM_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+WEB_LLM_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "deepseek_web")).strip() or "deepseek_web"
 WEB_LLM_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_FALLBACK", "chatgpt_web")).strip() or "chatgpt_web"
 WEB_LLM_GENERATE_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_PRIMARY", "")).strip()
 WEB_LLM_GENERATE_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_FALLBACK", "")).strip()
