@@ -327,11 +327,34 @@ gateway_status() {
 
 gateway_login() {
     log_info "Checking web gateway login state..."
-    # Prefer interactive login for the primary provider so this command actually
-    # resolves "needs_attention: gateway_login_required:*" jobs.
-    local provider="${OPENCLAW_WEB_LLM_PRIMARY:-gemini_web}"
+    # Prefer interactive login for the providers actually used by the pipeline.
+    # When per-phase overrides are set, we log in those primaries (generate/review).
+    local provider_primary="${OPENCLAW_WEB_LLM_PRIMARY:-gemini_web}"
+    local provider_generate="${OPENCLAW_WEB_LLM_GENERATE_PRIMARY:-}"
+    local provider_review="${OPENCLAW_WEB_LLM_REVIEW_PRIMARY:-}"
     local timeout="${OPENCLAW_WEB_GATEWAY_LOGIN_TIMEOUT_SECONDS:-60}"
-    gateway_dispatch "gateway-login" --provider "$provider" --interactive-login --timeout-seconds "$timeout"
+
+    local providers=()
+    if [[ -n "$provider_generate" ]]; then
+        providers+=("$provider_generate")
+    else
+        providers+=("$provider_primary")
+    fi
+    if [[ -n "$provider_review" ]]; then
+        providers+=("$provider_review")
+    else
+        providers+=("$provider_primary")
+    fi
+
+    local seen=""
+    for p in "${providers[@]}"; do
+        [[ -z "$p" ]] && continue
+        if [[ " $seen " == *" $p "* ]]; then
+            continue
+        fi
+        seen="$seen $p"
+        gateway_dispatch "gateway-login" --provider "$p" --interactive-login --timeout-seconds "$timeout"
+    done
 }
 
 gateway_diagnose() {

@@ -21,10 +21,12 @@ from scripts.openclaw_translation_orchestrator import (
     _cap_xlsx_prompt_rows,
     _collect_translated_xlsx_keys,
     _codex_generate,
+    _gemini_review,
     _estimate_spreadsheet_minutes_from_candidates,
     _infer_language_pair_from_context,
     _llm_intent,
     _trim_xlsx_prompt_text,
+    _xlsx_backfill_plan,
     _validate_format_preserve_coverage,
     _validate_glossary_enforcer,
     run,
@@ -941,6 +943,30 @@ class PromptCompactionHelpersTest(unittest.TestCase):
         self.assertEqual((meta.get("docx_missing_sample") or [])[0].get("file"), "two.docx")
 
 
+class XlsxBackfillPlanTest(unittest.TestCase):
+    def test_xlsx_backfill_plan_requeues_and_drops_by_attempt_cap(self):
+        rows = [
+            {"file": "a.xlsx", "sheet": "S1", "cell": "A1", "text": "one"},
+            {"file": "a.xlsx", "sheet": "S1", "cell": "A2", "text": "two"},
+            {"file": "a.xlsx", "sheet": "S1", "cell": "A3", "text": "three"},
+        ]
+        missing = [("a.xlsx", "S1", "A2"), ("a.xlsx", "S1", "A3")]
+        attempts = {("a.xlsx", "S1", "A3"): 2}
+        requeue, dropped, next_attempts = _xlsx_backfill_plan(
+            rows,
+            missing=missing,
+            attempts=attempts,
+            max_attempts=2,
+            label_prefix="1-",
+        )
+        self.assertEqual(len(requeue), 1)
+        self.assertEqual(requeue[0]["rows"][0]["cell"], "A2")
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["cell"], "A3")
+        self.assertEqual(next_attempts[("a.xlsx", "S1", "A2")], 1)
+        self.assertEqual(next_attempts[("a.xlsx", "S1", "A3")], 3)
+
+
 class CodexGenerateFallbackTest(unittest.TestCase):
     @patch("scripts.openclaw_translation_orchestrator._agent_call")
     def test_codex_generate_spreadsheet_batches_and_merges(self, mocked_agent_call):
@@ -1565,6 +1591,152 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         mocked_agent_call.assert_not_called()
         mocked_glm_call.assert_not_called()
         mocked_kimi_call.assert_not_called()
+
+    @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._glm_direct_api_call")
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    def test_codex_generate_uses_generate_provider_override(
+        self,
+        mocked_gateway,
+        mocked_agent_call,
+        mocked_glm_call,
+        mocked_kimi_call,
+    ):
+        mocked_gateway.return_value = {
+            "ok": True,
+            "text": json.dumps(
+                {
+                    "final_text": "Gateway output",
+                    "final_reflow_text": "Gateway output",
+                    "docx_translation_map": [],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "ok",
+                },
+                ensure_ascii=False,
+            ),
+            "source": "web_gateway",
+            "model": "chatgpt-web",
+        }
+        context = {
+            "task_intent": {"task_type": "LOW_CONTEXT_TASK"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+        }
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_FALLBACK_PROVIDER", "chatgpt_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_PRIMARY_PROVIDER", "chatgpt_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_FALLBACK_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", ""),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_FALLBACK_PROVIDER", ""),
+        ):
+            out = _codex_generate(context, None, [], 1)
+        self.assertTrue(out.get("ok"))
+        kwargs = mocked_gateway.call_args.kwargs
+        self.assertEqual(kwargs.get("provider"), "chatgpt_web")
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "chatgpt_web")
+        mocked_agent_call.assert_not_called()
+        mocked_glm_call.assert_not_called()
+        mocked_kimi_call.assert_not_called()
+
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    def test_gemini_review_uses_review_provider_override(self, mocked_gateway):
+        mocked_gateway.return_value = {
+            "ok": True,
+            "text": json.dumps(
+                {
+                    "findings": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "pass": True,
+                    "terminology_rate": 0.95,
+                    "structure_complete_rate": 0.95,
+                    "target_language_purity": 0.95,
+                    "numbering_consistency": 0.95,
+                    "reasoning_summary": "ok",
+                },
+                ensure_ascii=False,
+            ),
+            "source": "web_gateway",
+            "model": "gemini-web",
+        }
+        context = {"job_id": "job_review_override", "task_intent": {"task_type": "LOW_CONTEXT_TASK"}}
+        draft = {"final_text": "Draft", "final_reflow_text": "Draft", "docx_translation_map": [], "xlsx_translation_map": []}
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "chatgpt_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_FALLBACK_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_FALLBACK_PROVIDER", "chatgpt_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_PRIMARY_PROVIDER", ""),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_GENERATE_FALLBACK_PROVIDER", ""),
+        ):
+            out = _gemini_review(context, draft, 1)
+        self.assertTrue(out.get("ok"))
+        kwargs = mocked_gateway.call_args.kwargs
+        self.assertEqual(kwargs.get("provider"), "gemini_web")
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "gemini_web")
+
+    @patch("scripts.openclaw_translation_orchestrator._web_gateway_chat_completion")
+    def test_gemini_review_falls_back_when_schema_invalid(self, mocked_gateway):
+        def _fake_gateway(_prompt: str, **kwargs):
+            provider = kwargs.get("provider")
+            if provider == "gemini_web":
+                # Wrong schema (looks like generator output, not review output).
+                return {
+                    "ok": True,
+                    "text": json.dumps(
+                        {"job_id": "job123", "status": "ok", "translated_content": "hello"},
+                        ensure_ascii=False,
+                    ),
+                    "source": "web_gateway",
+                    "model": "gemini-web",
+                }
+            return {
+                "ok": True,
+                "text": json.dumps(
+                    {
+                        "findings": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "pass": True,
+                        "terminology_rate": 0.95,
+                        "structure_complete_rate": 0.95,
+                        "target_language_purity": 0.95,
+                        "numbering_consistency": 0.95,
+                        "reasoning_summary": "ok",
+                    },
+                    ensure_ascii=False,
+                ),
+                "source": "web_gateway",
+                "model": "chatgpt-web",
+            }
+
+        mocked_gateway.side_effect = _fake_gateway
+        context = {"job_id": "job_review_schema_fallback", "task_intent": {"task_type": "LOW_CONTEXT_TASK"}}
+        draft = {"final_text": "Draft", "final_reflow_text": "Draft", "docx_translation_map": [], "xlsx_translation_map": []}
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_STRICT", True),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_REVIEW_FALLBACK_PROVIDER", "chatgpt_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_PRIMARY_PROVIDER", "gemini_web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_LLM_FALLBACK_PROVIDER", "chatgpt_web"),
+        ):
+            out = _gemini_review(context, draft, 1)
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(mocked_gateway.call_count, 2)
+        self.assertEqual((out.get("call_meta") or {}).get("provider"), "chatgpt_web")
 
     @patch("scripts.openclaw_translation_orchestrator.write_artifacts")
     @patch("scripts.openclaw_translation_orchestrator._build_execution_context")

@@ -264,7 +264,44 @@ WEB_GATEWAY_MODEL = str(os.getenv("OPENCLAW_WEB_GATEWAY_MODEL", "chatgpt-web")).
 WEB_GATEWAY_TIMEOUT_SECONDS = max(10, int(os.getenv("OPENCLAW_WEB_GATEWAY_TIMEOUT_SECONDS", "180")))
 WEB_LLM_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
 WEB_LLM_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_FALLBACK", "chatgpt_web")).strip() or "chatgpt_web"
-WEB_LLM_SESSION_MODE = str(os.getenv("OPENCLAW_WEB_SESSION_MODE", "per_request")).strip().lower() or "per_request"
+WEB_LLM_GENERATE_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_PRIMARY", "")).strip()
+WEB_LLM_GENERATE_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_FALLBACK", "")).strip()
+WEB_LLM_REVIEW_PRIMARY_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_REVIEW_PRIMARY", "")).strip()
+WEB_LLM_REVIEW_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_REVIEW_FALLBACK", "")).strip()
+WEB_LLM_SESSION_MODE = str(os.getenv("OPENCLAW_WEB_SESSION_MODE", "per_job")).strip().lower() or "per_job"
+
+def _web_provider_chain(purpose: str) -> list[str]:
+    """Return providers to try (primary->fallback), optionally overridden per phase.
+
+    Backward compatible: when per-phase env vars are unset, fall back to the global
+    OPENCLAW_WEB_LLM_PRIMARY/FALLBACK pair.
+    """
+
+    primary = WEB_LLM_PRIMARY_PROVIDER
+    fallback = WEB_LLM_FALLBACK_PROVIDER
+
+    if purpose == "generate":
+        if WEB_LLM_GENERATE_PRIMARY_PROVIDER:
+            primary = WEB_LLM_GENERATE_PRIMARY_PROVIDER
+        if WEB_LLM_GENERATE_FALLBACK_PROVIDER:
+            fallback = WEB_LLM_GENERATE_FALLBACK_PROVIDER
+    elif purpose == "review":
+        if WEB_LLM_REVIEW_PRIMARY_PROVIDER:
+            primary = WEB_LLM_REVIEW_PRIMARY_PROVIDER
+        if WEB_LLM_REVIEW_FALLBACK_PROVIDER:
+            fallback = WEB_LLM_REVIEW_FALLBACK_PROVIDER
+
+    chain: list[str] = []
+    for raw in (primary, fallback):
+        provider = str(raw or "").strip()
+        if not provider:
+            continue
+        if provider.lower() in {"none", "disabled", "off"}:
+            continue
+        if provider in chain:
+            continue
+        chain.append(provider)
+    return chain
 
 
 def _glm_enabled() -> bool:
@@ -2029,6 +2066,65 @@ def _filter_xlsx_map_for_keys(entries: Any, keys: set[tuple[str, str, str]]) -> 
     return out
 
 
+def _xlsx_backfill_plan(
+    rows: list[dict[str, Any]],
+    *,
+    missing: list[tuple[str, str, str]],
+    attempts: dict[tuple[str, str, str], int],
+    max_attempts: int,
+    label_prefix: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[str, str, str], int]]:
+    """Plan backfill chunks for missing XLSX cells.
+
+    Returns:
+      - requeue: chunk_queue items (each contains exactly one row)
+      - dropped: cells that exceeded max_attempts
+      - attempts_next: updated attempts map
+    """
+    missing_set = set(missing or [])
+    attempts_next: dict[tuple[str, str, str], int] = dict(attempts or {})
+    requeue_rows: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    max_attempts_norm = max(1, int(max_attempts or 1))
+    prefix = str(label_prefix or "backfill-")
+
+    if not rows or not missing_set:
+        return [], [], attempts_next
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        file_name = str(row.get("file") or "").strip()
+        sheet = str(row.get("sheet") or "").strip()
+        cell = str(row.get("cell") or "").strip().upper()
+        if not (file_name and sheet and cell):
+            continue
+        key = _normalize_xlsx_key(file_name, sheet, cell)
+        if key not in missing_set:
+            continue
+        attempts_next[key] = int(attempts_next.get(key, 0) or 0) + 1
+        if int(attempts_next[key]) > max_attempts_norm:
+            preview = str(row.get("text") or "")
+            if len(preview) > 160:
+                preview = preview[:160] + "..."
+            dropped.append(
+                {
+                    "file": file_name,
+                    "sheet": sheet,
+                    "cell": cell,
+                    "attempts": int(attempts_next[key]),
+                    "text_preview": preview,
+                }
+            )
+            continue
+        requeue_rows.append(row)
+
+    requeue: list[dict[str, Any]] = []
+    for idx, row in enumerate(requeue_rows, start=1):
+        requeue.append({"label": f"{prefix}bf{idx}", "rows": [row]})
+    return requeue, dropped, attempts_next
+
+
 LANGUAGE_ALIASES: dict[str, str] = {
     "ar": "ar",
     "arabic": "ar",
@@ -3035,8 +3131,15 @@ PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
 - You MUST return docx_translation_map for every provided unit in the batch.
 - Each docx_translation_map item MUST include file + id + text.
 - DOCX batch hint: {docx_batch_hint}
-"""
+                """
             )
+
+        # Non-batch mode can accept partial completion (translate fewer cells) when the
+        # overall payload is too large. In XLSX batch mode, however, we must translate
+        # every cell in the batch; missing cells are handled by the batch/backfill logic.
+        xlsx_overflow_rule = "- If you cannot fit all cells completely, translate FEWER cells but translate each one FULLY."
+        if xlsx_batch_mode:
+            xlsx_overflow_rule = "- XLSX BATCH MODE: You MUST translate ALL cells in the batch. Do NOT translate fewer cells."
 
         return f"""
 You are Codex translator. Work on this translation job and return strict JSON only.
@@ -3076,7 +3179,7 @@ Rules:
 - XLSX COMPLETENESS: For each cell in xlsx_translation_map, your translated text MUST cover the ENTIRE source text.
   Compare your translation against the source: if the source has 5 sentences, your translation must have 5 sentences.
   A translation that only covers the first half of the source is WRONG and will be rejected.
-  If you cannot fit all cells completely, translate FEWER cells but translate each one FULLY.
+{xlsx_overflow_rule}
 {batch_rules}
 - If execution_context.glossary_enforcer.terms is present, you MUST apply those term mappings strictly (Arabic => English).
   For every unit/cell whose source text contains a glossary Arabic term, the corresponding translated text MUST contain the required English translation.
@@ -3100,9 +3203,10 @@ Rules:
         strict_gateway_mode = bool(WEB_GATEWAY_ENABLED and WEB_GATEWAY_STRICT)
         call: dict[str, Any] = {"ok": False, "error": "not_called"}
         fallback_errors: dict[str, str] = {}
+        provider_selected = ""
 
         if WEB_GATEWAY_ENABLED:
-            providers_to_try = [WEB_LLM_PRIMARY_PROVIDER, WEB_LLM_FALLBACK_PROVIDER]
+            providers_to_try = _web_provider_chain("generate")
             seen: set[str] = set()
             last_gateway_failure: dict[str, Any] = {}
             for provider in providers_to_try:
@@ -3122,6 +3226,7 @@ Rules:
                 )
                 if gateway_call.get("ok"):
                     call = gateway_call
+                    provider_selected = provider_norm
                     break
                 last_gateway_failure = gateway_call
                 fallback_errors[f"gateway:{provider_norm}"] = str(gateway_call.get("error") or "gateway_unavailable")
@@ -3298,7 +3403,7 @@ Rules:
                 provider_used = str((call.get("gateway_meta") or {}).get("provider") or "").strip()
             call_meta = {
                 "agent_id": "web_gateway",
-                "provider": provider_used or WEB_LLM_PRIMARY_PROVIDER,
+                "provider": provider_used or provider_selected or WEB_LLM_PRIMARY_PROVIDER,
                 "model": str(call.get("model") or call_meta.get("model") or WEB_GATEWAY_MODEL),
                 **call_meta,
             }
@@ -3824,6 +3929,12 @@ Rules:
     failed_batches: list[dict[str, Any]] = []
     xlsx_files = sorted({str(row.get("file") or "").strip() for row in all_rows if str(row.get("file") or "").strip()})
     default_xlsx_file = xlsx_files[0] if len(xlsx_files) == 1 else ""
+    backfill_max_attempts = max(1, int(os.getenv("OPENCLAW_XLSX_BACKFILL_MAX_CELL_ATTEMPTS", "2")))
+    cell_attempts: dict[tuple[str, str, str], int] = {}
+    backfill_events: list[dict[str, Any]] = []
+    dropped_cells_sample: list[dict[str, Any]] = []
+    dropped_cells_total = 0
+    requeued_cells_total = 0
 
     while chunk_queue:
         chunk_item = chunk_queue.pop(0)
@@ -3850,6 +3961,7 @@ Rules:
         local_findings = list(findings or [])
         batch_collected_map: Any = batch_previous.get("xlsx_translation_map") if isinstance(batch_previous, dict) else []
         split_for_size = False
+        missing: list[tuple[str, str, str]] = []
         while attempt <= batch_retry:
             attempt += 1
             hint = f"batch={chunk_label} cells={len(chunk_rows)} attempt={attempt} queue={len(chunk_queue)}"
@@ -3913,6 +4025,41 @@ Rules:
         if not first_call_meta:
             first_call_meta = batch_result.get("call_meta") if isinstance(batch_result.get("call_meta"), dict) else {}
 
+        if missing:
+            requeue, dropped, cell_attempts = _xlsx_backfill_plan(
+                chunk_rows,
+                missing=missing,
+                attempts=cell_attempts,
+                max_attempts=backfill_max_attempts,
+                label_prefix=f"{chunk_label}-",
+            )
+            if requeue:
+                requeued_cells_total += len(requeue)
+                # Prepend so we backfill holes ASAP (keeps later batches smaller and more stable).
+                chunk_queue = [*requeue, *chunk_queue]
+            if dropped:
+                dropped_cells_total += len(dropped)
+                failed_batches.append(
+                    {
+                        "batch": chunk_label,
+                        "error": "xlsx_backfill_exhausted",
+                        "dropped_cells": len(dropped),
+                        "max_attempts": int(backfill_max_attempts),
+                    }
+                )
+                dropped_cells_sample.extend(dropped)
+                if len(dropped_cells_sample) > 50:
+                    dropped_cells_sample = dropped_cells_sample[:50]
+            backfill_events.append(
+                {
+                    "batch": chunk_label,
+                    "cells": len(chunk_rows),
+                    "missing": len(missing),
+                    "requeued": len(requeue),
+                    "dropped": len(dropped),
+                }
+            )
+
         data = batch_result.get("data") if isinstance(batch_result.get("data"), dict) else {}
         aggregate_data["docx_translation_map"] = _merge_docx_translation_map(
             aggregate_data.get("docx_translation_map"),
@@ -3966,7 +4113,18 @@ Rules:
     return {
         "ok": True,
         "data": aggregate_data,
-        "raw": {"batch_mode": True, "failed_batches": failed_batches},
+        "raw": {
+            "batch_mode": True,
+            "failed_batches": failed_batches,
+            "xlsx_backfill": {
+                "enabled": True,
+                "max_cell_attempts": int(backfill_max_attempts),
+                "requeued_cells": int(requeued_cells_total),
+                "dropped_cells": int(dropped_cells_total),
+                "dropped_sample": dropped_cells_sample,
+                "events": backfill_events[-80:],
+            },
+        },
         "call_meta": first_call_meta,
     }
 
@@ -4000,14 +4158,73 @@ Output JSON:
 Rules:
 - pass=true only if no critical issue remains.
 - Scores are between 0 and 1.
+- Do NOT output translated_content, xlsx_translation_map, docx_translation_map, job_id, status, or any other keys.
+- Only output the exact keys shown in Output JSON (include all keys even if empty/default).
 - JSON only.
 """.strip()
     strict_gateway_mode = bool(WEB_GATEWAY_ENABLED and WEB_GATEWAY_STRICT)
+
+    required_keys = {
+        "findings",
+        "resolved",
+        "unresolved",
+        "pass",
+        "terminology_rate",
+        "structure_complete_rate",
+        "target_language_purity",
+        "numbering_consistency",
+        "reasoning_summary",
+    }
+    forbidden_keys = {
+        "translated_content",
+        "final_text",
+        "final_reflow_text",
+        "docx_translation_map",
+        "xlsx_translation_map",
+        "job_id",
+        "status",
+    }
+
+    def _clamp(v: Any, fallback: float) -> float:
+        try:
+            val = float(v)
+        except (TypeError, ValueError):
+            return fallback
+        return max(0.0, min(1.0, val))
+
+    def _schema_reason(obj: Any) -> str:
+        if not isinstance(obj, dict):
+            return "not_object"
+        missing = [k for k in sorted(required_keys) if k not in obj]
+        if missing:
+            return f"missing_keys:{','.join(missing[:6])}"
+        forbidden = [k for k in sorted(forbidden_keys) if k in obj]
+        if forbidden:
+            return f"forbidden_keys:{','.join(forbidden[:6])}"
+        return ""
+
+    def _to_review_data(obj: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "findings": [str(x) for x in (obj.get("findings") or [])],
+            "resolved": [str(x) for x in (obj.get("resolved") or [])],
+            "unresolved": [str(x) for x in (obj.get("unresolved") or [])],
+            "pass": bool(obj.get("pass")),
+            "terminology_rate": _clamp(obj.get("terminology_rate"), 0.0),
+            "structure_complete_rate": _clamp(obj.get("structure_complete_rate"), 0.0),
+            "target_language_purity": _clamp(obj.get("target_language_purity"), 0.0),
+            "numbering_consistency": _clamp(obj.get("numbering_consistency"), 0.0),
+            "reasoning_summary": str(obj.get("reasoning_summary") or ""),
+        }
+
     call: dict[str, Any] = {"ok": False, "error": "not_called"}
+    parsed: dict[str, Any] | None = None
+    data: dict[str, Any] | None = None
+    provider_selected = ""
+
     if WEB_GATEWAY_ENABLED:
-        providers_to_try = [WEB_LLM_PRIMARY_PROVIDER, WEB_LLM_FALLBACK_PROVIDER]
+        providers_to_try = _web_provider_chain("review")
         seen: set[str] = set()
-        last_failure: dict[str, Any] = {}
+        last_failure: dict[str, Any] = {"ok": False, "error": "gateway_unavailable"}
         op_id = f"op_{uuid.uuid4().hex[:12]}"
         for provider in providers_to_try:
             provider_norm = str(provider or "").strip()
@@ -4024,18 +4241,74 @@ Rules:
                 strict_mode=strict_gateway_mode,
                 new_chat=(WEB_LLM_SESSION_MODE in {"per_request", "per-request", "new_chat", "new-chat"}),
             )
-            if gw.get("ok"):
-                call = gw
-                break
-            last_failure = gw
+            if not gw.get("ok"):
+                last_failure = gw
+                continue
+            try:
+                parsed_try = _extract_json_from_text(str(gw.get("text", "")))
+            except Exception as exc:
+                last_failure = {
+                    "ok": False,
+                    "error": f"gemini_json_parse_failed:{provider_norm}",
+                    "detail": str(exc),
+                    "raw_text": str(gw.get("text", ""))[:2000],
+                    "call": gw,
+                }
+                continue
+            schema_reason = _schema_reason(parsed_try)
+            if schema_reason:
+                last_failure = {
+                    "ok": False,
+                    "error": f"review_schema_invalid:{provider_norm}",
+                    "detail": schema_reason,
+                    "raw_text": str(gw.get("text", ""))[:2000],
+                    "call": gw,
+                }
+                continue
+            assert isinstance(parsed_try, dict)
+            data_try = _to_review_data(parsed_try)
+            if (
+                (not data_try["pass"])
+                and (not data_try["findings"])
+                and (not data_try["unresolved"])
+                and (not data_try["resolved"])
+                and (not data_try["reasoning_summary"].strip())
+                and float(data_try["terminology_rate"]) == 0.0
+                and float(data_try["structure_complete_rate"]) == 0.0
+                and float(data_try["target_language_purity"]) == 0.0
+                and float(data_try["numbering_consistency"]) == 0.0
+            ):
+                last_failure = {
+                    "ok": False,
+                    "error": f"gemini_review_empty:{provider_norm}",
+                    "detail": gw,
+                    "raw_text": str(gw.get("text", ""))[:2000],
+                    "call": gw,
+                }
+                continue
+
+            call = gw
+            parsed = parsed_try
+            data = data_try
+            provider_selected = provider_norm
+            break
+
         if not call.get("ok"):
+            err = str(last_failure.get("error") or "gateway_unavailable")
+            if err.startswith(("review_schema_invalid:", "gemini_review_empty:", "gemini_json_parse_failed:")):
+                return {
+                    "ok": False,
+                    "error": err,
+                    "detail": last_failure.get("detail") or last_failure,
+                    "raw_text": str(last_failure.get("raw_text") or ""),
+                }
             if strict_gateway_mode:
                 mapped = _map_gateway_error(
                     str(last_failure.get("error") or ""),
                     str(last_failure.get("detail") or ""),
                 )
                 return {"ok": False, "error": mapped, "detail": last_failure, "raw_text": str(last_failure.get("raw_text") or "")}
-            return {"ok": False, "error": last_failure.get("error") or "gateway_unavailable", "detail": last_failure}
+            return {"ok": False, "error": err, "detail": last_failure}
     else:
         call = _agent_call(GEMINI_AGENT, prompt)
         if not call.get("ok") and GEMINI_FALLBACK_AGENTS:
@@ -4047,33 +4320,38 @@ Rules:
                     break
         if not call.get("ok"):
             return {"ok": False, "error": call.get("error"), "detail": call}
-    try:
-        parsed = _extract_json_from_text(str(call.get("text", "")))
-    except Exception as exc:
-        return {"ok": False, "error": "gemini_json_parse_failed", "detail": str(exc), "raw_text": call.get("text", "")}
-
-    def _clamp(v: Any, fallback: float) -> float:
         try:
-            val = float(v)
-        except (TypeError, ValueError):
-            return fallback
-        return max(0.0, min(1.0, val))
+            parsed_try = _extract_json_from_text(str(call.get("text", "")))
+        except Exception as exc:
+            return {"ok": False, "error": "gemini_json_parse_failed", "detail": str(exc), "raw_text": call.get("text", "")}
+        schema_reason = _schema_reason(parsed_try)
+        if schema_reason:
+            return {
+                "ok": False,
+                "error": "review_schema_invalid:agent",
+                "detail": schema_reason,
+                "raw_text": str(call.get("text", ""))[:2000],
+            }
+        assert isinstance(parsed_try, dict)
+        parsed = parsed_try
+        data = _to_review_data(parsed_try)
 
-    data = {
-        "findings": [str(x) for x in (parsed.get("findings") or [])],
-        "resolved": [str(x) for x in (parsed.get("resolved") or [])],
-        "unresolved": [str(x) for x in (parsed.get("unresolved") or [])],
-        "pass": bool(parsed.get("pass")),
-        "terminology_rate": _clamp(parsed.get("terminology_rate"), 0.0),
-        "structure_complete_rate": _clamp(parsed.get("structure_complete_rate"), 0.0),
-        "target_language_purity": _clamp(parsed.get("target_language_purity"), 0.0),
-        "numbering_consistency": _clamp(parsed.get("numbering_consistency"), 0.0),
-        "reasoning_summary": str(parsed.get("reasoning_summary") or ""),
-    }
+    assert isinstance(parsed, dict)
+    assert isinstance(data, dict)
 
     call_meta = call.get("meta") if isinstance(call.get("meta"), dict) else {}
     if isinstance(call, dict) and call.get("agent_id"):
         call_meta = {"agent_id": str(call.get("agent_id") or ""), **call_meta}
+    if isinstance(call, dict) and call.get("source") == "web_gateway":
+        provider_used = str(call_meta.get("provider") or "").strip()
+        if not provider_used and isinstance(call.get("gateway_meta"), dict):
+            provider_used = str((call.get("gateway_meta") or {}).get("provider") or "").strip()
+        call_meta = {
+            "agent_id": "web_gateway",
+            "provider": provider_used or provider_selected or WEB_LLM_REVIEW_PRIMARY_PROVIDER or WEB_LLM_PRIMARY_PROVIDER,
+            "model": str(call.get("model") or call_meta.get("model") or WEB_GATEWAY_MODEL),
+            **call_meta,
+        }
 
     # Treat "empty but successful" reviews as unavailable. This happens when upstream
     # providers return placeholder zeros without any findings or explanation.
@@ -4090,7 +4368,7 @@ Rules:
     ):
         return {
             "ok": False,
-            "error": "gemini_review_empty",
+            "error": f"gemini_review_empty:{provider_selected}" if provider_selected else "gemini_review_empty",
             "detail": call,
             "raw_text": call.get("text", ""),
             "call_meta": call_meta,
@@ -5395,6 +5673,11 @@ def run(
                 if glm_enabled
                 else {"ok": False, "error": "glm_disabled"}
             )
+
+            codex_raw = codex_gen.get("raw") if isinstance(codex_gen.get("raw"), dict) else {}
+            xlsx_backfill = codex_raw.get("xlsx_backfill") if isinstance(codex_raw.get("xlsx_backfill"), dict) else None
+            if xlsx_backfill:
+                _write_json(round_dir / "xlsx_backfill.json", xlsx_backfill)
 
             codex_data: dict[str, Any] | None = codex_gen.get("data") if codex_gen.get("ok") else None
             glm_data: dict[str, Any] | None = glm_gen.get("data") if (glm_enabled and glm_gen.get("ok")) else None

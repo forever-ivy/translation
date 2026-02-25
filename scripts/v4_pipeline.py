@@ -456,7 +456,33 @@ def run_job_pipeline(
         import urllib.request
 
         base_url = str(os.getenv("OPENCLAW_WEB_GATEWAY_BASE_URL", "http://127.0.0.1:8765")).strip().rstrip("/")
-        primary_provider = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+
+        global_primary = str(os.getenv("OPENCLAW_WEB_LLM_PRIMARY", "gemini_web")).strip() or "gemini_web"
+        global_fallback = str(os.getenv("OPENCLAW_WEB_LLM_FALLBACK", "chatgpt_web")).strip() or "chatgpt_web"
+        gen_primary = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_PRIMARY", "")).strip()
+        gen_fallback = str(os.getenv("OPENCLAW_WEB_LLM_GENERATE_FALLBACK", "")).strip()
+        rev_primary = str(os.getenv("OPENCLAW_WEB_LLM_REVIEW_PRIMARY", "")).strip()
+        rev_fallback = str(os.getenv("OPENCLAW_WEB_LLM_REVIEW_FALLBACK", "")).strip()
+
+        def _chain(primary_override: str, fallback_override: str) -> list[str]:
+            primary = primary_override or global_primary
+            fallback = fallback_override or global_fallback
+            out: list[str] = []
+            for raw in (primary, fallback):
+                p = str(raw or "").strip()
+                if not p:
+                    continue
+                if p.lower() in {"none", "disabled", "off"}:
+                    continue
+                if p in out:
+                    continue
+                out.append(p)
+            return out
+
+        providers_to_check: list[str] = []
+        for p in _chain(gen_primary, gen_fallback) + _chain(rev_primary, rev_fallback):
+            if p not in providers_to_check:
+                providers_to_check.append(p)
 
         notify_milestone(
             paths=paths,
@@ -468,39 +494,58 @@ def run_job_pipeline(
             dry_run=dry_run_notify,
         )
 
-        payload = json.dumps(
-            {"provider": primary_provider, "interactive": False, "timeout_seconds": 15},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            f"{base_url}/session/login",
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        login_resp: dict[str, Any] = {}
-        login_ok = False
-        preflight_error = ""
-        try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-            login_resp = json.loads(raw) if raw.strip().startswith("{") else {"raw": raw[:2000]}
-            login_ok = bool(login_resp.get("ok", False))
-        except urllib.error.HTTPError as exc:
-            raw_err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-            preflight_error = f"http_{exc.code}:{raw_err[:800]}"
-        except urllib.error.URLError as exc:
-            preflight_error = f"url_error:{exc}"
-        except TimeoutError:
-            preflight_error = "timeout"
-        except Exception as exc:
-            preflight_error = str(exc)
+        failures: list[dict[str, Any]] = []
+        for provider in (providers_to_check or [global_primary]):
+            payload = json.dumps(
+                {"provider": provider, "interactive": False, "timeout_seconds": 15},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base_url}/session/login",
+                data=payload,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            login_resp: dict[str, Any] = {}
+            login_ok = False
+            preflight_error = ""
+            try:
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                login_resp = json.loads(raw) if raw.strip().startswith("{") else {"raw": raw[:2000]}
+                login_ok = bool(login_resp.get("ok", False))
+            except urllib.error.HTTPError as exc:
+                raw_err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                preflight_error = f"http_{exc.code}:{raw_err[:800]}"
+            except urllib.error.URLError as exc:
+                preflight_error = f"url_error:{exc}"
+            except TimeoutError:
+                preflight_error = "timeout"
+            except Exception as exc:
+                preflight_error = str(exc)
 
-        if not login_ok:
-            token = f"gateway_login_required:{primary_provider}"
-            if preflight_error:
-                token = f"gateway_unavailable:{primary_provider}"
-            update_job_status(conn, job_id=job_id, status="needs_attention", errors=[token])
+            if not login_ok:
+                failures.append(
+                    {
+                        "provider": provider,
+                        "error": preflight_error or "login_required",
+                        "response": login_resp,
+                    }
+                )
+
+        if failures:
+            tokens: list[str] = []
+            status_flags: list[str] = []
+            for item in failures:
+                provider = str(item.get("provider") or "").strip()
+                err = str(item.get("error") or "").strip()
+                token = f"gateway_login_required:{provider}"
+                if err and err != "login_required":
+                    token = f"gateway_unavailable:{provider}"
+                tokens.append(token)
+                status_flags.append(token.split(":", 1)[0])
+
+            update_job_status(conn, job_id=job_id, status="needs_attention", errors=tokens)
             notify_milestone(
                 paths=paths,
                 conn=conn,
@@ -508,8 +553,8 @@ def run_job_pipeline(
                 milestone="preflight_failed",
                 message=(
                     "\u26d4 Web gateway not ready.\n"
-                    f"Provider: {primary_provider}\n"
-                    "Open Tauri -> Gateway Login (or run: scripts/start.sh --gateway-login)."
+                    f"Providers: {', '.join(sorted(set([str(x.get('provider') or '').strip() for x in failures if str(x.get('provider') or '').strip()]))) or global_primary}\n"
+                    "Open Tauri -> Runtime -> Provider Login (or run: scripts/start.sh --gateway-login)."
                 ),
                 target=notify_target,
                 dry_run=dry_run_notify,
@@ -520,9 +565,8 @@ def run_job_pipeline(
                 milestone="preflight_detail",
                 payload={
                     "ok": False,
-                    "provider": primary_provider,
-                    "error": preflight_error or "login_required",
-                    "response": login_resp,
+                    "providers": providers_to_check,
+                    "failures": failures,
                 },
             )
             conn.close()
@@ -530,22 +574,22 @@ def run_job_pipeline(
                 "ok": False,
                 "job_id": job_id,
                 "status": "needs_attention",
-                "errors": [token],
-                "status_flags": [token.split(":", 1)[0]],
+                "errors": tokens,
+                "status_flags": status_flags,
             }
 
         record_event(
             conn,
             job_id=job_id,
             milestone="preflight_done",
-            payload={"ok": True, "provider": primary_provider, "response": login_resp},
+            payload={"ok": True, "providers": providers_to_check},
         )
         notify_milestone(
             paths=paths,
             conn=conn,
             job_id=job_id,
             milestone="preflight_done",
-            message=f"\u2705 Preflight OK ({primary_provider})",
+            message=f"\u2705 Preflight OK ({', '.join(providers_to_check or [global_primary])})",
             target=notify_target,
             dry_run=dry_run_notify,
         )

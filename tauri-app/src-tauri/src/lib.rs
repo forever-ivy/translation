@@ -991,7 +991,16 @@ fn cleanup_telegram_processes(state: &AppState) {
 fn diagnose_telegram_health_inner(state: &AppState) -> TelegramHealth {
     let ts = now_iso();
     let log_tail = read_log_tail(&telegram_log_file_path(state), 50);
-    let combined = log_tail.join("\n");
+    // Only evaluate conflict/errors within the most recent bot session to avoid
+    // stale log lines (e.g., old 409s) forcing the UI into a restart loop.
+    let session_start_idx = log_tail
+        .iter()
+        .rposition(|line| line.to_lowercase().contains("starting telegram bot poll loop"));
+    let session_lines: &[String] = match session_start_idx {
+        Some(idx) => &log_tail[idx..],
+        None => &log_tail[..],
+    };
+    let combined = session_lines.join("\n");
     let lower = combined.to_lowercase();
     let network_issue = lower.contains("network error")
         || lower.contains("timed out")
@@ -1018,7 +1027,7 @@ fn diagnose_telegram_health_inner(state: &AppState) -> TelegramHealth {
     let running = !running_pids.is_empty();
     let single_instance_ok = running_pids.len() <= 1;
     let mut last_error = String::new();
-    for line in log_tail.iter().rev() {
+    for line in session_lines.iter().rev() {
         let up = line.to_uppercase();
         if up.contains("ERROR") || up.contains("TRACEBACK") || up.contains("CONFLICT") {
             last_error = line.clone();

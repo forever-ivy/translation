@@ -413,7 +413,26 @@ export const useServiceStore = create<ServiceStoreState>((set, get) => ({
         providerLoggedIn ? "Gateway login verified" : "Gateway login not completed",
       );
     } catch (error) {
-      ui.addToast("error", `Gateway login check failed: ${error}`);
+      console.warn("loginGateway failed:", error);
+      const raw = String((error as unknown as { message?: string })?.message || error || "");
+      const lower = raw.toLowerCase();
+
+      let summary = "Gateway login failed.";
+      if (lower.includes("sync api") && lower.includes("asyncio")) {
+        summary = "Gateway Playwright init failed (async mismatch). Stop Gateway, Start Gateway, then try Login again.";
+      } else if (lower.includes("playwright_init_failed")) {
+        summary = "Gateway Playwright init failed. Stop Gateway, Start Gateway, then try Login again.";
+      } else if (
+        lower.includes("targetclosederror") ||
+        lower.includes("target page, context or browser has been closed") ||
+        lower.includes("context or browser has been closed")
+      ) {
+        summary = "Gateway browser closed unexpectedly. Stop Gateway, Start Gateway, then try Login again.";
+      } else if (lower.includes("gateway_login_check_failed")) {
+        summary = "Gateway login check failed. Stop Gateway, Start Gateway, then try again.";
+      }
+
+      ui.addToast("error", summary);
     } finally {
       ui.setIsLoading(false);
     }

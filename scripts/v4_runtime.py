@@ -10,6 +10,7 @@ import re
 import signal
 import sqlite3
 import subprocess
+import shutil
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -1646,18 +1647,22 @@ def send_message(
     account: str = DEFAULT_NOTIFY_ACCOUNT,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    direct_mode = os.getenv("TELEGRAM_DIRECT_MODE") == "1"
+
     # Direct Telegram bypass when enabled
-    if (
-        os.getenv("TELEGRAM_DIRECT_MODE") == "1"
-        and channel == "telegram"
-        and not dry_run
-    ):
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        if token:
+    if direct_mode and channel == "telegram" and not dry_run and token:
+        return send_telegram_direct(chat_id=target, message=message, bot_token=token)
+
+    openclaw_bin = shutil.which("openclaw")
+    if not openclaw_bin:
+        # Fallback: if OpenClaw CLI is unavailable, still deliver Telegram notifications directly.
+        if channel == "telegram" and not dry_run and token:
             return send_telegram_direct(chat_id=target, message=message, bot_token=token)
+        return {"ok": False, "stderr": "openclaw command not found", "stdout": ""}
 
     cmd = [
-        "openclaw",
+        openclaw_bin,
         "message",
         "send",
         "--channel",

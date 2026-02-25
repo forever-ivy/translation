@@ -233,6 +233,8 @@ def _gateway_login(args: argparse.Namespace) -> dict[str, Any]:
     base_url = (args.base_url or DEFAULT_GATEWAY_BASE_URL).strip()
     provider = str(getattr(args, "provider", "") or "").strip()
     timeout_seconds = int(getattr(args, "timeout_seconds", 15) or 15)
+    # /session/login can block while launching a browser and waiting for interactive login.
+    http_timeout = max(30.0, float(timeout_seconds) + 20.0)
     try:
         login = _http_json(
             _gateway_url("/session/login", base_url=base_url),
@@ -242,7 +244,7 @@ def _gateway_login(args: argparse.Namespace) -> dict[str, Any]:
                 "interactive": bool(args.interactive_login),
                 "timeout_seconds": timeout_seconds,
             },
-            timeout=30.0,
+            timeout=http_timeout,
         )
     except urllib.error.URLError as exc:
         return {"ok": False, "action": "login", "error": f"gateway_login_request_failed:{exc}"}
