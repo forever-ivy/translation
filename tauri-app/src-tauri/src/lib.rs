@@ -2464,6 +2464,16 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
         },
     });
 
+    // Parse env once for mode-dependent checks.
+    let env_map = read_env_map(&PathBuf::from(&state.config_path).join(".env.v4.local"));
+    let web_gateway_enabled = env_map
+        .get("OPENCLAW_WEB_GATEWAY_ENABLED")
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            !matches!(s.as_str(), "" | "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false);
+
     // OpenClaw check - try multiple paths with proper environment
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ivy".to_string());
     let openclaw_paths = [
@@ -2502,19 +2512,21 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
         key: "openclaw".to_string(),
         status: if openclaw_ok {
             "pass".to_string()
+        } else if web_gateway_enabled {
+            "warning".to_string()
         } else {
             "blocker".to_string()
         },
         message: if openclaw_ok {
             "OpenClaw is running".to_string()
+        } else if web_gateway_enabled {
+            "OpenClaw gateway is optional in web gateway mode.".to_string()
         } else {
             "Run: openclaw gateway --force".to_string()
         },
     });
 
     // Model availability checks (fast status; no live probes)
-    let env_path = PathBuf::from(&state.config_path).join(".env.v4.local");
-    let env_map = read_env_map(&env_path);
     let vision_has_google = env_map
         .get("GOOGLE_API_KEY")
         .map(|v| !v.trim().is_empty())
@@ -2557,29 +2569,36 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
             .unwrap_or(false);
 
     // translator-core model route (required)
-    let (translator_status, translator_msg) = match report.as_ref().and_then(|r| r.agents.get("translator-core")) {
-        Some(a) if a.runnable_now => (
-            "pass",
-            format!(
-                "Runnable. First usable model: {}. (Inspect: openclaw models status --agent translator-core --json)",
-                a.first_runnable_model.clone().unwrap_or_else(|| "unknown".to_string())
+    let (translator_status, translator_msg) = if web_gateway_enabled {
+        (
+            "warning",
+            "Skipped in web gateway mode (generation/review providers are configured via OPENCLAW_WEB_LLM_*).".to_string(),
+        )
+    } else {
+        match report.as_ref().and_then(|r| r.agents.get("translator-core")) {
+            Some(a) if a.runnable_now => (
+                "pass",
+                format!(
+                    "Runnable. First usable model: {}. (Inspect: openclaw models status --agent translator-core --json)",
+                    a.first_runnable_model.clone().unwrap_or_else(|| "unknown".to_string())
+                ),
             ),
-        ),
-        Some(a) => (
-            "blocker",
-            format!(
-                "Blocked. {} (Inspect: openclaw models status --agent translator-core --json; Fix auth: openclaw models auth login --provider openai-codex)",
-                a.blocked_reasons.join(" ")
+            Some(a) => (
+                "blocker",
+                format!(
+                    "Blocked. {} (Inspect: openclaw models status --agent translator-core --json; Fix auth: openclaw models auth login --provider openai-codex)",
+                    a.blocked_reasons.join(" ")
+                ),
             ),
-        ),
-        None if openclaw_ok => (
-            "blocker",
-            "Could not evaluate model availability (openclaw models status/list failed). Try: openclaw models status --agent translator-core --json".to_string(),
-        ),
-        None => (
-            "blocker",
-            "OpenClaw not running; cannot evaluate translator-core models. Try: openclaw gateway --force".to_string(),
-        ),
+            None if openclaw_ok => (
+                "blocker",
+                "Could not evaluate model availability (openclaw models status/list failed). Try: openclaw models status --agent translator-core --json".to_string(),
+            ),
+            None => (
+                "blocker",
+                "OpenClaw not running; cannot evaluate translator-core models. Try: openclaw gateway --force".to_string(),
+            ),
+        }
     };
     checks.push(PreflightCheck {
         name: "Models (translator-core)".to_string(),
@@ -2589,29 +2608,36 @@ fn run_preflight_check_inner(state: &AppState) -> Vec<PreflightCheck> {
     });
 
     // review-core model route (optional-ish: warnings)
-    let (review_status, review_msg) = match report.as_ref().and_then(|r| r.agents.get("review-core")) {
-        Some(a) if a.runnable_now => (
-            "pass",
-            format!(
-                "Runnable. First usable model: {}. (Inspect: openclaw models status --agent review-core --json)",
-                a.first_runnable_model.clone().unwrap_or_else(|| "unknown".to_string())
+    let (review_status, review_msg) = if web_gateway_enabled {
+        (
+            "warning",
+            "Skipped in web gateway mode (review providers are configured via OPENCLAW_WEB_LLM_*).".to_string(),
+        )
+    } else {
+        match report.as_ref().and_then(|r| r.agents.get("review-core")) {
+            Some(a) if a.runnable_now => (
+                "pass",
+                format!(
+                    "Runnable. First usable model: {}. (Inspect: openclaw models status --agent review-core --json)",
+                    a.first_runnable_model.clone().unwrap_or_else(|| "unknown".to_string())
+                ),
             ),
-        ),
-        Some(a) => (
-            "warning",
-            format!(
-                "Not runnable. {} (Inspect: openclaw models status --agent review-core --json)",
-                a.blocked_reasons.join(" ")
+            Some(a) => (
+                "warning",
+                format!(
+                    "Not runnable. {} (Inspect: openclaw models status --agent review-core --json)",
+                    a.blocked_reasons.join(" ")
+                ),
             ),
-        ),
-        None if openclaw_ok => (
-            "warning",
-            "Could not evaluate review-core model availability. Try: openclaw models status --agent review-core --json".to_string(),
-        ),
-        None => (
-            "warning",
-            "OpenClaw not running; cannot evaluate review-core models.".to_string(),
-        ),
+            None if openclaw_ok => (
+                "warning",
+                "Could not evaluate review-core model availability. Try: openclaw models status --agent review-core --json".to_string(),
+            ),
+            None => (
+                "warning",
+                "OpenClaw not running; cannot evaluate review-core models.".to_string(),
+            ),
+        }
     };
     checks.push(PreflightCheck {
         name: "Models (review-core)".to_string(),
