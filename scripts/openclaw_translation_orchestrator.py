@@ -1913,6 +1913,73 @@ def _filter_docx_map_for_keys(entries: Any, keys: set[tuple[str, str]], *, defau
     return out
 
 
+def _docx_backfill_plan(
+    rows: list[dict[str, Any]],
+    *,
+    missing: list[tuple[str, str]],
+    attempts: dict[tuple[str, str], int],
+    max_attempts: int,
+    label_prefix: str,
+    max_units_per_chunk: int,
+    max_source_chars: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[str, str], int]]:
+    """Plan backfill chunks for missing DOCX units.
+
+    Returns:
+      - requeue: chunk_queue items containing only missing units (chunked)
+      - dropped: units that exceeded max_attempts
+      - attempts_next: updated attempts map
+    """
+    missing_set = set(missing or [])
+    attempts_next: dict[tuple[str, str], int] = dict(attempts or {})
+    dropped: list[dict[str, Any]] = []
+    requeue_units: list[dict[str, Any]] = []
+    max_attempts_norm = max(1, int(max_attempts or 1))
+    prefix = str(label_prefix or "backfill-")
+
+    if not rows or not missing_set:
+        return [], [], attempts_next
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        file_name = str(row.get("file") or "").strip()
+        unit_id = str(row.get("id") or "").strip()
+        if not file_name or not unit_id:
+            continue
+        key = _normalize_docx_key(file_name, unit_id)
+        if key not in missing_set:
+            continue
+        attempts_next[key] = int(attempts_next.get(key, 0) or 0) + 1
+        if int(attempts_next[key]) > max_attempts_norm:
+            preview = str(row.get("text") or "")
+            if len(preview) > 160:
+                preview = preview[:160] + "..."
+            dropped.append(
+                {
+                    "file": file_name,
+                    "id": unit_id,
+                    "attempts": int(attempts_next[key]),
+                    "text_preview": preview,
+                }
+            )
+            continue
+        requeue_units.append(row)
+
+    if not requeue_units:
+        return [], dropped, attempts_next
+
+    chunks = _chunk_docx_units_for_translation(
+        requeue_units,
+        max_units=max(1, int(max_units_per_chunk or 1)),
+        max_source_chars=max(200, int(max_source_chars or 200)),
+    )
+    requeue: list[dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        requeue.append({"label": f"{prefix}bf{idx}", "rows": list(chunk)})
+    return requeue, dropped, attempts_next
+
+
 def _flatten_xlsx_prompt_rows(context_payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten xlsx_sources into canonical row dicts for batch planning."""
     preserve = context_payload.get("format_preserve")
@@ -3181,6 +3248,7 @@ PRESERVED_TEXT_MAP (copy these texts EXACTLY for the corresponding unit IDs):
 - This is DOCX BATCH MODE. Translate ONLY the docx units present in this batch payload.
 - You MUST return docx_translation_map for every provided unit in the batch.
 - Each docx_translation_map item MUST include file + id + text.
+- Keep the response SMALL in DOCX BATCH MODE: set final_text/final_reflow_text to "" and keep review_brief_points/change_log_points/resolved/unresolved empty unless absolutely necessary.
 - DOCX batch hint: {docx_batch_hint}
                 """
             )
@@ -3208,7 +3276,7 @@ Output JSON:
 {{
   "final_text": "string",
   "final_reflow_text": "string",
-  "docx_translation_map": [{{"id": "p:12", "text": "..."}}],
+  "docx_translation_map": [{{"file": "file.docx", "id": "p:12", "text": "..."}}],
   "xlsx_translation_map": [{{"file": "file.xlsx", "sheet": "Sheet1", "cell": "B2", "text": "..."}}],
   "review_brief_points": ["..."],
   "change_log_points": ["..."],
@@ -3458,6 +3526,38 @@ Rules:
                 "model": str(call.get("model") or call_meta.get("model") or WEB_GATEWAY_MODEL),
                 **call_meta,
             }
+
+        if _env_flag("OPENCLAW_DISALLOW_MARKDOWN", "1") and isinstance(parsed, dict):
+            dash_pat = re.compile(r"(?m)^(\s*)-\s+")
+            markdown_autofix: dict[str, int] = {"dash_bullets": 0}
+
+            def _fix_dash_lists(value: Any) -> Any:
+                if not isinstance(value, str) or "- " not in value:
+                    return value
+
+                def _repl(m: re.Match[str]) -> str:
+                    markdown_autofix["dash_bullets"] = int(markdown_autofix.get("dash_bullets", 0) or 0) + 1
+                    return f"{m.group(1)}• "
+
+                return dash_pat.sub(_repl, value)
+
+            parsed["final_text"] = _fix_dash_lists(parsed.get("final_text") or "")
+            parsed["final_reflow_text"] = _fix_dash_lists(parsed.get("final_reflow_text") or "")
+            for key in ("docx_translation_map", "docx_translation_blocks", "docx_table_cells"):
+                entries = parsed.get(key)
+                if not isinstance(entries, list):
+                    continue
+                for row in entries:
+                    if isinstance(row, dict):
+                        row["text"] = _fix_dash_lists(row.get("text") or "")
+            x_entries = parsed.get("xlsx_translation_map")
+            if isinstance(x_entries, list):
+                for row in x_entries:
+                    if isinstance(row, dict):
+                        row["text"] = _fix_dash_lists(row.get("text") or "")
+
+            if int(markdown_autofix.get("dash_bullets", 0) or 0) > 0:
+                call_meta = {**call_meta, "markdown_autofix": markdown_autofix}
 
         return {
             "ok": True,
@@ -3785,6 +3885,22 @@ Rules:
         }
         first_call_meta: dict[str, Any] = {}
         failed_batches: list[dict[str, Any]] = []
+        backfill_max_attempts = max(1, int(os.getenv("OPENCLAW_DOCX_BACKFILL_MAX_UNIT_ATTEMPTS", "2")))
+        backfill_max_units = max(1, int(os.getenv("OPENCLAW_DOCX_BACKFILL_MAX_UNITS", "12")))
+        backfill_max_chars = max(
+            200,
+            int(
+                os.getenv(
+                    "OPENCLAW_DOCX_BACKFILL_MAX_SOURCE_CHARS",
+                    str(min(4000, int(docx_batch_max_chars))),
+                )
+            ),
+        )
+        unit_attempts: dict[tuple[str, str], int] = {}
+        backfill_events: list[dict[str, Any]] = []
+        dropped_units_sample: list[dict[str, Any]] = []
+        dropped_units_total = 0
+        requeued_units_total = 0
 
         while chunk_queue:
             chunk_item = chunk_queue.pop(0)
@@ -3812,7 +3928,8 @@ Rules:
             batch_result: dict[str, Any] | None = None
             local_findings = list(findings or [])
             batch_collected_map: Any = batch_previous.get("docx_translation_map") if isinstance(batch_previous, dict) else []
-            split_for_size = False
+            split_and_requeue = False
+            missing: list[tuple[str, str]] = []
             while attempt <= docx_batch_retry:
                 attempt += 1
                 hint = f"batch={chunk_label} units={len(chunk_units)} attempt={attempt} queue={len(chunk_queue)}"
@@ -3825,14 +3942,18 @@ Rules:
                 )
                 if not batch_result.get("ok"):
                     err = str(batch_result.get("error") or "")
-                    detail = str(batch_result.get("detail") or "")
+                    detail_obj = batch_result.get("detail")
+                    if isinstance(detail_obj, (dict, list)):
+                        detail = json.dumps(detail_obj, ensure_ascii=False)
+                    else:
+                        detail = str(detail_obj or "")
                     raw_text = str(batch_result.get("raw_text") or "")
                     if len(chunk_units) > 1 and (
                         err.startswith("agent_request_too_large:")
                         or _looks_like_model_request_too_large(detail)
                         or _looks_like_model_request_too_large(raw_text)
                     ):
-                        split_for_size = True
+                        split_and_requeue = True
                         mid = max(1, len(chunk_units) // 2)
                         left_units = list(chunk_units[:mid])
                         right_units = list(chunk_units[mid:])
@@ -3845,6 +3966,30 @@ Rules:
                             {
                                 "batch": chunk_label,
                                 "error": "agent_request_too_large",
+                                "action": "split_retry",
+                                "units": len(chunk_units),
+                                "split_units": [len(left_units), len(right_units)],
+                            }
+                        )
+                        break
+                    parse_failed = err in {"codex_json_parse_failed", "gateway_bad_payload"} or err.startswith("gateway_bad_payload:")
+                    parse_failed = parse_failed and ("format_contract_failed" not in err)
+                    if len(chunk_units) > 1 and parse_failed and (
+                        _looks_like_truncated_json(raw_text) or "json" in detail.lower() or "expecting" in detail.lower()
+                    ):
+                        split_and_requeue = True
+                        mid = max(1, len(chunk_units) // 2)
+                        left_units = list(chunk_units[:mid])
+                        right_units = list(chunk_units[mid:])
+                        chunk_queue = [
+                            {"label": f"{chunk_label}a", "rows": left_units},
+                            {"label": f"{chunk_label}b", "rows": right_units},
+                            *chunk_queue,
+                        ]
+                        failed_batches.append(
+                            {
+                                "batch": chunk_label,
+                                "error": "json_parse_failed",
                                 "action": "split_retry",
                                 "units": len(chunk_units),
                                 "split_units": [len(left_units), len(right_units)],
@@ -3867,7 +4012,7 @@ Rules:
                 ]
                 batch_previous["docx_translation_map"] = batch_collected_map if isinstance(batch_collected_map, list) else []
 
-            if split_for_size:
+            if split_and_requeue:
                 continue
 
             if not batch_result or not batch_result.get("ok"):
@@ -3904,6 +4049,40 @@ Rules:
             if not aggregate_data.get("final_reflow_text") and str(data.get("final_reflow_text") or "").strip():
                 aggregate_data["final_reflow_text"] = str(data.get("final_reflow_text") or "")
             aggregate_data["reasoning_summary"] = str(data.get("reasoning_summary") or aggregate_data.get("reasoning_summary") or "")
+            if missing:
+                requeue, dropped, unit_attempts = _docx_backfill_plan(
+                    chunk_units,
+                    missing=missing,
+                    attempts=unit_attempts,
+                    max_attempts=backfill_max_attempts,
+                    label_prefix=f"{chunk_label}-",
+                    max_units_per_chunk=backfill_max_units,
+                    max_source_chars=backfill_max_chars,
+                )
+                if requeue:
+                    requeued = sum(len((item.get("rows") or [])) for item in requeue if isinstance(item, dict))
+                    requeued_units_total += int(requeued)
+                    chunk_queue = [*requeue, *chunk_queue]
+                if dropped:
+                    dropped_units_total += len(dropped)
+                    if len(dropped_units_sample) < 12:
+                        dropped_units_sample.extend(dropped[: max(0, 12 - len(dropped_units_sample))])
+                    failed_batches.append(
+                        {
+                            "batch": chunk_label,
+                            "error": "docx_backfill_exhausted",
+                            "dropped_units": len(dropped),
+                            "max_attempts": int(backfill_max_attempts),
+                        }
+                    )
+                backfill_events.append(
+                    {
+                        "batch": chunk_label,
+                        "missing_units": len(missing),
+                        "requeued_units": sum(len((item.get("rows") or [])) for item in requeue if isinstance(item, dict)),
+                        "dropped_units": len(dropped),
+                    }
+                )
 
         expected_all_keys = _docx_batch_key_set(docx_all_units)
         got_all_keys = _normalize_docx_translation_map_keys(aggregate_data.get("docx_translation_map"), docx_files=docx_files)
@@ -3929,7 +4108,19 @@ Rules:
         return {
             "ok": True,
             "data": aggregate_data,
-            "raw": {"batch_mode": True, "failed_batches": failed_batches},
+            "raw": {
+                "batch_mode": True,
+                "failed_batches": failed_batches,
+                "docx_backfill": {
+                    "max_attempts": int(backfill_max_attempts),
+                    "max_units_per_chunk": int(backfill_max_units),
+                    "max_source_chars": int(backfill_max_chars),
+                    "events": backfill_events,
+                    "requeued_units_total": int(requeued_units_total),
+                    "dropped_units_total": int(dropped_units_total),
+                    "dropped_units_sample": dropped_units_sample,
+                },
+            },
             "call_meta": first_call_meta,
         }
 
@@ -4508,6 +4699,15 @@ def _looks_like_model_request_too_large(text: str) -> bool:
     )
 
 
+def _looks_like_truncated_json(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if raw.endswith(("}", "]")):
+        return False
+    return ("{" in raw) or ("[" in raw)
+
+
 def _map_gateway_error(error_type: str, detail: str = "") -> str:
     token = str(error_type or "").strip().lower()
     if token in {"gateway_unavailable", "gateway_login_required", "gateway_timeout", "gateway_bad_payload"}:
@@ -4553,6 +4753,10 @@ def _web_gateway_chat_completion(
     provider_norm = str(provider or "").strip()
     if provider_norm:
         request_payload["provider"] = provider_norm
+        # Observability: label the request model by provider when explicitly routed.
+        # The gateway uses `provider` for routing; `model` is primarily used for downstream
+        # status reporting (e.g., "Gen(...)" / "Review(...)").
+        request_payload["model"] = provider_norm.replace("_", "-")
     if format_contract:
         request_payload["format_contract"] = format_contract
     if job_id:
@@ -4776,7 +4980,7 @@ Output JSON:
 {{
   "final_text": "string",
   "final_reflow_text": "string",
-  "docx_translation_map": [{{"id": "p:12", "text": "..."}}],
+  "docx_translation_map": [{{"file": "file.docx", "id": "p:12", "text": "..."}}],
   "xlsx_translation_map": [{{"file": "file.xlsx", "sheet": "Sheet1", "cell": "B2", "text": "..."}}],
   "review_brief_points": ["..."],
   "change_log_points": ["..."],
@@ -5729,6 +5933,9 @@ def run(
             xlsx_backfill = codex_raw.get("xlsx_backfill") if isinstance(codex_raw.get("xlsx_backfill"), dict) else None
             if xlsx_backfill:
                 _write_json(round_dir / "xlsx_backfill.json", xlsx_backfill)
+            docx_backfill = codex_raw.get("docx_backfill") if isinstance(codex_raw.get("docx_backfill"), dict) else None
+            if docx_backfill:
+                _write_json(round_dir / "docx_backfill.json", docx_backfill)
 
             codex_data: dict[str, Any] | None = codex_gen.get("data") if codex_gen.get("ok") else None
             glm_data: dict[str, Any] | None = glm_gen.get("data") if (glm_enabled and glm_gen.get("ok")) else None

@@ -366,7 +366,17 @@ class PlaywrightWebProvider:
         return {"ok": False, "logged_in": False, "error": "gateway_diagnose_failed:unknown", "selector_probe": {}}
 
     async def _prompt_send(self, page: Any, prompt: str) -> tuple[bool, str]:
-        sel, box = await self._pick_first_visible_on_page(page, self.prompt_selectors)
+        wait_seconds = max(1.0, float(os.getenv("OPENCLAW_WEB_GATEWAY_PROMPT_WAIT_SECONDS", "12") or 12))
+        deadline = time.time() + wait_seconds
+        sel, box = None, None
+        while time.time() < deadline:
+            sel, box = await self._pick_first_visible_on_page(page, self.prompt_selectors)
+            if sel and box is not None:
+                break
+            try:
+                await page.wait_for_timeout(250)
+            except Exception:
+                break
         if not sel or box is None:
             return False, "prompt_selector_missing"
         try:
@@ -375,23 +385,120 @@ class PlaywrightWebProvider:
                 """
                 (el, value) => {
                     const tag = (el.tagName || '').toLowerCase();
-                    if (tag === 'textarea' || tag === 'input') {
-                        el.value = value;
-                    } else {
-                        el.textContent = value;
+                    const v = String(value || '');
+                    if (tag === 'textarea') {
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                        if (setter) {
+                            setter.call(el, v);
+                        } else {
+                            el.value = v;
+                        }
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return;
                     }
+                    if (tag === 'input') {
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) {
+                            setter.call(el, v);
+                        } else {
+                            el.value = v;
+                        }
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return;
+                    }
+                    // contenteditable / other
+                    el.textContent = v;
                     el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
                 }
                 """,
                 prompt,
             )
             await asyncio.sleep(0.15)
 
+            def _normalize_value(value: str) -> str:
+                return " ".join(str(value or "").split()).strip()
+
+            before_send = _normalize_value(
+                await box.evaluate(
+                    """
+                    (el) => {
+                        const tag = (el.tagName || '').toLowerCase();
+                        if (tag === 'textarea' || tag === 'input') return String(el.value || '');
+                        return String(el.textContent || '');
+                    }
+                    """
+                )
+            )
+
+            # Try explicit send selectors first; fall back to keyboard submission.
             _, send_btn = await self._pick_first_visible_on_page(page, self.send_selectors)
             if send_btn is not None:
                 await send_btn.click(timeout=5000)
             else:
                 await box.press("Enter", timeout=5000)
+
+            async def _box_value() -> str:
+                return _normalize_value(
+                    await box.evaluate(
+                        """
+                        (el) => {
+                            const tag = (el.tagName || '').toLowerCase();
+                            if (tag === 'textarea' || tag === 'input') return String(el.value || '');
+                            return String(el.textContent || '');
+                        }
+                        """
+                    )
+                )
+
+            # Heuristic: most chat UIs clear the input on successful submit.
+            await asyncio.sleep(0.25)
+            after_send = await _box_value()
+            if after_send and before_send and after_send.startswith(before_send[: min(60, len(before_send))]):
+                # Fallback: try platform-specific "send" combos and a DOM-click heuristic.
+                try:
+                    await box.press("Meta+Enter", timeout=2500)
+                except Exception:
+                    pass
+                try:
+                    await box.press("Control+Enter", timeout=2500)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.25)
+                after_send2 = await _box_value()
+                if after_send2 and before_send and after_send2.startswith(before_send[: min(60, len(before_send))]):
+                    clicked = await box.evaluate(
+                        """
+                        (el) => {
+                            const root = el.closest('form') || el.closest('main') || el.parentElement;
+                            if (!root) return false;
+                            const buttons = Array.from(root.querySelectorAll('button')).filter((b) => {
+                                try {
+                                    if (b.disabled) return false;
+                                    if (b.offsetParent === null) return false;
+                                } catch (e) {
+                                    return false;
+                                }
+                                const t = (b.innerText || '').trim();
+                                if (t === 'DeepThink' || t === 'Search') return false;
+                                return true;
+                            });
+                            const candidate = buttons.length ? buttons[buttons.length - 1] : null;
+                            if (!candidate) return false;
+                            candidate.click();
+                            return true;
+                        }
+                        """
+                    )
+                    if clicked:
+                        await asyncio.sleep(0.25)
+                        after_send3 = await _box_value()
+                        if after_send3 and before_send and after_send3.startswith(before_send[: min(60, len(before_send))]):
+                            return False, "prompt_send_no_effect"
+                    else:
+                        return False, "prompt_send_selector_missing"
             return True, ""
         except Exception as exc:
             return False, f"prompt_send_failed:{exc}"
@@ -441,11 +548,21 @@ class PlaywrightWebProvider:
             const codeUnique = dedupe(codeTexts);
             const assistantUnique = dedupe(assistantTexts);
             const genericLast = (assistantUnique.length ? assistantUnique[assistantUnique.length - 1] : '');
+            let mainText = '';
+            try {
+                const main = document.querySelector('main') || document.body;
+                mainText = main && main.innerText ? String(main.innerText || '').trim() : '';
+            } catch (e) {
+                mainText = '';
+            }
+            const maxTail = 20000;
+            const mainTail = (mainText && mainText.length > maxTail) ? mainText.slice(-maxTail) : mainText;
             return {
                 loading: hasLoading,
                 code_blocks: codeUnique,
                 assistant_texts: assistantUnique,
                 generic_last: genericLast,
+                main_tail: mainTail,
                 prompt_echo: promptText,
             };
         }
@@ -463,27 +580,40 @@ class PlaywrightWebProvider:
     def _pick_response_text(probe: dict[str, Any], *, prompt_text: str) -> tuple[str, str]:
         prompt_norm = str(prompt_text or "").strip()
 
-        def _is_prompt_echo(candidate: str) -> bool:
+        def _strip_prompt_echo_prefix(candidate: str) -> str:
             c = str(candidate or "").strip()
             if not c:
-                return True
+                return ""
             if not prompt_norm:
-                return False
+                return c
             if c == prompt_norm:
-                return True
-            return c.startswith(prompt_norm[: min(160, len(prompt_norm))])
+                return ""
+            if c.startswith(prompt_norm):
+                rest = c[len(prompt_norm):].strip()
+                return rest
+            if prompt_norm in c:
+                idx = c.rfind(prompt_norm)
+                rest = c[idx + len(prompt_norm):].strip()
+                if rest:
+                    return rest
+            return c
 
         for txt in reversed(list(probe.get("code_blocks") or [])):
-            s = str(txt or "").strip()
-            if s and not _is_prompt_echo(s):
+            s = _strip_prompt_echo_prefix(txt)
+            if s:
                 return s, "code_block"
         for txt in reversed(list(probe.get("assistant_texts") or [])):
-            s = str(txt or "").strip()
-            if s and not _is_prompt_echo(s):
+            s = _strip_prompt_echo_prefix(txt)
+            if s:
                 return s, "assistant"
         generic = str(probe.get("generic_last") or "").strip()
-        if generic and not _is_prompt_echo(generic):
+        generic = _strip_prompt_echo_prefix(generic)
+        if generic:
             return generic, "generic"
+        tail = str(probe.get("main_tail") or "").strip()
+        tail = _strip_prompt_echo_prefix(tail)
+        if tail:
+            return tail, "main_tail"
         return "", ""
 
     def _infer_trace_dir(self, *, health_file: Path, job_id: str) -> Path | None:
@@ -732,6 +862,16 @@ class PlaywrightWebProvider:
 
         started_at = time.time()
         trace_dir = self._infer_trace_dir(health_file=health_file, job_id=job_id)
+        requested_timeout = payload.get("timeout_seconds")
+        try:
+            requested_timeout_int = int(requested_timeout) if requested_timeout is not None else 0
+        except Exception:
+            requested_timeout_int = 0
+        if requested_timeout_int > 0:
+            # Keep guardrails: too small causes flakiness, too large stalls workflows.
+            timeout_seconds = max(15, min(600, requested_timeout_int))
+        else:
+            timeout_seconds = max(30, int(os.getenv("OPENCLAW_WEB_GATEWAY_TIMEOUT_SECONDS", "180")))
 
         async with self._get_lock():
             require_login = str(os.getenv("OPENCLAW_WEB_GATEWAY_REQUIRE_LOGIN", "0")).strip() == "1"
@@ -742,7 +882,7 @@ class PlaywrightWebProvider:
 
             result = await self._complete_via_browser(
                 prompt,
-                timeout_seconds=max(30, int(os.getenv("OPENCLAW_WEB_GATEWAY_TIMEOUT_SECONDS", "180"))),
+                timeout_seconds=timeout_seconds,
                 new_chat=new_chat,
                 job_id=job_id,
                 session_mode=session_mode,

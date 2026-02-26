@@ -8,3 +8,4 @@
 - Failover order preference: Kimi (`moonshot/kimi-k2.5`) before GLM (`zai/glm-*`) when Codex/Gemini are unavailable.
 - Vision QA preference: use Kimi (Moonshot) for multimodal format checks when Gemini Vision keys are unavailable/restricted.
 - 2026-02-25: Tauri UI slimmed to core loop (Runtime/Jobs/Verify/Logs/KB Health/Glossary/Settings); Verify now covers needs_attention with actionable buttons; Logs supports gateway logs; Settings/KB Health simplified.
+- 2026-02-26: Web gateway status/round notifications now prefer the routed web provider label (e.g. `deepseek-web`) to avoid “DeepSeek never used” confusion when `OPENCLAW_WEB_GATEWAY_MODEL` is set to `chatgpt-web`.

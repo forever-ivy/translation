@@ -12,6 +12,7 @@ from openpyxl import Workbook
 
 from scripts.compose_docx_from_draft import build_doc
 from scripts.docx_preserver import apply_translation_map as apply_docx_translation_map
+from scripts.docx_reflow import reflow_docx_to_english
 from scripts.xlsx_preserver import apply_translation_map as apply_xlsx_translation_map
 
 SYSTEM_DIR_NAME = ".system"
@@ -278,7 +279,16 @@ def write_artifacts(
     if len(docx_entries) >= 2:
         primary_docx = str(docx_entries[0]["path"])
 
-    _write_docx(final_reflow_docx, "Final-Reflow", _text_to_lines(final_reflow_text))
+    reflow_ok = False
+    if docx_sources and primary_docx and Path(primary_docx).suffix.lower() == ".docx":
+        try:
+            reflow_res = reflow_docx_to_english(input_docx=Path(primary_docx), output_docx=final_reflow_docx)
+            reflow_ok = bool(reflow_res.get("ok"))
+        except Exception:
+            reflow_ok = False
+
+    if not reflow_ok:
+        _write_docx(final_reflow_docx, "Final-Reflow", _text_to_lines(final_reflow_text))
 
     review_lines = build_review_brief_lines(
         task_type=task_type,

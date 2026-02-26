@@ -998,14 +998,25 @@ def run_job_pipeline(
         return f"\U0001f504 Round {rd_no} done\nGen({gen_model}): {gen_ok} \u00b7 Review({rev_model}): {rev_ok}"
 
     def _extract_models(rd: dict[str, Any]) -> tuple[str, str]:
+        generator = (rd.get("generator") or {}) if isinstance(rd.get("generator"), dict) else {}
+        reviewer = (rd.get("reviewer") or {}) if isinstance(rd.get("reviewer"), dict) else {}
         gen_model = (
             str(rd.get("generator_model") or "")
-            or str(((rd.get("generator") or {}) if isinstance(rd.get("generator"), dict) else {}).get("model") or "")
+            or str(generator.get("model") or "")
         ).strip() or "unknown"
         rev_model = (
             str(rd.get("review_model") or "")
-            or str(((rd.get("reviewer") or {}) if isinstance(rd.get("reviewer"), dict) else {}).get("model") or "")
+            or str(reviewer.get("model") or "")
         ).strip() or "unknown"
+
+        gen_provider = str(generator.get("provider") or "").strip()
+        rev_provider = str(reviewer.get("provider") or "").strip()
+        gen_agent = str(generator.get("agent_id") or "").strip()
+        rev_agent = str(reviewer.get("agent_id") or "").strip()
+        if gen_agent == "web_gateway" and gen_provider:
+            gen_model = gen_provider.replace("_", "-")
+        if rev_agent == "web_gateway" and rev_provider:
+            rev_model = rev_provider.replace("_", "-")
         return gen_model, rev_model
 
     def _format_models_summary(rd: dict[str, Any]) -> str:

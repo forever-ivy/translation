@@ -674,7 +674,10 @@ class SpreadsheetEtaHeuristicsTest(unittest.TestCase):
             "source": "web_gateway",
         }
         candidates = [{"path": "/tmp/test.xlsx", "name": "test.xlsx", "language": "ar"}]
-        with patch("scripts.openclaw_translation_orchestrator.INTENT_CLASSIFIER_MODE", "web"):
+        with (
+            patch("scripts.openclaw_translation_orchestrator.INTENT_CLASSIFIER_MODE", "web"),
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", True),
+        ):
             result = _llm_intent({"subject": "translate", "message_text": "translate arabic to english"}, candidates)
         self.assertTrue(result.get("ok"))
         self.assertEqual((result.get("intent") or {}).get("task_type"), "SPREADSHEET_TRANSLATION")
@@ -1311,6 +1314,145 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         data = out.get("data") or {}
         self.assertEqual(len(data.get("docx_translation_map") or []), 3)
         self.assertEqual(mocked_agent_call.call_count, 2)
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_docx_batch_backfills_missing_units(self, mocked_agent_call):
+        mocked_agent_call.side_effect = [
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [
+                        {"file": "one.docx", "id": "p:1", "text": "One-1"},
+                    ],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "partial batch",
+                }
+            ),
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [
+                        {"file": "two.docx", "id": "p:1", "text": "Two-1"},
+                    ],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "backfill",
+                }
+            ),
+        ]
+
+        context = {
+            "task_intent": {"task_type": "MULTI_FILE_BATCH"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+            "format_preserve": {
+                "docx_sources": [
+                    {"file": "one.docx", "units": [{"file": "one.docx", "id": "p:1", "text": "a1"}]},
+                    {"file": "two.docx", "units": [{"file": "two.docx", "id": "p:1", "text": "b1"}]},
+                ]
+            },
+        }
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", False),
+            patch("scripts.openclaw_translation_orchestrator.CODEX_FALLBACK_AGENT", ""),
+            patch.dict(
+                os.environ,
+                {
+                    "OPENCLAW_DOCX_BATCH_RETRY": "0",
+                    "OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED": "0",
+                    "OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED": "0",
+                },
+                clear=False,
+            ),
+        ):
+            out = _codex_generate(context, None, [], 1)
+
+        self.assertTrue(out.get("ok"))
+        data = out.get("data") or {}
+        self.assertEqual(len(data.get("docx_translation_map") or []), 2)
+        self.assertEqual(mocked_agent_call.call_count, 2)
+
+    @patch("scripts.openclaw_translation_orchestrator._agent_call")
+    def test_codex_generate_docx_batch_splits_on_json_parse_failure(self, mocked_agent_call):
+        mocked_agent_call.side_effect = [
+            {"ok": True, "agent_id": "mock", "payload": {}, "text": "{"},
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [
+                        {"file": "one.docx", "id": "p:1", "text": "One-1"},
+                    ],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "split a",
+                }
+            ),
+            _agent_ok(
+                {
+                    "final_text": "",
+                    "final_reflow_text": "",
+                    "docx_translation_map": [
+                        {"file": "two.docx", "id": "p:1", "text": "Two-1"},
+                    ],
+                    "xlsx_translation_map": [],
+                    "review_brief_points": [],
+                    "change_log_points": [],
+                    "resolved": [],
+                    "unresolved": [],
+                    "codex_pass": True,
+                    "reasoning_summary": "split b",
+                }
+            ),
+        ]
+
+        context = {
+            "task_intent": {"task_type": "MULTI_FILE_BATCH"},
+            "subject": "Translate",
+            "message_text": "translate",
+            "candidate_files": [],
+            "format_preserve": {
+                "docx_sources": [
+                    {"file": "one.docx", "units": [{"file": "one.docx", "id": "p:1", "text": "a1"}]},
+                    {"file": "two.docx", "units": [{"file": "two.docx", "id": "p:1", "text": "b1"}]},
+                ]
+            },
+        }
+        with (
+            patch("scripts.openclaw_translation_orchestrator.WEB_GATEWAY_ENABLED", False),
+            patch("scripts.openclaw_translation_orchestrator.CODEX_FALLBACK_AGENT", ""),
+            patch.dict(
+                os.environ,
+                {
+                    "OPENCLAW_DOCX_BATCH_RETRY": "0",
+                    "OPENCLAW_GLM_DIRECT_FALLBACK_ENABLED": "0",
+                    "OPENCLAW_KIMI_CODING_DIRECT_FALLBACK_ENABLED": "0",
+                },
+                clear=False,
+            ),
+        ):
+            out = _codex_generate(context, None, [], 1)
+
+        self.assertTrue(out.get("ok"))
+        data = out.get("data") or {}
+        self.assertEqual(len(data.get("docx_translation_map") or []), 2)
+        self.assertEqual(mocked_agent_call.call_count, 3)
 
     @patch("scripts.openclaw_translation_orchestrator._kimi_coding_direct_api_call")
     @patch("scripts.openclaw_translation_orchestrator._agent_call")

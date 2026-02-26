@@ -10,3 +10,4 @@ __pycache__/
 .env
 .env.v4.local
 .claude/settings.local.json
+tmp/docs/
