@@ -244,6 +244,7 @@ OPENCLAW_KB_CONTEXT_MAX_HITS = max(0, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_HIT
 OPENCLAW_KB_CONTEXT_MAX_CHARS = max(120, int(os.getenv("OPENCLAW_KB_CONTEXT_MAX_CHARS", "1200")))
 OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS = max(40, int(os.getenv("OPENCLAW_XLSX_PROMPT_TEXT_MAX_CHARS", "2000")))
 OPENCLAW_DOCX_PROMPT_TEXT_MAX_CHARS = max(80, int(os.getenv("OPENCLAW_DOCX_PROMPT_TEXT_MAX_CHARS", "800")))
+OPENCLAW_DOCX_MISSING_BACKFILL_MAX_UNITS = max(1, int(os.getenv("OPENCLAW_DOCX_MISSING_BACKFILL_MAX_UNITS", "12")))
 OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES = max(100, int(os.getenv("OPENCLAW_PREVIOUS_MAP_MAX_ENTRIES", "1200")))
 OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT = max(1, int(os.getenv("OPENCLAW_XLSX_TRUNCATED_SAMPLE_LIMIT", "50")))
 SOURCE_TRUNCATED_MARKER = str(os.getenv("OPENCLAW_SOURCE_TRUNCATED_MARKER", "[SOURCE TRUNCATED]")).strip() or "[SOURCE TRUNCATED]"
@@ -274,6 +275,7 @@ WEB_LLM_INTENT_PRIMARY_PROVIDER = str(
 ).strip() or "chatgpt_web"
 WEB_LLM_INTENT_FALLBACK_PROVIDER = str(os.getenv("OPENCLAW_WEB_LLM_INTENT_FALLBACK", "")).strip()
 WEB_LLM_SESSION_MODE = str(os.getenv("OPENCLAW_WEB_SESSION_MODE", "per_job")).strip().lower() or "per_job"
+WEB_LLM_REVIEW_FORCE_NEW_CHAT = _env_flag("OPENCLAW_WEB_LLM_REVIEW_FORCE_NEW_CHAT", "1")
 
 def _web_provider_chain(purpose: str) -> list[str]:
     """Return providers to try (primary->fallback), optionally overridden per phase.
@@ -482,6 +484,15 @@ def _validate_format_preserve_coverage(context: dict[str, Any], draft: dict[str,
             meta["docx_missing_sample"] = [
                 {"file": f, "id": uid}
                 for (f, uid) in missing_keys[:8]
+            ]
+            # Provide a broader unit list for retry prompts so the next round can
+            # target all missing ids instead of only a tiny sample.
+            max_units = 20
+            if len(missing_keys) <= 60:
+                max_units = len(missing_keys)
+            meta["docx_missing_units_sample"] = [
+                {"file": f, "id": uid}
+                for (f, uid) in missing_keys[:max_units]
             ]
 
     xlsx_sources = preserve.get("xlsx_sources") if isinstance(preserve.get("xlsx_sources"), list) else []
@@ -1911,6 +1922,43 @@ def _filter_docx_map_for_keys(entries: Any, keys: set[tuple[str, str]], *, defau
         )
         seen.add(key)
     return out
+
+
+def _filter_docx_sources_for_keys(sources: Any, keys: set[tuple[str, str]]) -> list[dict[str, Any]]:
+    """Return docx_sources narrowed to the requested (file,id) keys."""
+    if not isinstance(sources, list) or not keys:
+        return []
+    filtered: list[dict[str, Any]] = []
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        file_name = str(src.get("file") or "").strip()
+        units = src.get("units")
+        if not isinstance(units, list):
+            continue
+        keep_units: list[dict[str, Any]] = []
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("id") or unit.get("unit_id") or unit.get("block_id") or unit.get("cell_id") or "").strip()
+            unit_file = str(unit.get("file") or file_name).strip()
+            if not unit_id or not unit_file:
+                continue
+            key = _normalize_docx_key(unit_file, unit_id)
+            if key not in keys:
+                continue
+            unit_copy = dict(unit)
+            unit_copy["file"] = unit_file
+            unit_copy["id"] = unit_id
+            keep_units.append(unit_copy)
+        if not keep_units:
+            continue
+        src_copy = dict(src)
+        if not str(src_copy.get("file") or "").strip():
+            src_copy["file"] = file_name or str(keep_units[0].get("file") or "").strip()
+        src_copy["units"] = keep_units
+        filtered.append(src_copy)
+    return filtered
 
 
 def _docx_backfill_plan(
@@ -4482,7 +4530,12 @@ Rules:
                 operation_id=op_id,
                 round_index=int(round_index),
                 strict_mode=strict_gateway_mode,
-                new_chat=(WEB_LLM_SESSION_MODE in {"per_request", "per-request", "new_chat", "new-chat"}),
+                # Review prompts include full context and candidate payload; a fresh chat
+                # avoids stale assistant code-block extraction from prior generation turns.
+                new_chat=(
+                    WEB_LLM_REVIEW_FORCE_NEW_CHAT
+                    or (WEB_LLM_SESSION_MODE in {"per_request", "per-request", "new_chat", "new-chat"})
+                ),
             )
             if not gw.get("ok"):
                 last_failure = gw
@@ -6151,7 +6204,9 @@ def run(
                         f"xlsx_truncated_cells_need_complete_translation:{json.dumps(xlsx_truncated, ensure_ascii=False)}"
                     )
 
-                docx_sample = preserve_meta.get("docx_missing_sample")
+                docx_sample = preserve_meta.get("docx_missing_units_sample")
+                if not isinstance(docx_sample, list) or not docx_sample:
+                    docx_sample = preserve_meta.get("docx_missing_sample")
                 if isinstance(docx_sample, list) and docx_sample:
                     hints.append(f"docx_missing_sample:{json.dumps(docx_sample, ensure_ascii=False)}")
 
@@ -6167,6 +6222,93 @@ def run(
                 vision_in_round=vision_in_round,
             )
             hard_retry_hints = _hard_gate_retry_hints(hard_meta)
+
+            preserve_gate = hard_meta.get("preserve_coverage") if isinstance(hard_meta.get("preserve_coverage"), dict) else {}
+            preserve_gate_meta = preserve_gate.get("meta") if isinstance(preserve_gate.get("meta"), dict) else {}
+            docx_missing_units = preserve_gate_meta.get("docx_missing_units_sample")
+            has_docx_missing = any(str(item).startswith("docx_translation_map_incomplete:") for item in hard_findings)
+            if (
+                has_docx_missing
+                and isinstance(docx_missing_units, list)
+                and 0 < len(docx_missing_units) <= OPENCLAW_DOCX_MISSING_BACKFILL_MAX_UNITS
+            ):
+                missing_keys: set[tuple[str, str]] = set()
+                for item in docx_missing_units:
+                    if not isinstance(item, dict):
+                        continue
+                    file_name = str(item.get("file") or "").strip()
+                    unit_id = str(item.get("id") or "").strip()
+                    if file_name and unit_id:
+                        missing_keys.add(_normalize_docx_key(file_name, unit_id))
+
+                preserve_ctx = execution_context.get("format_preserve")
+                sources_ctx = preserve_ctx.get("docx_sources") if isinstance(preserve_ctx, dict) else None
+                filtered_sources = _filter_docx_sources_for_keys(sources_ctx, missing_keys)
+                if missing_keys and filtered_sources:
+                    before_expected = int(preserve_gate_meta.get("docx_expected", 0) or 0)
+                    before_got = int(preserve_gate_meta.get("docx_got", 0) or 0)
+                    before_missing = max(0, before_expected - before_got)
+
+                    backfill_context = copy.deepcopy(execution_context)
+                    backfill_preserve = (
+                        backfill_context.get("format_preserve")
+                        if isinstance(backfill_context.get("format_preserve"), dict)
+                        else {}
+                    )
+                    if not isinstance(backfill_preserve, dict):
+                        backfill_preserve = {}
+                    backfill_preserve["docx_sources"] = filtered_sources
+                    backfill_preserve.pop("xlsx_sources", None)
+                    backfill_context["format_preserve"] = backfill_preserve
+
+                    missing_hint = json.dumps(docx_missing_units, ensure_ascii=False)
+                    backfill_findings = _fix_findings_for_retry()
+                    backfill_findings.append(
+                        "docx_missing_units_backfill_only: return docx_translation_map for every listed (file,id)."
+                    )
+                    backfill_findings.append(f"docx_missing_sample:{missing_hint}")
+                    backfill_findings.append(
+                        "Do not skip headings, notes, or page labels; translate them too."
+                    )
+
+                    backfill_attempt: dict[str, Any] = {
+                        "type": "docx_missing_units_backfill",
+                        "requested_units": len(missing_keys),
+                        "before_missing": before_missing,
+                    }
+                    backfill_out = _codex_generate(backfill_context, selected_draft, backfill_findings, round_idx)
+                    if backfill_out.get("ok"):
+                        merged = _preserve_nonempty_translation_maps(selected_draft, backfill_out.get("data") or {})
+                        selected_draft = merged
+                        hard_findings, hard_warnings, hard_meta = _compute_hard_gates(
+                            review_dir=review_dir,
+                            context=execution_context,
+                            draft=selected_draft,
+                            round_idx=round_idx,
+                            disallow_markdown=disallow_markdown,
+                            vision_in_round=vision_in_round,
+                        )
+                        hard_retry_hints = _hard_gate_retry_hints(hard_meta)
+                        after_preserve = (
+                            hard_meta.get("preserve_coverage")
+                            if isinstance(hard_meta.get("preserve_coverage"), dict)
+                            else {}
+                        )
+                        after_meta = after_preserve.get("meta") if isinstance(after_preserve.get("meta"), dict) else {}
+                        after_expected = int(after_meta.get("docx_expected", 0) or 0)
+                        after_got = int(after_meta.get("docx_got", 0) or 0)
+                        after_missing = max(0, after_expected - after_got)
+                        backfill_attempt["ok"] = True
+                        backfill_attempt["after_missing"] = after_missing
+                        if after_missing < before_missing:
+                            did_fix = True
+                        backfill_meta = backfill_out.get("call_meta")
+                        if isinstance(backfill_meta, dict) and backfill_meta:
+                            selected_generator_meta = {**selected_generator_meta, **backfill_meta}
+                    else:
+                        backfill_attempt["ok"] = False
+                        backfill_attempt["error"] = str(backfill_out.get("error") or "docx_backfill_failed")
+                    hard_fix_attempts.append(backfill_attempt)
 
             candidate_refs: dict[str, str] = {}
             review_refs: dict[str, str] = {}

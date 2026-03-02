@@ -23,6 +23,7 @@ from scripts.openclaw_translation_orchestrator import (
     _codex_generate,
     _gemini_review,
     _estimate_spreadsheet_minutes_from_candidates,
+    _filter_docx_sources_for_keys,
     _infer_language_pair_from_context,
     _llm_intent,
     _trim_xlsx_prompt_text,
@@ -998,6 +999,33 @@ class PromptCompactionHelpersTest(unittest.TestCase):
         self.assertEqual(meta.get("docx_expected"), 2)
         self.assertEqual(meta.get("docx_got"), 1)
         self.assertEqual((meta.get("docx_missing_sample") or [])[0].get("file"), "two.docx")
+        self.assertEqual(len(meta.get("docx_missing_units_sample") or []), 1)
+        self.assertEqual((meta.get("docx_missing_units_sample") or [])[0].get("id"), "p:1")
+
+    def test_filter_docx_sources_for_keys_keeps_only_requested_units(self):
+        sources = [
+            {
+                "file": "a.docx",
+                "units": [
+                    {"id": "p:1", "text": "one"},
+                    {"id": "p:2", "text": "two"},
+                ],
+            },
+            {
+                "file": "b.docx",
+                "units": [
+                    {"id": "p:1", "text": "alpha"},
+                    {"id": "p:2", "text": "beta"},
+                ],
+            },
+        ]
+        keys = {("a.docx", "p:2"), ("b.docx", "p:1")}
+        filtered = _filter_docx_sources_for_keys(sources, keys)
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(len(filtered[0].get("units") or []), 1)
+        self.assertEqual(len(filtered[1].get("units") or []), 1)
+        self.assertEqual((filtered[0]["units"][0]).get("id"), "p:2")
+        self.assertEqual((filtered[1]["units"][0]).get("id"), "p:1")
 
 
 class XlsxBackfillPlanTest(unittest.TestCase):
@@ -1968,6 +1996,8 @@ class CodexGenerateFallbackTest(unittest.TestCase):
         self.assertTrue(out.get("ok"))
         self.assertEqual(mocked_gateway.call_count, 2)
         self.assertEqual((out.get("call_meta") or {}).get("provider"), "chatgpt_web")
+        for c in mocked_gateway.call_args_list:
+            self.assertTrue(c.kwargs.get("new_chat"), "review must use isolated chat to avoid stale extraction")
 
     @patch("scripts.openclaw_translation_orchestrator.write_artifacts")
     @patch("scripts.openclaw_translation_orchestrator._build_execution_context")
