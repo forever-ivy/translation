@@ -3974,7 +3974,8 @@ Rules:
                         break
                     parse_failed = err in {"codex_json_parse_failed", "gateway_bad_payload"} or err.startswith("gateway_bad_payload:")
                     parse_failed = parse_failed and ("format_contract_failed" not in err)
-                    if len(chunk_units) > 1 and parse_failed and (
+                    has_json_hints = ("{" in raw_text) or ("[" in raw_text)
+                    if len(chunk_units) > 1 and parse_failed and has_json_hints and (
                         _looks_like_truncated_json(raw_text) or "json" in detail.lower() or "expecting" in detail.lower()
                     ):
                         split_and_requeue = True
@@ -4710,9 +4711,17 @@ def _looks_like_truncated_json(text: str) -> bool:
 
 def _map_gateway_error(error_type: str, detail: str = "") -> str:
     token = str(error_type or "").strip().lower()
-    if token in {"gateway_unavailable", "gateway_login_required", "gateway_timeout", "gateway_bad_payload"}:
+    if token in {
+        "gateway_unavailable",
+        "gateway_login_required",
+        "gateway_timeout",
+        "gateway_bad_payload",
+        "gateway_human_check_required",
+    }:
         return token
     merged = f"{token}:{detail}".lower()
+    if any(t in merged for t in ("captcha", "cloudflare", "hcaptcha", "recaptcha", "verify you are human", "robot")):
+        return "gateway_human_check_required"
     if "login" in merged or "auth" in merged:
         return "gateway_login_required"
     if "timeout" in merged:

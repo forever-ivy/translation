@@ -344,7 +344,7 @@ class PlaywrightWebProvider:
                 await self._primary_page.goto(self.state.home_url, wait_until="domcontentloaded", timeout=45000)
                 await self._primary_page.wait_for_timeout(1200)
                 selector_probe: dict[str, bool] = {}
-                for sel in self.prompt_selectors + self.send_selectors + self.loading_selectors:
+                for sel in self.prompt_selectors + self.send_selectors + self.loading_selectors + self.assistant_selectors:
                     try:
                         selector_probe[sel] = bool(await self._primary_page.locator(sel).count() > 0)
                     except Exception:
@@ -504,15 +504,44 @@ class PlaywrightWebProvider:
             return False, f"prompt_send_failed:{exc}"
 
     async def _response_probe(self, page: Any, *, prompt_text: str) -> dict[str, Any]:
+        main_tail_chars = 80000
+        try:
+            main_tail_chars = int(os.getenv("OPENCLAW_WEB_GATEWAY_MAIN_TAIL_CHARS", str(main_tail_chars)) or main_tail_chars)
+        except Exception:
+            main_tail_chars = 80000
+        main_tail_chars = max(5000, min(300000, main_tail_chars))
+
         js = """
         (args) => {
             const promptText = args && args.promptText ? args.promptText : '';
             const loadingSelectors = (args && Array.isArray(args.loadingSelectors)) ? args.loadingSelectors : [];
             const assistantSelectors = (args && Array.isArray(args.assistantSelectors)) ? args.assistantSelectors : [];
+            const mainTailChars = (args && typeof args.mainTailChars === 'number') ? args.mainTailChars : 80000;
+
+            const isVisible = (el) => {
+                try {
+                    if (!el) return false;
+                    const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+                    if (style) {
+                        if (style.display === 'none' || style.visibility === 'hidden') return false;
+                        const opacity = parseFloat(style.opacity || '1');
+                        if (!Number.isNaN(opacity) && opacity <= 0.01) return false;
+                    }
+                    const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                    if (rect && rect.width > 1 && rect.height > 1) return true;
+                    // offsetParent can be null for position:fixed; treat it as a weak signal.
+                    if (el.offsetParent !== null) return true;
+                    const t = (el.innerText || '').trim();
+                    return !!t;
+                } catch (e) {
+                    return false;
+                }
+            };
 
             const hasLoading = loadingSelectors.some((sel) => {
                 try {
-                    return !!document.querySelector(sel);
+                    const nodes = Array.from(document.querySelectorAll(sel));
+                    return nodes.some(isVisible);
                 } catch (e) {
                     return false;
                 }
@@ -523,13 +552,39 @@ class PlaywrightWebProvider:
                 .map((n) => (n && n.innerText ? n.innerText.trim() : ''))
                 .filter(Boolean);
 
-            const assistantNodes = [];
+            const assistantNodesRaw = [];
             for (const sel of assistantSelectors) {
                 try {
-                    assistantNodes.push(...Array.from(document.querySelectorAll(sel)));
+                    assistantNodesRaw.push(...Array.from(document.querySelectorAll(sel)));
                 } catch (e) {}
             }
+
+            const normalizeAssistantNode = (node) => {
+                try {
+                    if (!node) return null;
+                    if (node.matches && node.matches("[data-message-author-role='assistant']")) return node;
+                    if (node.querySelector) {
+                        const child = node.querySelector("[data-message-author-role='assistant']");
+                        if (child) return child;
+                    }
+                } catch (e) {}
+                return node;
+            };
+
+            const assistantNodes = assistantNodesRaw.map(normalizeAssistantNode).filter(Boolean);
             const assistantTexts = assistantNodes
+                .map((n) => (n && n.innerText ? n.innerText.trim() : ''))
+                .filter(Boolean)
+                .slice(-8);
+
+            const assistantCodeNodes = [];
+            for (const node of assistantNodes) {
+                try {
+                    if (!node || !node.querySelectorAll) continue;
+                    assistantCodeNodes.push(...Array.from(node.querySelectorAll('pre code, pre, code')));
+                } catch (e) {}
+            }
+            const assistantCodeTexts = assistantCodeNodes
                 .map((n) => (n && n.innerText ? n.innerText.trim() : ''))
                 .filter(Boolean)
                 .slice(-8);
@@ -547,6 +602,7 @@ class PlaywrightWebProvider:
 
             const codeUnique = dedupe(codeTexts);
             const assistantUnique = dedupe(assistantTexts);
+            const assistantCodeUnique = dedupe(assistantCodeTexts);
             const genericLast = (assistantUnique.length ? assistantUnique[assistantUnique.length - 1] : '');
             let mainText = '';
             try {
@@ -555,14 +611,39 @@ class PlaywrightWebProvider:
             } catch (e) {
                 mainText = '';
             }
-            const maxTail = 20000;
+
+            let maxTail = 80000;
+            try {
+                if (typeof mainTailChars === 'number' && mainTailChars > 0) {
+                    maxTail = Math.max(5000, Math.min(300000, Math.floor(mainTailChars)));
+                }
+            } catch (e) {}
+
             const mainTail = (mainText && mainText.length > maxTail) ? mainText.slice(-maxTail) : mainText;
+
+            const humanCheckTokens = [
+                "verify you are human",
+                "are you a robot",
+                "robot check",
+                "captcha",
+                "cloudflare",
+                "hcaptcha",
+                "recaptcha",
+                "attention required",
+                "access denied",
+                "checking your browser",
+            ];
+            const mainLower = String(mainTail || '').toLowerCase();
+            const humanCheck = humanCheckTokens.some((t) => mainLower.includes(t));
+
             return {
                 loading: hasLoading,
                 code_blocks: codeUnique,
+                assistant_code_blocks: assistantCodeUnique,
                 assistant_texts: assistantUnique,
                 generic_last: genericLast,
                 main_tail: mainTail,
+                human_check: humanCheck,
                 prompt_echo: promptText,
             };
         }
@@ -573,12 +654,18 @@ class PlaywrightWebProvider:
                 "promptText": prompt_text,
                 "loadingSelectors": self.loading_selectors,
                 "assistantSelectors": self.assistant_selectors,
+                "mainTailChars": main_tail_chars,
             },
         )
 
     @staticmethod
     def _pick_response_text(probe: dict[str, Any], *, prompt_text: str) -> tuple[str, str]:
         prompt_norm = str(prompt_text or "").strip()
+        prompt_compact = " ".join(prompt_norm.split())
+        tail_compact_chars = 300
+        prompt_tail_compact = (
+            prompt_compact[-tail_compact_chars:] if prompt_compact and len(prompt_compact) > tail_compact_chars else prompt_compact
+        )
 
         def _strip_prompt_echo_prefix(candidate: str) -> str:
             c = str(candidate or "").strip()
@@ -586,7 +673,14 @@ class PlaywrightWebProvider:
                 return ""
             if not prompt_norm:
                 return c
-            if c == prompt_norm:
+            c_compact = " ".join(c.split())
+            if c_compact == prompt_compact:
+                return ""
+            # If the candidate is fully contained in the prompt (often the tail of our rules/schema),
+            # it's almost certainly prompt echo (not an assistant response).
+            if c_compact and c_compact in prompt_compact:
+                return ""
+            if prompt_tail_compact and c_compact and c_compact in prompt_tail_compact:
                 return ""
             if c.startswith(prompt_norm):
                 rest = c[len(prompt_norm):].strip()
@@ -598,14 +692,18 @@ class PlaywrightWebProvider:
                     return rest
             return c
 
-        for txt in reversed(list(probe.get("code_blocks") or [])):
+        for txt in reversed(list(probe.get("assistant_code_blocks") or [])):
             s = _strip_prompt_echo_prefix(txt)
             if s:
-                return s, "code_block"
+                return s, "assistant_code_block"
         for txt in reversed(list(probe.get("assistant_texts") or [])):
             s = _strip_prompt_echo_prefix(txt)
             if s:
                 return s, "assistant"
+        for txt in reversed(list(probe.get("code_blocks") or [])):
+            s = _strip_prompt_echo_prefix(txt)
+            if s:
+                return s, "code_block"
         generic = str(probe.get("generic_last") or "").strip()
         generic = _strip_prompt_echo_prefix(generic)
         if generic:
@@ -615,6 +713,32 @@ class PlaywrightWebProvider:
         if tail:
             return tail, "main_tail"
         return "", ""
+
+    @staticmethod
+    def _summarize_probe(probe: Any) -> dict[str, Any]:
+        if not isinstance(probe, dict):
+            return {}
+        raw = probe.get("raw") if isinstance(probe.get("raw"), dict) else probe
+        if not isinstance(raw, dict):
+            raw = {}
+
+        def _count_list(key: str) -> int:
+            value = raw.get(key)
+            return len(value) if isinstance(value, list) else 0
+
+        def _len_str(key: str) -> int:
+            value = raw.get(key)
+            return len(value) if isinstance(value, str) else 0
+
+        return {
+            "loading": bool(raw.get("loading", False)),
+            "human_check": bool(raw.get("human_check", False)),
+            "assistant_texts": _count_list("assistant_texts"),
+            "assistant_code_blocks": _count_list("assistant_code_blocks"),
+            "code_blocks": _count_list("code_blocks"),
+            "generic_last_len": _len_str("generic_last"),
+            "main_tail_len": _len_str("main_tail"),
+        }
 
     def _infer_trace_dir(self, *, health_file: Path, job_id: str) -> Path | None:
         if not _truthy_env("OPENCLAW_WEB_GATEWAY_TRACE", "1"):
@@ -769,6 +893,7 @@ class PlaywrightWebProvider:
                 last_text = ""
                 last_method = ""
                 last_probe: dict[str, Any] = {}
+                human_check_detected = False
 
                 while time.time() < deadline:
                     try:
@@ -779,6 +904,9 @@ class PlaywrightWebProvider:
                         probe = {"loading": True, "code_blocks": [], "assistant_texts": [], "generic_last": ""}
                     last_probe = probe
                     loading = bool(probe.get("loading", False))
+                    if bool(probe.get("human_check", False)):
+                        human_check_detected = True
+                        break
                     candidate, method = self._pick_response_text(probe, prompt_text=prompt)
                     if candidate and candidate == last_text:
                         stable_hits += 1
@@ -814,6 +942,16 @@ class PlaywrightWebProvider:
                 except Exception:
                     pass
 
+                if human_check_detected:
+                    return {
+                        "ok": False,
+                        "error": "gateway_human_check_required",
+                        "detail": "human_check_detected",
+                        "extract_method": "human_check",
+                        "probe": {"loading": bool(last_probe.get("loading", False)), "stable_hits": stable_hits, "raw": last_probe},
+                        "url": url,
+                        "screenshot_path": screenshot_path,
+                    }
                 if last_text:
                     return {
                         "ok": True,
@@ -823,7 +961,15 @@ class PlaywrightWebProvider:
                         "url": url,
                         "screenshot_path": screenshot_path,
                     }
-                return {"ok": False, "error": "gateway_timeout", "detail": "response_timeout_no_extractable_text"}
+                return {
+                    "ok": False,
+                    "error": "gateway_timeout",
+                    "detail": "response_timeout_no_extractable_text",
+                    "extract_method": last_method or "timeout_last",
+                    "probe": {"loading": bool(last_probe.get("loading", False)), "stable_hits": stable_hits, "raw": last_probe},
+                    "url": url,
+                    "screenshot_path": screenshot_path,
+                }
             except Exception as exc:
                 try:
                     if new_chat:
@@ -854,6 +1000,7 @@ class PlaywrightWebProvider:
         job_id = str(payload.get("job_id") or "").strip()
         round_id = payload.get("round")
         batch_id = str(payload.get("batch_id") or "").strip()
+        model = str(payload.get("model") or self.state.model or self.state.provider)
 
         session_mode = str(os.getenv("OPENCLAW_WEB_SESSION_MODE", "per_job")).strip().lower() or "per_job"
         new_chat = bool(payload.get("new_chat", False))
@@ -890,12 +1037,65 @@ class PlaywrightWebProvider:
                 operation_id=operation_id,
             )
             if not result.get("ok"):
+                error = str(result.get("error") or "gateway_unavailable")
+                detail = result.get("detail")
+                extract_method = str(result.get("extract_method") or "unknown")
+                probe_summary = self._summarize_probe(result.get("probe"))
+                elapsed_ms = int((time.time() - started_at) * 1000)
+                gateway_meta = {
+                    "provider": self.state.provider,
+                    "site": ("deepseek" if self.state.provider == PROVIDER_DEEPSEEK_WEB else "chatgpt"),
+                    "session_state": {"logged_in": bool(self.state.logged_in), "healthy": False},
+                    "extract_method": extract_method,
+                    "probe_summary": probe_summary,
+                    "marker_validation": {"applied": False, "attempts": 0, "ok": False},
+                    "elapsed_ms": elapsed_ms,
+                    "operation_id": operation_id,
+                    "job_id": job_id,
+                    "round": round_id,
+                    "batch_id": batch_id,
+                    "strict_mode": strict_mode,
+                    "page_url": str(result.get("url") or self.state.last_url or ""),
+                    "screenshot_path": str(result.get("screenshot_path") or ""),
+                    "error": error,
+                    "detail": detail,
+                }
+
+                if trace_dir:
+                    try:
+                        trace_dir.mkdir(parents=True, exist_ok=True)
+                        call_path = trace_dir / f"{int(time.time())}_{operation_id}.json"
+                        trace_payload: dict[str, Any] = {
+                            "ts": _utc_now(),
+                            "provider": self.state.provider,
+                            "job_id": job_id,
+                            "operation_id": operation_id,
+                            "round": round_id,
+                            "batch_id": batch_id,
+                            "model": model,
+                            "new_chat": bool(new_chat),
+                            "strict_mode": bool(strict_mode),
+                            "prompt": prompt,
+                            "raw_text": "",
+                            "final_text": "",
+                            "error": error,
+                            "detail": detail,
+                            "meta": gateway_meta,
+                        }
+                        if _truthy_env("OPENCLAW_WEB_GATEWAY_TRACE_PROBE_RAW", "0"):
+                            trace_payload["probe"] = result.get("probe")
+                        call_path.write_text(json.dumps(trace_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+
                 self.state.healthy = False
-                self.state.last_error = str(result.get("error") or "gateway_unavailable")
+                self.state.last_error = error
+                self.state.updated_at = _utc_now()
                 return result
 
             raw_text = str(result.get("text") or "").strip()
             extract_method = str(result.get("extract_method") or "unknown")
+            probe_summary = self._summarize_probe(result.get("probe"))
             marker_validation: dict[str, Any] = {"applied": bool(format_contract), "attempts": 1, "ok": True}
 
             final_text = raw_text
@@ -942,7 +1142,6 @@ class PlaywrightWebProvider:
         self.state.healthy = True
         self.state.last_error = ""
         self.state.updated_at = _utc_now()
-        model = str(payload.get("model") or self.state.model or self.state.provider)
         now_ts = int(time.time())
         elapsed_ms = int((time.time() - started_at) * 1000)
         gateway_meta = {
@@ -950,6 +1149,7 @@ class PlaywrightWebProvider:
             "site": ("deepseek" if self.state.provider == PROVIDER_DEEPSEEK_WEB else "chatgpt"),
             "session_state": {"logged_in": bool(self.state.logged_in), "healthy": bool(self.state.healthy)},
             "extract_method": extract_method,
+            "probe_summary": probe_summary,
             "marker_validation": marker_validation,
             "elapsed_ms": elapsed_ms,
             "operation_id": operation_id,
@@ -965,23 +1165,26 @@ class PlaywrightWebProvider:
             try:
                 trace_dir.mkdir(parents=True, exist_ok=True)
                 call_path = trace_dir / f"{int(time.time())}_{operation_id}.json"
+                trace_payload: dict[str, Any] = {
+                    "ts": _utc_now(),
+                    "provider": self.state.provider,
+                    "job_id": job_id,
+                    "operation_id": operation_id,
+                    "round": round_id,
+                    "batch_id": batch_id,
+                    "model": model,
+                    "new_chat": bool(new_chat),
+                    "strict_mode": bool(strict_mode),
+                    "prompt": prompt,
+                    "raw_text": raw_text,
+                    "final_text": final_text,
+                    "meta": gateway_meta,
+                }
+                if _truthy_env("OPENCLAW_WEB_GATEWAY_TRACE_PROBE_RAW", "0"):
+                    trace_payload["probe"] = result.get("probe")
                 call_path.write_text(
                     json.dumps(
-                        {
-                            "ts": _utc_now(),
-                            "provider": self.state.provider,
-                            "job_id": job_id,
-                            "operation_id": operation_id,
-                            "round": round_id,
-                            "batch_id": batch_id,
-                            "model": model,
-                            "new_chat": bool(new_chat),
-                            "strict_mode": bool(strict_mode),
-                            "prompt": prompt,
-                            "raw_text": raw_text,
-                            "final_text": final_text,
-                            "meta": gateway_meta,
-                        },
+                        trace_payload,
                         ensure_ascii=False,
                         indent=2,
                     ),
