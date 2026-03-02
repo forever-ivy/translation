@@ -1639,6 +1639,131 @@ def send_telegram_direct(*, chat_id: str, message: str, bot_token: str) -> dict[
         return {"ok": False, "description": str(exc)}
 
 
+def send_telegram_document_direct(*, chat_id: str, media_path: str, caption: str, bot_token: str) -> dict[str, Any]:
+    """Send a document directly via Telegram Bot API (no OpenClaw)."""
+    import mimetypes
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    if not bot_token:
+        return {"ok": False, "error": "no_bot_token"}
+    file_path = Path(str(media_path or "")).expanduser().resolve()
+    if not file_path.exists() or not file_path.is_file():
+        return {"ok": False, "error": f"missing_media:{file_path}"}
+
+    boundary = f"----OpenClawBoundary{uuid.uuid4().hex}"
+    mime_type, _ = mimetypes.guess_type(file_path.name)
+    mime_type = mime_type or "application/octet-stream"
+    safe_caption = str(caption or "")
+    if len(safe_caption) > 1024:
+        safe_caption = safe_caption[:1024]
+
+    body_parts: list[bytes] = []
+
+    def _add_field(name: str, value: str) -> None:
+        body_parts.append(f"--{boundary}\r\n".encode("utf-8"))
+        body_parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body_parts.append(str(value).encode("utf-8"))
+        body_parts.append(b"\r\n")
+
+    _add_field("chat_id", chat_id)
+    if safe_caption:
+        _add_field("caption", safe_caption)
+    body_parts.append(f"--{boundary}\r\n".encode("utf-8"))
+    body_parts.append(
+        (
+            f'Content-Disposition: form-data; name="document"; filename="{file_path.name}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    body_parts.append(file_path.read_bytes())
+    body_parts.append(b"\r\n")
+    body_parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(body_parts)
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return {"ok": data.get("ok", False), "response": data}
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        return {"ok": False, "error_code": exc.code, "description": err}
+    except (urllib.error.URLError, OSError) as exc:
+        return {"ok": False, "description": str(exc)}
+
+
+def send_media(
+    *,
+    target: str,
+    media_path: str,
+    message: str = "",
+    channel: str = DEFAULT_NOTIFY_CHANNEL,
+    account: str = DEFAULT_NOTIFY_ACCOUNT,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    direct_mode = os.getenv("TELEGRAM_DIRECT_MODE") == "1"
+    media = Path(str(media_path or "")).expanduser()
+    if not media.exists() or not media.is_file():
+        return {"ok": False, "error": f"missing_media:{media}"}
+
+    if direct_mode and channel == "telegram" and not dry_run and token:
+        return send_telegram_document_direct(
+            chat_id=target,
+            media_path=str(media.resolve()),
+            caption=message,
+            bot_token=token,
+        )
+
+    openclaw_bin = shutil.which("openclaw")
+    if not openclaw_bin:
+        if channel == "telegram" and not dry_run and token:
+            return send_telegram_document_direct(
+                chat_id=target,
+                media_path=str(media.resolve()),
+                caption=message,
+                bot_token=token,
+            )
+        if dry_run:
+            return {"ok": True, "dry_run": True, "stdout": "", "stderr": "openclaw command not found"}
+        return {"ok": False, "stderr": "openclaw command not found", "stdout": ""}
+
+    cmd = [
+        openclaw_bin,
+        "message",
+        "send",
+        "--channel",
+        channel,
+        "--account",
+        account,
+        "--target",
+        target,
+        "--media",
+        str(media.resolve()),
+        "--json",
+    ]
+    msg = str(message or "").strip()
+    if msg:
+        cmd.extend(["--message", msg])
+    if dry_run:
+        cmd.append("--dry-run")
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    payload: dict[str, Any] = {"ok": proc.returncode == 0, "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()}
+    if proc.stdout.strip().startswith("{"):
+        try:
+            payload["response"] = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            pass
+    return payload
+
+
 def send_message(
     *,
     target: str,

@@ -41,6 +41,7 @@ from scripts.v4_runtime import (
     resolve_rag_collection,
     search_memories,
     set_sender_active_job,
+    send_media,
     send_message,
     update_job_plan,
     update_job_result,
@@ -330,12 +331,20 @@ def _recall_cross_job_context(conn, *, company: str, query: str) -> list[dict[st
 
 
 def _read_change_log_points(*, review_dir: Path, limit: int = 12) -> list[str]:
-    path = Path(review_dir) / "Change Log.md"
-    if not path.exists():
-        return []
-    try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
+    candidates = [
+        Path(review_dir) / ".system" / "change_log.md",
+        Path(review_dir) / "Change Log.md",
+    ]
+    lines: list[str] = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            break
+        except OSError:
+            continue
+    if not lines:
         return []
     points = []
     for line in lines:
@@ -348,6 +357,139 @@ def _read_change_log_points(*, review_dir: Path, limit: int = 12) -> list[str]:
         if len(points) >= max(1, int(limit)):
             break
     return points
+
+
+def _collect_delivery_files(*, artifacts: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+
+    def _add(kind: str, path_value: str, *, source_path: str = "", name: str = "") -> None:
+        raw = str(path_value or "").strip()
+        if not raw:
+            return
+        path = Path(raw).expanduser().resolve()
+        if not path.exists() or not path.is_file():
+            return
+        out.append(
+            {
+                "kind": str(kind or "").strip() or "file",
+                "path": str(path),
+                "name": str(name or path.name),
+                "source_path": str(source_path or ""),
+            }
+        )
+
+    for item in (artifacts.get("delivery_files") or []):
+        if not isinstance(item, dict):
+            continue
+        _add(
+            str(item.get("kind") or "file"),
+            str(item.get("path") or ""),
+            source_path=str(item.get("source_path") or ""),
+            name=str(item.get("name") or ""),
+        )
+
+    for entry in (artifacts.get("docx_files") or []):
+        if not isinstance(entry, dict):
+            continue
+        source_path = str(entry.get("source_path") or "")
+        _add("final_docx", str(entry.get("path") or ""), source_path=source_path, name=str(entry.get("name") or ""))
+        _add("bilingual_docx", str(entry.get("bilingual_path") or ""), source_path=source_path)
+
+    for entry in (artifacts.get("xlsx_files") or []):
+        if not isinstance(entry, dict):
+            continue
+        source_path = str(entry.get("source_path") or "")
+        _add("final_xlsx", str(entry.get("path") or ""), source_path=source_path, name=str(entry.get("name") or ""))
+        _add("bilingual_xlsx", str(entry.get("bilingual_path") or ""), source_path=source_path)
+
+    _add("final_docx", str(artifacts.get("final_docx") or ""))
+    _add("bilingual_docx", str(artifacts.get("bilingual_docx") or ""))
+    _add("final_xlsx", str(artifacts.get("final_xlsx") or ""))
+    _add("bilingual_xlsx", str(artifacts.get("bilingual_xlsx") or ""))
+
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in out:
+        p = str(item.get("path") or "").strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        deduped.append(item)
+    return deduped
+
+
+def _send_delivery_files(
+    *,
+    paths: RuntimePaths,
+    conn,
+    job_id: str,
+    task_name: str,
+    target: str,
+    dry_run: bool,
+    delivery_files: list[dict[str, str]],
+) -> dict[str, Any]:
+    attempted = 0
+    sent: list[str] = []
+    failed: list[dict[str, Any]] = []
+    for item in delivery_files:
+        file_path = str(item.get("path") or "").strip()
+        if not file_path:
+            continue
+        attempted += 1
+        send_result = send_media(
+            target=target,
+            media_path=file_path,
+            message="",
+            dry_run=dry_run,
+        )
+        if bool(send_result.get("ok")):
+            sent.append(file_path)
+        else:
+            failed.append(
+                {
+                    "path": file_path,
+                    "name": str(item.get("name") or Path(file_path).name),
+                    "kind": str(item.get("kind") or ""),
+                    "send_result": send_result,
+                }
+            )
+
+    summary = {
+        "attempted": attempted,
+        "sent": len(sent),
+        "failed": len(failed),
+        "sent_paths": sent,
+        "failed_items": failed,
+    }
+    if attempted <= 0:
+        return summary
+
+    milestone = "delivery_sent" if not failed else "delivery_partial_failed"
+    record_event(
+        conn,
+        job_id=job_id,
+        milestone=milestone,
+        payload={"target": target, "summary": summary},
+    )
+    append_log(paths, "events.log", f"{milestone}\t{job_id}\t{summary}")
+
+    if failed:
+        failed_names = ", ".join(item["name"] for item in failed[:3])
+        notify_milestone(
+            paths=paths,
+            conn=conn,
+            job_id=job_id,
+            milestone="delivery_partial_failed",
+            message=(
+                "⚠️ File delivery partially failed\n"
+                f"📋 {task_name}\n"
+                f"Failed: {failed_names}\n"
+                "Send: status · rerun"
+            ),
+            target=target,
+            dry_run=dry_run,
+        )
+    return summary
 
 
 def _summarize_kb_hits(kb_hits: list[dict[str, Any]], *, limit: int = 6) -> list[str]:
@@ -1189,9 +1331,26 @@ def run_job_pipeline(
         final_artifacts["pdf_translated"] = [str(p) for p in pdf_translated]
     if pdf_extracted:
         final_artifacts["pdf_extracted"] = [str(p) for p in pdf_extracted]
+    result["artifacts"] = final_artifacts
 
     # Add PDF warnings/errors to status flags
     final_status_flags = list(result.get("status_flags", [])) + pdf_warnings
+
+    if source == "telegram" and result.get("status") in {"review_ready", "needs_attention"}:
+        delivery_files = _collect_delivery_files(artifacts=final_artifacts)
+        final_artifacts["delivery_files"] = delivery_files
+        delivery_target = notify_target or DEFAULT_NOTIFY_TARGET
+        if delivery_files:
+            delivery_summary = _send_delivery_files(
+                paths=paths,
+                conn=conn,
+                job_id=job_id,
+                task_name=_task_name,
+                target=delivery_target,
+                dry_run=dry_run_notify,
+                delivery_files=delivery_files,
+            )
+            final_artifacts["delivery_send"] = delivery_summary
 
     update_job_result(
         conn,

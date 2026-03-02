@@ -913,7 +913,7 @@ def handle_command(
                     "\u2705 Verified\n"
                     f"\U0001f4cb {_task_name}\n"
                     "\n"
-                    "\U0001f4a1 Manual delivery: move files from _VERIFY to the final folder (if needed)."
+                    "\U0001f4a1 Delivery is auto-sent to Telegram. _VERIFY keeps final + bilingual files."
                 ),
                 dry_run=dry_run_notify,
             )
@@ -970,15 +970,15 @@ def handle_command(
             job_id=job_id,
             milestone="verified",
             target=target,
-            message=(
-                "\u2705 Verified\n"
-                f"\U0001f4cb {_task_name}\n"
-                f"\U0001f4c1 Archived reference: {archive_result.get('dest_dir')}\n"
-                "\n"
-                "\U0001f4a1 Manual delivery: move files from _VERIFY to the final folder (if needed)."
-            ),
-            dry_run=dry_run_notify,
-        )
+                message=(
+                    "\u2705 Verified\n"
+                    f"\U0001f4cb {_task_name}\n"
+                    f"\U0001f4c1 Archived reference: {archive_result.get('dest_dir')}\n"
+                    "\n"
+                    "\U0001f4a1 Delivery is auto-sent to Telegram. _VERIFY keeps final + bilingual files."
+                ),
+                dry_run=dry_run_notify,
+            )
         conn.close()
         return {"ok": True, "job_id": job_id, "status": "verified", "archive": archive_result}
 

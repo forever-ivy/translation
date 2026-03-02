@@ -33,6 +33,11 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
             review = Path(tmp) / "_VERIFY" / "job_1"
             template = Path(tmp) / "english_v1.docx"
             _make_docx(template, "Baseline text")
+            # Legacy top-level artifacts should be cleaned up.
+            review.mkdir(parents=True, exist_ok=True)
+            (review / "Final-Reflow.docx").write_bytes(b"legacy")
+            (review / "Review Brief.docx").write_bytes(b"legacy")
+            (review / "Change Log.md").write_text("legacy", encoding="utf-8")
 
             manifest = write_artifacts(
                 review_dir=str(review),
@@ -61,9 +66,16 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
             )
 
             self.assertTrue(Path(manifest["final_docx"]).exists())
-            self.assertTrue(Path(manifest["final_reflow_docx"]).exists())
-            self.assertTrue(Path(manifest["review_brief_docx"]).exists())
-            self.assertTrue(Path(manifest["change_log_md"]).exists())
+            self.assertTrue(Path(manifest["bilingual_docx"]).exists())
+            self.assertIn("delivery_files", manifest)
+            self.assertEqual(len(manifest["delivery_files"]), 2)
+            self.assertTrue((review / "Final.docx").exists())
+            self.assertTrue((review / "Bilingual.docx").exists())
+            self.assertFalse((review / "Final-Reflow.docx").exists())
+            self.assertFalse((review / "Review Brief.docx").exists())
+            self.assertFalse((review / "Change Log.md").exists())
+            self.assertTrue((review / ".system" / "review_brief.md").exists())
+            self.assertTrue((review / ".system" / "change_log.md").exists())
             self.assertTrue(Path(manifest["execution_plan_json"]).exists())
             self.assertTrue(Path(manifest["quality_report_json"]).exists())
 
@@ -101,7 +113,9 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
             )
 
             self.assertIn("final_xlsx", manifest)
+            self.assertIn("bilingual_xlsx", manifest)
             self.assertTrue(Path(manifest["final_xlsx"]).exists())
+            self.assertTrue(Path(manifest["bilingual_xlsx"]).exists())
 
     def test_write_artifacts_emits_per_source_translated_xlsx_when_multiple_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +166,7 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
             self.assertEqual(len(manifest["xlsx_files"]), 2)
             for entry in manifest["xlsx_files"]:
                 self.assertTrue(Path(entry["path"]).exists())
+                self.assertTrue(Path(entry["bilingual_path"]).exists())
             self.assertNotIn("final_xlsx", manifest)
 
     def test_write_artifacts_emits_per_source_translated_docx_when_multiple_sources(self):
@@ -200,11 +215,16 @@ class OpenClawArtifactWriterTest(unittest.TestCase):
             self.assertEqual(manifest["primary_docx"], manifest["final_docx"])
             for entry in manifest["docx_files"]:
                 self.assertTrue(Path(entry["path"]).exists())
+                self.assertTrue(Path(entry["bilingual_path"]).exists())
 
             translated_one = review / "one_translated.docx"
             translated_two = review / "two_translated.docx"
+            bilingual_one = review / "one_bilingual.docx"
+            bilingual_two = review / "two_bilingual.docx"
             self.assertTrue(translated_one.exists())
             self.assertTrue(translated_two.exists())
+            self.assertTrue(bilingual_one.exists())
+            self.assertTrue(bilingual_two.exists())
             self.assertIn("Hello", Document(str(translated_one)).paragraphs[0].text)
             self.assertIn("Thanks", Document(str(translated_two)).paragraphs[0].text)
 
